@@ -1,9 +1,9 @@
 # SwiftEEG firmware — west manifest (T2 "application" topology).
 #
-# TODO(pin-version): `revision` below is a PLACEHOLDER. It must be pinned to
-# the nRF Connect SDK version actually installed before anyone builds, so the
-# build is reproducible. Confirm with `west list sdk-nrf` in the NCS workspace
-# and set the exact tag here.
+# Pinned to the NCS version installed on this machine (nrfutil sdk-manager).
+# Build reuses that shared workspace directly (see README §4) rather than
+# `west update`-ing a second copy here — this manifest exists so a fresh
+# machine or CI can `west init -l swifteeg` and get the same SDK version.
 manifest:
   remotes:
     - name: nrfconnect
@@ -12,7 +12,7 @@ manifest:
   projects:
     - name: sdk-nrf
       remote: nrfconnect
-      revision: v3.1.0
+      revision: v3.4.0
       import: true
 
   self:

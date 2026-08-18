@@ -115,12 +115,44 @@ repartitioning and re-flashing every unit over SWD.
 
 ## 4. Building
 
-Requires the nRF Connect SDK. Pin the version in `west.yml` before building —
-the value there is currently a **placeholder**.
+**Toolchain:** nRF Connect SDK **v3.4.0**, installed via
+`nrfutil sdk-manager` into the shared workspace at `C:\ncs\v3.4.0`.
+`west.yml` pins the same version so a fresh machine or CI reproduces it.
+
+### 4.1 The path-with-spaces problem
+
+Zephyr's CMake does not quote paths in list context, so **spaces in the build
+path break the build**. `zephyr/cmake/modules/kconfig.cmake` splits
+`D:/Electronics Projects/...` into `D:/Electronics` and `Projects/...`, then
+fails with `File not found: D:/Electronics`.
+
+The repo therefore builds through a **directory junction** with no spaces.
+The repo itself stays where it is; this is only an alias:
 
 ```
-west build -b swifteeg
+mklink /J D:\SwiftEEG_RTOS "D:\Electronics Projects\EEG Project\SwiftEEG\RTOS Firmware\RTOS"
 ```
+
+### 4.2 Build
+
+`west build` is a manifest-provided extension command, so it only exists when
+the working directory is inside the NCS workspace — and putting the cwd on
+`C:` while the source is on `D:` trips a separate `os.path.relpath` failure
+("path is on mount 'D:', start on mount 'C:'"). Driving CMake directly avoids
+both problems:
+
+```
+cd /d D:\SwiftEEG_RTOS
+nrfutil sdk-manager toolchain launch --ncs-version v3.4.0 -- cmake -B build -S . -GNinja -DBOARD=swifteeg -DBOARD_ROOT=D:/SwiftEEG_RTOS -DDTS_ROOT=D:/SwiftEEG_RTOS
+nrfutil sdk-manager toolchain launch --ncs-version v3.4.0 -- ninja -C build
+```
+
+`nrfutil.exe` lives at `%APPDATA%
+rfconnect
+rfutil.exe` if it is not on PATH.
+
+Current M1 footprint: **63 KB flash, 15.7 KB RAM** — comfortably inside the
+464 K application slot.
 
 ---
 
@@ -129,14 +161,18 @@ west build -b swifteeg
 ST-Link V2 over SWD. There is no spare UART, so **RTT is the only log path**.
 
 ```
-west flash
-```
-
-or directly:
-
-```
 openocd -f openocd/swifteeg.cfg -c "program build/zephyr/zephyr.hex verify reset exit"
 ```
+
+For RTT logs, after `reset halt`:
+
+```
+rtt setup 0x20000000 0x40000 "SEGGER RTT"
+rtt start
+rtt server start 9090 0
+```
+
+then `telnet localhost 9090`.
 
 ---
 

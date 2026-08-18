@@ -158,18 +158,46 @@ Current M1 footprint: **63 KB flash, 15.7 KB RAM** — comfortably inside the
 
 ## 5. Flashing and logs
 
-ST-Link V2 over SWD. There is no spare UART, so **RTT is the only log path**.
+**Probe:** ST-Link V2 over SWD to header **J4** (`1=GND 2=nRESET 3=SWDIO 4=SWDCLK`).
+**OpenOCD:** xPack 0.12.0 at `D:\swifteeg-tools\xpack-openocd-0.12.0-7\bin\openocd.exe`
+— not on PATH, and not bundled with NCS (which ships J-Link tooling instead).
+
+OpenOCD 0.12+ moved vendor configs into subdirectories, so the target is
+`target/nordic/nrf52.cfg`, **not** `target/nrf52.cfg`.
+
+### 5.1 APPROTECT
+
+The nRF52840 can ship with APPROTECT enabled, locking the debug port until a
+mass erase over the CTRL-AP. Reaching CTRL-AP needs **raw DAP** access, so the
+config uses `transport select swd`, not `hla_swd` — OpenOCD's own `nrf52.cfg`
+warns that HLA adapters cannot reach CTRL-AP, making `nrf52_recover` silently
+useless. Raw DAP needs ST-Link firmware V2J28+; if the adapter is older, the
+Raspberry Pi 5 bit-banging raw SWD is the fallback.
+
+### 5.2 Commands
+
+Probe — is the chip alive, is it locked:
+
+```
+openocd -f openocd/swifteeg.cfg -c "init; targets; exit"
+```
+
+Unlock a locked chip (mass erase, destroys all flash):
+
+```
+openocd -f openocd/swifteeg.cfg -c "init; nrf52_recover; exit"
+```
+
+Flash:
 
 ```
 openocd -f openocd/swifteeg.cfg -c "program build/zephyr/zephyr.hex verify reset exit"
 ```
 
-For RTT logs, after `reset halt`:
+RTT logs — the only log path, since no UART is spare:
 
 ```
-rtt setup 0x20000000 0x40000 "SEGGER RTT"
-rtt start
-rtt server start 9090 0
+openocd -f openocd/swifteeg.cfg -c "init; reset halt; rtt setup 0x20000000 0x40000 \"SEGGER RTT\"; rtt start; rtt server start 9090 0; resume"
 ```
 
 then `telnet localhost 9090`.

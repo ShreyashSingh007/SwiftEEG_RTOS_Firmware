@@ -11,6 +11,7 @@
 /dts-v1/;
 #include <nordic/nrf52840_qiaa.dtsi>
 #include "swifteeg-pinctrl.dtsi"
+#include <zephyr/dt-bindings/gpio/nordic-nrf-gpio.h>
 
 / {
 	model = "SwiftEEG 8-Channel Wireless EEG";
@@ -25,13 +26,22 @@
 
 	leds {
 		compatible = "gpio-leds";
-		/* MCU drives the LED anode; cathode returns through a resistor to GND. */
+		/*
+		 * MCU drives the LED anode; cathode returns through 330R to GND.
+		 * High drive (H0H1) because standard drive sags under load and
+		 * the LEDs are visibly dim on it.
+		 *
+		 * Headroom is tight by design: at 3.3 V through 330R the yellow
+		 * (Vf ~2.0 V) gets ~3.9 mA, but the blue (Vf ~3.0 V) only ~0.9 mA.
+		 * Blue stays the dimmer of the two - that is the board, not the
+		 * firmware.
+		 */
 		led_yellow: led_yellow {
-			gpios = <&gpio1 10 GPIO_ACTIVE_HIGH>;
+			gpios = <&gpio1 10 (GPIO_ACTIVE_HIGH | NRF_GPIO_DRIVE_H0H1)>;
 			label = "Yellow LED";
 		};
 		led_blue: led_blue {
-			gpios = <&gpio1 11 GPIO_ACTIVE_HIGH>;
+			gpios = <&gpio1 11 (GPIO_ACTIVE_HIGH | NRF_GPIO_DRIVE_H0H1)>;
 			label = "Blue LED";
 		};
 	};

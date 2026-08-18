@@ -10,6 +10,8 @@ project(swifteeg_fw LANGUAGES C)
 target_sources(app PRIVATE
   src/main.c
   src/board/leds.c
+  src/board/supply.c
+  src/afe/ads1299.c
 )
 
 target_include_directories(app PRIVATE src)

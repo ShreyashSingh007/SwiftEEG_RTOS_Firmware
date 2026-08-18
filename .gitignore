@@ -1,0 +1,28 @@
+# Zephyr / west
+build/
+build_*/
+.west/
+twister-out*/
+
+# Toolchain / editor
+.vscode/
+*.o
+*.a
+*.elf
+*.hex
+*.bin
+*.map
+compile_commands.json
+
+# Python tooling
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Local-only
+*.local

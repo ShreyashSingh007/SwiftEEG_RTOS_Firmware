@@ -1,0 +1,159 @@
+/*
+ * SwiftEEG — 8-channel wireless EEG
+ * MCU:  Raytac MDBT50Q-1MV2 (nRF52840)
+ * AFE:  TI ADS1299IPAGR, SRB1 referential montage
+ * IMU:  ST LSM6DSV16XTR
+ *
+ * Every pin below is taken from the KiCad schematic and cross-checked
+ * against the PCB netlist. Do not edit without re-checking the board.
+ */
+
+/dts-v1/;
+#include <nordic/nrf52840_qiaa.dtsi>
+#include "swifteeg-pinctrl.dtsi"
+
+/ {
+	model = "SwiftEEG 8-Channel Wireless EEG";
+	compatible = "shreyash,swifteeg";
+
+	chosen {
+		zephyr,sram = &sram0;
+		zephyr,flash = &flash0;
+		zephyr,code-partition = &slot0_partition;
+		/* No spare UART on this board. RTT is the only log path. */
+	};
+
+	leds {
+		compatible = "gpio-leds";
+		/* MCU drives the LED anode; cathode returns through a resistor to GND. */
+		led_yellow: led_yellow {
+			gpios = <&gpio1 10 GPIO_ACTIVE_HIGH>;
+			label = "Yellow LED";
+		};
+		led_blue: led_blue {
+			gpios = <&gpio1 11 GPIO_ACTIVE_HIGH>;
+			label = "Blue LED";
+		};
+	};
+
+	aliases {
+		led0 = &led_yellow;
+		led1 = &led_blue;
+		eeg-afe = &ads1299;
+		imu = &lsm6dsv16x;
+		watchdog0 = &wdt0;
+	};
+};
+
+&gpiote {
+	status = "okay";
+};
+
+&gpio0 {
+	status = "okay";
+};
+
+&gpio1 {
+	status = "okay";
+};
+
+/* ---- SD card (SPI mode, 1-bit) ---- */
+&spi1 {
+	compatible = "nordic,nrf-spim";
+	status = "okay";
+	pinctrl-0 = <&spi1_default>;
+	pinctrl-1 = <&spi1_sleep>;
+	pinctrl-names = "default", "sleep";
+	cs-gpios = <&gpio0 27 GPIO_ACTIVE_LOW>;
+
+	sdhc0: sdhc@0 {
+		compatible = "zephyr,sdhc-spi-slot";
+		reg = <0>;
+		status = "okay";
+		spi-max-frequency = <8000000>;
+		mmc {
+			compatible = "zephyr,sdmmc-disk";
+			disk-name = "SD";
+			status = "okay";
+		};
+	};
+};
+
+/* ---- LSM6DSV16X IMU ---- */
+&spi2 {
+	compatible = "nordic,nrf-spim";
+	status = "okay";
+	pinctrl-0 = <&spi2_default>;
+	pinctrl-1 = <&spi2_sleep>;
+	pinctrl-names = "default", "sleep";
+	cs-gpios = <&gpio1 0 GPIO_ACTIVE_LOW>;
+
+	lsm6dsv16x: lsm6dsv16x@0 {
+		compatible = "st,lsm6dsv16x";
+		reg = <0>;
+		spi-max-frequency = <8000000>;
+		/* Only INT2 is routed on this board; INT1 is not connected. */
+		int2-gpios = <&gpio0 24 GPIO_ACTIVE_HIGH>;
+		status = "okay";
+	};
+};
+
+/* ---- ADS1299 EEG AFE ----
+ * M1 uses the Zephyr SPI API for register access only.
+ * M2 takes ownership of SPIM3 via nrfx so DRDY can trigger EasyDMA
+ * through PPI with the CPU off the critical path.
+ */
+&spi3 {
+	compatible = "nordic,nrf-spim";
+	status = "okay";
+	pinctrl-0 = <&spi3_default>;
+	pinctrl-1 = <&spi3_sleep>;
+	pinctrl-names = "default", "sleep";
+	cs-gpios = <&gpio0 8 GPIO_ACTIVE_LOW>;
+
+	ads1299: ads1299@0 {
+		compatible = "ti,ads1299";
+		reg = <0>;
+		spi-max-frequency = <16000000>;	/* ADS1299 SCLK ceiling is 20 MHz */
+		drdy-gpios = <&gpio0 4 GPIO_ACTIVE_LOW>;
+		afe-gpio1-gpios = <&gpio0 6 GPIO_ACTIVE_HIGH>;
+		status = "okay";
+
+		/*
+		 * RESET and PWDN are hard pull-ups to DVDD on this board, so
+		 * neither can be driven. Reset is by SPI opcode only.
+		 * START is unconnected — see the START self-test in src/afe.
+		 */
+	};
+};
+
+&usbd {
+	compatible = "nordic,nrf-usbd";
+	status = "okay";
+};
+
+&flash0 {
+	partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		/* MCUboot dual-slot. Application must fit in slot0 (0x74000). */
+		boot_partition: partition@0 {
+			label = "mcuboot";
+			reg = <0x00000000 0x0000C000>;
+		};
+		slot0_partition: partition@c000 {
+			label = "image-0";
+			reg = <0x0000C000 0x00074000>;
+		};
+		slot1_partition: partition@80000 {
+			label = "image-1";
+			reg = <0x00080000 0x00074000>;
+		};
+		storage_partition: partition@f4000 {
+			label = "storage";
+			reg = <0x000F4000 0x0000C000>;
+		};
+	};
+};

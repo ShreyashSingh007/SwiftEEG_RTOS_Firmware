@@ -1,0 +1,28 @@
+# Copyright (c) 2026 Shreyash Singh
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+  TI ADS1299 8-channel 24-bit EEG analog front end.
+
+  On the SwiftEEG board RESET and PWDN are tied high through pull-ups and
+  cannot be driven, so reset is by SPI opcode only. START is unconnected;
+  conversions are controlled by opcode and the driver self-tests for a
+  stuck-high START at boot.
+
+compatible: "ti,ads1299"
+
+include: [spi-device.yaml]
+
+properties:
+  drdy-gpios:
+    type: phandle-array
+    required: true
+    description: |
+      Data-ready output from the AFE, active low. Falling edge marks a new
+      sample. Routed to a GPIOTE-capable pin so it can drive PPI.
+
+  afe-gpio1-gpios:
+    type: phandle-array
+    description: |
+      ADS1299 GPIO1. The only AFE GPIO routed on this board; GPIO2..4 are
+      unconnected.

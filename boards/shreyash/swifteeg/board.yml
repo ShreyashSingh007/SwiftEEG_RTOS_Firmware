@@ -1,0 +1,6 @@
+board:
+  name: swifteeg
+  full_name: SwiftEEG 8-Channel Wireless EEG
+  vendor: shreyash
+  socs:
+    - name: nrf52840

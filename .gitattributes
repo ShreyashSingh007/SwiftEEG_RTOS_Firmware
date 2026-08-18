@@ -1,0 +1,8 @@
+# Firmware sources are LF everywhere. Avoids CRLF noise in diffs and keeps
+# the tree identical on Windows and CI.
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.hex binary
+*.bin binary
+*.elf binary

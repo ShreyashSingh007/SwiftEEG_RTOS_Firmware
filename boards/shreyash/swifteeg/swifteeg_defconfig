@@ -1,0 +1,16 @@
+# Bare minimum to boot. Feature selection lives in prj.conf.
+CONFIG_ARM_MPU=y
+CONFIG_HW_STACK_PROTECTION=y
+
+# 32.768 kHz crystal (Y1) is fitted — use it, not the RC oscillator.
+# Accurate LFCLK is required for BLE timing and the sample-clock drift estimate.
+CONFIG_CLOCK_CONTROL_NRF_K32SRC_XTAL=y
+CONFIG_CLOCK_CONTROL_NRF_K32SRC_20PPM=y
+
+CONFIG_GPIO=y
+CONFIG_SERIAL=n
+CONFIG_CONSOLE=y
+
+# No spare UART on this board — SWD + RTT is the only log path.
+CONFIG_RTT_CONSOLE=y
+CONFIG_USE_SEGGER_RTT=y

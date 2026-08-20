@@ -115,44 +115,25 @@ repartitioning and re-flashing every unit over SWD.
 
 ## 4. Building
 
-**Toolchain:** nRF Connect SDK **v3.4.0**, installed via
-`nrfutil sdk-manager` into the shared workspace at `C:\ncs\v3.4.0`.
-`west.yml` pins the same version so a fresh machine or CI reproduces it.
-
-### 4.1 The path-with-spaces problem
-
-Zephyr's CMake does not quote paths in list context, so **spaces in the build
-path break the build**. `zephyr/cmake/modules/kconfig.cmake` splits
-`D:/Electronics Projects/...` into `D:/Electronics` and `Projects/...`, then
-fails with `File not found: D:/Electronics`.
-
-The repo therefore builds through a **directory junction** with no spaces.
-The repo itself stays where it is; this is only an alias:
-
 ```
-mklink /J D:\SwiftEEG_RTOS "D:\Electronics Projects\EEG Project\SwiftEEG\RTOS Firmware\RTOS"
+.\tools\build.ps1                 # main application
+.\tools\build.ps1 -Target proto   # protocol test suite
+.\tools\build.ps1 -Pristine       # wipe the build dir first
 ```
 
-### 4.2 Build
+### 4.1 Do not build via the nrfutil toolchain launcher
 
-`west build` is a manifest-provided extension command, so it only exists when
-the working directory is inside the NCS workspace — and putting the cwd on
-`C:` while the source is on `D:` trips a separate `os.path.relpath` failure
-("path is on mount 'D:', start on mount 'C:'"). Driving CMake directly avoids
-both problems:
+`nrfutil sdk-manager toolchain launch -- cmake ...` **silently builds the
+wrong thing.** It injects its own `-S` pointing at the repo root and truncates
+Windows drive paths (`-DBOARD_ROOT=D:/foo` arrives as `D:`). The symptom is
+subtle: a test suite configures with the main application's `prj.conf`, builds
+without complaint, and produces a binary that is not the test.
 
-```
-cd /d D:\SwiftEEG_RTOS
-nrfutil sdk-manager toolchain launch --ncs-version v3.4.0 -- cmake -B build -S . -GNinja -DBOARD=swifteeg -DBOARD_ROOT=D:/SwiftEEG_RTOS -DDTS_ROOT=D:/SwiftEEG_RTOS
-nrfutil sdk-manager toolchain launch --ncs-version v3.4.0 -- ninja -C build
-```
+`tools/build.ps1` sets the toolchain environment explicitly and calls cmake
+directly, which avoids this. Use it.
 
-`nrfutil.exe` lives at `%APPDATA%
-rfconnect
-rfutil.exe` if it is not on PATH.
-
-Current M1 footprint: **63 KB flash, 15.7 KB RAM** — comfortably inside the
-464 K application slot.
+`west build` is not an option here either - this repo is an application, not a
+west workspace, so west has no `build` command available.
 
 ---
 

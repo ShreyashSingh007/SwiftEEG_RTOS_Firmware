@@ -169,6 +169,16 @@
 &usbd {
 	compatible = "nordic,nrf-usbd";
 	status = "okay";
+
+	/*
+	 * CDC ACM gives the host a virtual serial port with no driver install
+	 * on Windows 10+, macOS or Linux. This is the wired transport for the
+	 * binary protocol, and the only path fast enough for 16 kSPS
+	 * (~432 kB/s) - BLE cannot carry that.
+	 */
+	cdc_acm_uart0: cdc_acm_uart0 {
+		compatible = "zephyr,cdc-acm-uart";
+	};
 };
 
 &flash0 {

@@ -17,6 +17,8 @@
 #include "afe/ads1299.h"
 #include "board/leds.h"
 #include "board/supply.h"
+#include "transport/ble.h"
+#include "transport/usb.h"
 
 LOG_MODULE_REGISTER(main, CONFIG_LOG_DEFAULT_LEVEL);
 
@@ -89,6 +91,18 @@ int main(void)
 
 	report_supply();
 	report_afe();
+
+	/*
+	 * Transports are brought up but carry no protocol yet - the codec
+	 * lands in M2. A failure here is logged and tolerated: a device that
+	 * cannot advertise is still useful over USB, and vice versa.
+	 */
+	if (usb_transport_init() != 0) {
+		LOG_WRN("USB transport unavailable");
+	}
+	if (ble_transport_init() != 0) {
+		LOG_WRN("BLE transport unavailable");
+	}
 
 	/* Start out of phase. */
 	(void)leds_set(LED_YELLOW, true);

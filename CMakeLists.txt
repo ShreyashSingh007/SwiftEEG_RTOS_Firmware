@@ -12,6 +12,8 @@ target_sources(app PRIVATE
   src/board/leds.c
   src/board/supply.c
   src/afe/ads1299.c
+  src/transport/usb.c
+  src/transport/ble.c
 )
 
 target_include_directories(app PRIVATE src)

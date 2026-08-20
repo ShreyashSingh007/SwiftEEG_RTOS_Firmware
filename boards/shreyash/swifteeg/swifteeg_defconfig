@@ -8,8 +8,12 @@ CONFIG_CLOCK_CONTROL_NRF_K32SRC_XTAL=y
 CONFIG_CLOCK_CONTROL_NRF_K32SRC_20PPM=y
 
 CONFIG_GPIO=y
-CONFIG_SERIAL=n
 CONFIG_CONSOLE=y
+
+# No physical UART is wired on this board, so SERIAL is off by default.
+# Applications that enable USB CDC ACM must turn it back on: CDC ACM is
+# implemented as a serial driver and depends on SERIAL.
+CONFIG_SERIAL=n
 
 # No spare UART on this board — SWD + RTT is the only log path.
 CONFIG_RTT_CONSOLE=y

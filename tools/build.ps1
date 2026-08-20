@@ -18,7 +18,7 @@
         .\tools\build.ps1 -Pristine       # wipe the build dir first
 #>
 param(
-    [ValidateSet("app", "proto")]
+    [ValidateSet("app", "proto", "dsp")]
     [string]$Target = "app",
     [switch]$Pristine
 )
@@ -40,6 +40,7 @@ $env:ZEPHYR_SDK_INSTALL_DIR = "$Toolchain\opt\zephyr-sdk"
 switch ($Target) {
     "app"   { $SourceDir = $RepoRoot }
     "proto" { $SourceDir = Join-Path $RepoRoot "tests\proto" }
+    "dsp"   { $SourceDir = Join-Path $RepoRoot "tests\dsp" }
 }
 $BuildDir = Join-Path $SourceDir "build"
 

@@ -105,10 +105,13 @@ int main(void)
 	}
 
 	/*
-	 * Report the USB regulator state after init. The device controller
-	 * stays disabled until the SoC's internal USB regulator is ready, so
-	 * this distinguishes a firmware problem from a supply one.
+	 * Report the USB regulator state. Sampled after a short delay: the
+	 * SoC's internal USB regulator takes a moment to come ready after
+	 * VBUS is detected, and reading immediately after usbd_enable()
+	 * reports OUTPUTRDY=0 and logs a scary warning about a supply that is
+	 * in fact perfectly healthy.
 	 */
+	k_msleep(50);
 	supply_log_usb_status();
 	if (ble_transport_init() != 0) {
 		LOG_WRN("BLE transport unavailable");

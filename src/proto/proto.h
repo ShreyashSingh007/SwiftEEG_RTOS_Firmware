@@ -116,4 +116,15 @@ void proto_stream_reset(proto_stream_t *st);
  */
 bool proto_stream_push(proto_stream_t *st, uint8_t byte, proto_frame_t *out);
 
+/*
+ * Tries to pull a frame out of already-buffered bytes without feeding a new
+ * one. A single push can leave a second complete frame buffered (they often
+ * arrive in one burst), so drain with this until it returns false if you need
+ * every frame before the stream goes quiet.
+ *
+ * As with proto_decode, out->payload points into the decoder's own buffer and
+ * is only valid until the next push or poll.
+ */
+bool proto_stream_poll(proto_stream_t *st, proto_frame_t *out);
+
 #endif /* SWIFTEEG_PROTO_H */

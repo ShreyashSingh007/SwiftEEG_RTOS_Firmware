@@ -170,6 +170,87 @@ static void resync(proto_stream_t *st)
 	st->need = 0;
 }
 
+/* Removes `count` leading bytes, keeping anything that follows them. */
+static void consume(proto_stream_t *st, uint16_t count)
+{
+	if (count >= st->have) {
+		st->have = 0;
+		st->in_frame = false;
+		st->need = 0;
+		return;
+	}
+
+	const uint16_t remaining = (uint16_t)(st->have - count);
+	memmove(st->buf, &st->buf[count], remaining);
+	st->have = remaining;
+
+	/*
+	 * Trailing bytes are the start of the next frame, so stay in-frame if
+	 * they begin with a SOF. Discarding them would lose a frame that
+	 * arrived in the same burst as the one just decoded.
+	 */
+	st->in_frame = (st->buf[0] == PROTO_SOF);
+	st->need = 0;
+	if (!st->in_frame) {
+		st->have = 0;
+	}
+}
+
+/*
+ * Tries to pull one complete frame out of whatever is already buffered.
+ *
+ * Loops rather than returning after a resync: once resync() has re-anchored
+ * on a later SOF, the buffer may ALREADY hold a complete valid frame, and
+ * waiting for another byte before parsing it would stall - or lose it
+ * entirely if the stream went quiet.
+ */
+static bool try_extract(proto_stream_t *st, proto_frame_t *out)
+{
+	while (st->in_frame && st->have >= PROTO_HEADER_LEN) {
+		const uint16_t payload_len = get_le16(&st->buf[4]);
+
+		if (st->buf[1] != PROTO_VERSION ||
+		    !type_is_valid(st->buf[2]) ||
+		    payload_len > PROTO_MAX_PAYLOAD) {
+			/* Not a plausible header - that was not a real SOF. */
+			resync(st);
+			continue;
+		}
+
+		st->need = (uint16_t)(PROTO_OVERHEAD + payload_len);
+		if (st->have < st->need) {
+			return false; /* still collecting */
+		}
+
+		const int err = proto_decode(st->buf, st->need, out);
+		if (err == PROTO_OK) {
+			/*
+			 * out->payload points into st->buf, so the caller must
+			 * finish with it before the next push. Documented in
+			 * the header.
+			 */
+			const uint16_t used = st->need;
+			consume(st, used);
+			return true;
+		}
+
+		if (err == PROTO_ERR_CRC) {
+			st->crc_errors++;
+		}
+		resync(st);
+	}
+
+	return false;
+}
+
+bool proto_stream_poll(proto_stream_t *st, proto_frame_t *out)
+{
+	if (st == NULL || out == NULL) {
+		return false;
+	}
+	return try_extract(st, out);
+}
+
 bool proto_stream_push(proto_stream_t *st, uint8_t byte, proto_frame_t *out)
 {
 	if (st == NULL || out == NULL) {
@@ -187,42 +268,12 @@ bool proto_stream_push(proto_stream_t *st, uint8_t byte, proto_frame_t *out)
 
 	if (st->have >= sizeof(st->buf)) {
 		resync(st);
-		return false;
+		if (!st->in_frame) {
+			return false;
+		}
 	}
 
 	st->buf[st->have++] = byte;
 
-	/* Once the header is in, the total length is known. */
-	if (st->need == 0 && st->have >= PROTO_HEADER_LEN) {
-		const uint16_t payload_len = get_le16(&st->buf[4]);
-
-		if (st->buf[1] != PROTO_VERSION ||
-		    !type_is_valid(st->buf[2]) ||
-		    payload_len > PROTO_MAX_PAYLOAD) {
-			/* Header is not plausible - this was not a real SOF. */
-			resync(st);
-			return false;
-		}
-
-		st->need = (uint16_t)(PROTO_OVERHEAD + payload_len);
-	}
-
-	if (st->need == 0 || st->have < st->need) {
-		return false; /* still collecting */
-	}
-
-	const int err = proto_decode(st->buf, st->have, out);
-
-	if (err == PROTO_OK) {
-		st->have = 0;
-		st->need = 0;
-		st->in_frame = false;
-		return true;
-	}
-
-	if (err == PROTO_ERR_CRC) {
-		st->crc_errors++;
-	}
-	resync(st);
-	return false;
+	return try_extract(st, out);
 }

@@ -163,18 +163,66 @@ ZTEST(proto, test_stream_survives_truncated_frame)
 
 	proto_stream_reset(&st);
 
-	/* Half a frame, then a whole one: the good frame must still arrive. */
+	/*
+	 * Half a frame, then good frames.
+	 *
+	 * The decoder CANNOT know the first frame was truncated until it has
+	 * consumed the length that frame declared - so the bytes of the first
+	 * good frame are legitimately swallowed making up that count. Only
+	 * then does the CRC fail, and only then can it resync. Recovery is
+	 * therefore measured as "a later good frame arrives", not "the very
+	 * next one does".
+	 */
 	for (uint16_t b = 0; b < cut->frame_len / 2; b++) {
 		(void)proto_stream_push(&st, cut->frame[b], &f);
 	}
 
 	bool got = false;
-	for (uint16_t b = 0; b < good->frame_len; b++) {
-		got = proto_stream_push(&st, good->frame[b], &f);
+	for (int rep = 0; rep < 3 && !got; rep++) {
+		for (uint16_t b = 0; b < good->frame_len; b++) {
+			if (proto_stream_push(&st, good->frame[b], &f)) {
+				got = true;
+			}
+		}
 	}
 
-	zassert_true(got, "decoder wedged after a truncated frame");
+	zassert_true(got, "decoder never recovered after a truncated frame");
 	zassert_equal(f.seq, good->seq, "seq after truncation");
+	zassert_equal(f.len, good->payload_len, "len after truncation");
+	zassert_true(st.crc_errors >= 1,
+		     "truncated frame should have produced a CRC error");
+}
+
+ZTEST(proto, test_stream_poll_drains_buffered_frames)
+{
+	proto_stream_t st;
+	proto_frame_t f;
+	const struct golden_vector *v = &golden_vectors[2];
+
+	proto_stream_reset(&st);
+
+	/*
+	 * Regression guard. resync() can re-anchor on a SOF with a COMPLETE
+	 * frame already behind it; the decoder must parse that immediately
+	 * rather than waiting for another byte that may never come.
+	 */
+	const uint8_t garbage[] = { 0xA5, 0x00, 0x00 };
+	for (size_t i = 0; i < sizeof(garbage); i++) {
+		(void)proto_stream_push(&st, garbage[i], &f);
+	}
+
+	bool got = false;
+	for (uint16_t b = 0; b < v->frame_len; b++) {
+		if (proto_stream_push(&st, v->frame[b], &f)) {
+			got = true;
+		}
+	}
+
+	zassert_true(got, "frame lost after a false SOF");
+	zassert_equal(f.seq, v->seq, "seq wrong after false SOF");
+
+	/* Nothing should remain once the frame has been taken. */
+	zassert_false(proto_stream_poll(&st, &f), "poll returned a stale frame");
 }
 
 ZTEST_SUITE(proto, NULL, NULL, NULL, NULL, NULL);

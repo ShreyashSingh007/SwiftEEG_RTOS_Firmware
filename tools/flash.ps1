@@ -37,7 +37,9 @@ if (-not (Test-Path $Hex)) { throw "hex not found: $Hex" }
 Get-Process openocd -ErrorAction SilentlyContinue | Stop-Process -Force
 
 # Forward slashes: OpenOCD's TCL treats backslash as an escape.
-$hexFwd = $Hex.Replace([char]92, '/')
+# Braces: the repo path contains spaces, and TCL would otherwise split the
+# filename into several arguments ("Invalid command argument").
+$hexFwd = '{' + $Hex.Replace([char]92, '/') + '}'
 $cmds = @("-f", $Cfg, "-c", "init", "-c", "halt")
 if (-not $NoErase) {
     # Re-halt after the erase: with flash blank the core runs garbage off an

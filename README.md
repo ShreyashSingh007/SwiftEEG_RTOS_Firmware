@@ -4,38 +4,42 @@
 nRF Connect SDK. Designed as a raw BCI tool: full hardware control, on-chip
 DSP, precise timestamps, and a transport-agnostic binary API.
 
-> **Status: M1 complete, verified on hardware.**
+> **Status: M1 complete, verified on both board builds.**
 >
-> | Check | Result |
-> |---|---|
-> | Board port, flashing, RTT logging | pass |
-> | Both LEDs blinking | pass |
-> | IMU over SPI | pass, `chip id 0x70` |
-> | AFE absent handled, firmware continues | pass |
-> | VDD rail | 3315 mV |
-> | USB CDC ACM | enumerates as a serial port |
-> | BLE advertising as "SwiftEEG" | pass |
-> | Unit tests on target | 26/26 |
+> | Check | No-AFE board | AFE board |
+> |---|---|---|
+> | Board port, flashing, RTT logging | pass | pass |
+> | Both LEDs blinking | pass | pass |
+> | IMU over SPI | `chip id 0x70` | `chip id 0x70` |
+> | ADS1299 over SPI | absent, handled | **present, ID 0x3e, 8 ch** |
+> | ADS1299 `START` not stuck high | n/a | **pass** |
+> | VDD rail | 3315 mV | 3309 mV |
+> | USB CDC ACM | enumerates as a serial port | pending |
+> | BLE advertising as "SwiftEEG" | pass | pass |
+> | Unit tests on target | 26/26 | - |
 >
-> Verified on a board built **without** the ADS1299. Acquisition and DSP
-> (M2) need the populated board.
+> One binary runs on both builds. Acquisition and DSP are M2.
 
 ---
 
 ## 0. Where we are  (read this first)
 
-**M1 is done.** Everything below was verified on the board built **without**
-an ADS1299.
+**M1 is done**, now on the board with the ADS1299 fitted as well as the one
+without.
 
 ### Built and working on hardware
 - Board port, flashing, RTT logging
 - Both LEDs blinking
 - IMU responds over SPI (`chip id 0x70`) - driver initialises only, no
   sample pipeline yet, and none is planned until M2 phase 2
-- ADS1299 absence detected; firmware carries on, so one binary runs on all
-  three boards
-- VDD rail 3315 mV
-- USB CDC ACM enumerates as a serial port
+- **ADS1299 detected and identified: ID `0x3e`** - reserved bit set,
+  `DEV_ID` = ADS1299, `NU_CH` = 8 channels. Absence is also handled, so one
+  binary runs on all three boards.
+- **`START` pin is not stuck high** - the floating-pin risk is closed, no
+  hardware change needed. See section on risks.
+- VDD rail 3315 mV (no-AFE board) / 3309 mV (AFE board)
+- USB CDC ACM enumerates as a serial port (no-AFE board; not yet retested
+  on the AFE board)
 - BLE advertises as "SwiftEEG"
 - 26/26 unit tests pass on target
 
@@ -61,8 +65,10 @@ The codec exists but is not connected to either transport.
 ### Blocked on the user
 - `wsl --install` (admin + reboot) so tests can run without the board.
   Optional; tests currently run on target instead.
-- Confirm the ADS1299 board got the **same solder-jumper fix**. Its
-  +/-2.5 V analog rails come off the supply that read 2.26 V here.
+- Plug USB into the AFE board to confirm it enumerates there too.
+
+The solder-jumper question is **resolved**: the AFE board reads 3309 mV, so
+its supply is healthy and it did not have the fault that the other board had.
 
 ### Scope reminder
 Milestone order is fixed: **(1) bring-up with USB+BLE -> (2) raw ADC + DSP
@@ -110,6 +116,11 @@ LEDs are **active high** — the MCU drives the anode.
    opcode. A floating CMOS input can read high, in which case `STOP` has no
    effect. The AFE driver self-tests for this at boot and reports a hardware
    fault rather than producing silently-bad data.
+   **Measured on the AFE board: not stuck high — `STOP` is honoured.** The
+   test issues `STOP`, then watches `DRDY` for 10 ms; at the reset default of
+   250 SPS a free-running part would pulse every 4 ms, so silence is proof.
+   No pull-down wire is needed. The self-test stays in, because a floating
+   input can behave differently with temperature or an enclosure fitted.
 2. **`RESET` and `PWDN` are pull-ups to DVDD.** Neither can be driven; reset is
    by SPI opcode only, and the AFE cannot be power-cycled by the MCU.
 3. **`CLKSEL` is tied high** — the AFE runs its own internal oscillator, spec'd
@@ -198,13 +209,6 @@ west workspace, so west has no `build` command available.
 
 ---
 
-### 5.3 The debugger stops BLE
-
-Halting the core stops advertising. Every `openocd ... halt` - including the
-RTT attach in `rtt_halted.cfg` - freezes the radio, so a phone scanning at
-that moment sees nothing. If BLE looks dead, reset the board, detach the
-debugger entirely, and scan again before suspecting the firmware.
-
 ## 5. Flashing and logs
 
 **Probe:** ST-Link V2 over SWD to header **J4** (`1=GND 2=nRESET 3=SWDIO 4=SWDCLK`).
@@ -214,42 +218,85 @@ debugger entirely, and scan again before suspecting the firmware.
 OpenOCD 0.12+ moved vendor configs into subdirectories, so the target is
 `target/nordic/nrf52.cfg`, **not** `target/nrf52.cfg`.
 
-### 5.1 APPROTECT
+### 5.1 Transport: HLA, and what it costs
 
-The nRF52840 can ship with APPROTECT enabled, locking the debug port until a
-mass erase over the CTRL-AP. Reaching CTRL-AP needs **raw DAP** access, so the
-config uses `transport select swd`, not `hla_swd` — OpenOCD's own `nrf52.cfg`
-warns that HLA adapters cannot reach CTRL-AP, making `nrf52_recover` silently
-useless. Raw DAP needs ST-Link firmware V2J28+; if the adapter is older, the
-Raspberry Pi 5 bit-banging raw SWD is the fallback.
+This ST-Link (V2J46S7) **fails raw-DAP** access on this board — it reports
+status 0x0b and never attaches. The config therefore uses
+`interface/stlink-hla.cfg` with `transport select hla_swd`, which works
+reliably.
 
-### 5.2 Commands
+The price: HLA cannot reach the nRF52's CTRL-AP, so **`nrf52_recover` does
+not work here**. That is the only way back from an APPROTECT lock.
 
-Probe — is the chip alive, is it locked:
+> **Never enable UICR APPROTECT.** There is no recovery path with this probe.
 
-```
-openocd -f openocd/swifteeg.cfg -c "init; targets; exit"
-```
+Check it is clear (expect `0xffffffff`):
 
-Unlock a locked chip (mass erase, destroys all flash):
-
-```
-openocd -f openocd/swifteeg.cfg -c "init; nrf52_recover; exit"
+```bash
+openocd -f openocd/swifteeg.cfg -c init -c halt -c "mdw 0x10001208" -c exit
 ```
 
-Flash:
+Both boards flashed so far read `0xffffffff`. Arduino-flashed boards have not
+had APPROTECT set either, so a board arriving with vendor firmware is fine.
+
+### 5.2 SWD speed: faster is more reliable
+
+Counter-intuitive, but measured: **950–1200 kHz works, 125–480 kHz fails.**
+If SWD is flaky, do not "helpfully" slow the adapter down — that makes it
+worse. `adapter speed 950` is set in `openocd/swifteeg.cfg`.
+
+### 5.3 Reset is by SYSRESETREQ, not SRST
+
+The ST-Link's SRST does not reliably drive nRESET on this board, so
+`reset halt`, `reset run`, and OpenOCD's `program ... reset` all time out.
+Reset is issued through the Cortex-M's own AIRCR register instead:
 
 ```
-openocd -f openocd/swifteeg.cfg -c "program build/zephyr/zephyr.hex verify reset exit"
+mww 0xE000ED0C 0x05FA0004
 ```
 
-RTT logs — the only log path, since no UART is spare:
+Do **not** start firmware by writing PC/SP directly. That leaves a non-zero
+exception number in xPSR, and the kernel then trips
+`ASSERTION FAIL [!arch_is_in_isr()]` at boot. It looks like a firmware bug
+and is not one.
 
-```
-openocd -f openocd/swifteeg.cfg -c "init; reset halt; rtt setup 0x20000000 0x40000 \"SEGGER RTT\"; rtt start; rtt server start 9090 0; resume"
+### 5.4 Commands
+
+Flash (mass-erase, write, verify, reset):
+
+```bash
+powershell -File tools/flash.ps1
 ```
 
-then `telnet localhost 9090`.
+`tools/flash.ps1` mass-erases first because the flash write algorithm runs
+code *on the target*: resident firmware that keeps taking interrupts — BLE
+especially — corrupts the write partway through. It also brace-quotes the
+hex path, because the repo path contains spaces and OpenOCD's TCL would
+otherwise split it (`Error: Invalid command argument`).
+
+Read the log — RTT is the only path, no UART is spare:
+
+```bash
+python tools/rtt.py
+```
+
+That halts the core, dumps the buffer, and **leaves the target halted**.
+Reflash, or reset it with the `mww` command above. To follow a running
+target instead:
+
+```bash
+python tools/rtt.py --live 20
+```
+
+Live mode is less dependable: RTT reads race the running target over HLA.
+Prefer the halted dump unless you need to watch something post-boot.
+
+### 5.5 The debugger stops BLE
+
+Halting the core stops advertising. Every `openocd ... halt` — including the
+default `tools/rtt.py` — freezes the radio, so a phone scanning at that
+moment sees nothing. If BLE looks dead, reset the board, detach the debugger
+entirely, and scan again before suspecting the firmware.
 
 ---
 

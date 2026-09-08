@@ -55,6 +55,88 @@ static int afe_read_reg(uint8_t addr, uint8_t *val)
 	return 0;
 }
 
+static int afe_write_reg(uint8_t addr, uint8_t val)
+{
+	/* WREG: [0x40|addr][n-1][data]. Single transfer, CS held throughout. */
+	uint8_t tx_buf[3] = { ADS1299_CMD_WREG | addr, 0x00, val };
+
+	const struct spi_buf tx = { .buf = tx_buf, .len = sizeof(tx_buf) };
+	const struct spi_buf_set tx_set = { .buffers = &tx, .count = 1 };
+
+	return spi_write_dt(&afe_spi, &tx_set);
+}
+
+int ads1299_read_reg(uint8_t addr, uint8_t *val)
+{
+	return afe_read_reg(addr, val);
+}
+
+int ads1299_start_conversions(void)
+{
+	return afe_cmd(ADS1299_CMD_START);
+}
+
+int ads1299_stop_conversions(void)
+{
+	return afe_cmd(ADS1299_CMD_STOP);
+}
+
+int ads1299_configure(uint8_t rate)
+{
+	/* Registers are only writable outside continuous-read mode. */
+	int err = afe_cmd(ADS1299_CMD_SDATAC);
+	if (err) {
+		return err;
+	}
+	k_busy_wait(10);
+
+	err = afe_write_reg(ADS1299_REG_CONFIG1,
+			    ADS1299_CONFIG1_BASE | (rate & 0x07));
+	if (err) {
+		return err;
+	}
+
+	/*
+	 * Internal reference on. VREFP carries decoupling only on this board,
+	 * so without this the part converts against nothing.
+	 */
+	err = afe_write_reg(ADS1299_REG_CONFIG3,
+			    ADS1299_CONFIG3_BASE | ADS1299_CONFIG3_PD_REFBUF);
+	if (err) {
+		return err;
+	}
+
+	/* The reference needs time to settle before conversions mean anything. */
+	k_msleep(150);
+
+	/* SRB1 referential montage - every channel measured against SRB1. */
+	err = afe_write_reg(ADS1299_REG_MISC1, ADS1299_MISC1_SRB1);
+	if (err) {
+		return err;
+	}
+
+	/*
+	 * Read back the two registers that decide whether the data is valid at
+	 * all. A silent SPI failure here would otherwise look like real EEG.
+	 */
+	uint8_t cfg1 = 0, cfg3 = 0;
+
+	(void)afe_read_reg(ADS1299_REG_CONFIG1, &cfg1);
+	(void)afe_read_reg(ADS1299_REG_CONFIG3, &cfg3);
+
+	const uint8_t want1 = ADS1299_CONFIG1_BASE | (rate & 0x07);
+	const uint8_t want3 = ADS1299_CONFIG3_BASE | ADS1299_CONFIG3_PD_REFBUF;
+
+	if (cfg1 != want1 || cfg3 != want3) {
+		LOG_ERR("AFE config readback wrong: CONFIG1 %02x (want %02x), "
+			"CONFIG3 %02x (want %02x)", cfg1, want1, cfg3, want3);
+		return -EIO;
+	}
+
+	LOG_INF("AFE configured: CONFIG1 %02x, CONFIG3 %02x, SRB1 on", cfg1, cfg3);
+	return 0;
+}
+
 const char *afe_probe_str(afe_probe_result_t r)
 {
 	switch (r) {

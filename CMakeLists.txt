@@ -13,6 +13,7 @@ target_sources(app PRIVATE
   src/board/supply.c
   src/afe/ads1299.c
   src/timebase/timebase.c
+  src/pipeline/capture.c
   src/transport/usb.c
   src/transport/ble.c
 )

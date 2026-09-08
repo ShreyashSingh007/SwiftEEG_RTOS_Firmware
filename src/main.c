@@ -17,6 +17,7 @@
 #include "afe/ads1299.h"
 #include "board/leds.h"
 #include "board/supply.h"
+#include "pipeline/capture.h"
 #include "timebase/timebase.h"
 #include "transport/ble.h"
 #include "transport/usb.h"
@@ -50,6 +51,8 @@ static void report_supply(void)
 	}
 }
 
+static bool afe_present;
+
 static void report_afe(void)
 {
 	struct afe_probe probe;
@@ -61,6 +64,7 @@ static void report_afe(void)
 
 	switch (probe.result) {
 	case AFE_PRESENT:
+		afe_present = true;
 		LOG_INF("AFE ADS1299: present, ID 0x%02x (8 channels)",
 			probe.raw_id);
 		if (ads1299_start_pin_stuck_high()) {
@@ -114,16 +118,109 @@ static void report_timebase(void)
 		return;
 	}
 
-	/*
-	 * Error in parts per thousand, signed. Crystals should land within a
-	 * count or two of zero; the internal RC would show tens.
-	 */
-	const int32_t err_ppt =
-		(int32_t)(((int64_t)tb_us - (int64_t)ref_us) * 1000 / (int64_t)ref_us);
+	const int64_t delta_us = (int64_t)tb_us - (int64_t)ref_us;
 
-	LOG_INF("timebase: %llu us elapsed vs %llu us reference (%d ppt), HFXO %s",
-		tb_us, ref_us, err_ppt,
+	LOG_INF("timebase: %llu us vs %llu us reference, delta %lld us, HFXO %s",
+		tb_us, ref_us, delta_us,
 		timebase_hfxo_running() ? "on" : "off");
+
+	/*
+	 * This is a coarse check, not a calibration. The reference ticks at
+	 * 32.768 kHz, so it quantises to 30.5 us - about 150 ppm over this
+	 * window, which swamps the ~40 ppm a pair of crystals would show.
+	 *
+	 * What it does catch is a clock running off an internal RC oscillator
+	 * instead of its crystal, which is off by 1-2 % - two orders of
+	 * magnitude larger. Flag at 1 %. The true sample rate gets measured
+	 * properly later, by fitting many DRDY captures.
+	 */
+	if (delta_us > (int64_t)ref_us / 100 || -delta_us > (int64_t)ref_us / 100) {
+		LOG_WRN("timebase disagrees with the reference by more than 1 %% - "
+			"one of the two is running on its internal RC oscillator");
+	}
+}
+
+/*
+ * Prove the hardware capture path end to end.
+ *
+ * Configures the AFE, lets it convert for a second, and reports what the
+ * DRDY intervals looked like. Nothing is read over SPI here on purpose: this
+ * isolates the timestamp path, so a failure points at DRDY, GPIOTE or PPI
+ * rather than at the data transfer that comes next.
+ *
+ * The AFE runs from its own oscillator, so the measured rate is expected to
+ * sit near the nominal one rather than on it. That offset is the thing the
+ * drift estimator will track.
+ */
+#define CAPTURE_TEST_MS   1000
+#define CAPTURE_NOMINAL_SPS 250
+
+static void report_capture(void)
+{
+	if (!afe_present) {
+		LOG_INF("capture test skipped: no AFE on this board");
+		return;
+	}
+
+	if (ads1299_configure(ADS1299_DR_250SPS) != 0) {
+		LOG_ERR("AFE configuration failed, skipping capture test");
+		return;
+	}
+
+	if (capture_init() != 0) {
+		LOG_ERR("capture path unavailable");
+		return;
+	}
+
+	if (ads1299_start_conversions() != 0) {
+		LOG_ERR("AFE START failed");
+		return;
+	}
+
+	/*
+	 * Poll rather than take interrupts. The capture is done in hardware,
+	 * so watching the register move tests DRDY, GPIOTE and PPI on their
+	 * own - and it does not care who owns the GPIOTE interrupt.
+	 */
+	struct capture_stats st;
+
+	capture_measure(CAPTURE_TEST_MS, &st);
+
+	(void)ads1299_stop_conversions();
+
+	if (st.count < 2) {
+		LOG_ERR("capture test: %u DRDY edges in %d ms - the AFE is not "
+			"converting, or DRDY is not reaching P0.04",
+			st.count, CAPTURE_TEST_MS);
+		return;
+	}
+
+	/* Mean interval over the window, in microseconds. */
+	const uint32_t mean_us = (uint32_t)(st.total_us / (st.count - 1));
+	const uint32_t sps = (mean_us != 0) ? (TIMEBASE_HZ / mean_us) : 0;
+
+	LOG_INF("capture: %u edges in %d ms -> %u SPS "
+		"(interval mean %u us, min %u, max %u)",
+		st.count, CAPTURE_TEST_MS, sps, mean_us, st.min_us, st.max_us);
+
+	/*
+	 * Jitter is the interesting number. The timestamp is latched in
+	 * hardware, so spread here is the AFE's own oscillator plus any
+	 * missed edges - not interrupt latency.
+	 */
+	const uint32_t spread = st.max_us - st.min_us;
+
+	if (spread > mean_us / 10) {
+		LOG_WRN("DRDY interval spread %u us is over 10 %% of the mean - "
+			"edges are being missed or the AFE is not steady",
+			spread);
+	}
+
+	if (sps < CAPTURE_NOMINAL_SPS * 9 / 10 ||
+	    sps > CAPTURE_NOMINAL_SPS * 11 / 10) {
+		LOG_WRN("measured %u SPS is far from the nominal %d SPS",
+			sps, CAPTURE_NOMINAL_SPS);
+	}
 }
 
 int main(void)
@@ -139,6 +236,7 @@ int main(void)
 	report_supply();
 	report_afe();
 	report_timebase();
+	report_capture();
 
 	/*
 	 * Transports are brought up but carry no protocol yet - the codec

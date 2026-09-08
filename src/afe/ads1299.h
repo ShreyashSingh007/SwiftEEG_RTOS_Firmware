@@ -32,6 +32,37 @@
 
 /* Register map (subset used at this stage). */
 #define ADS1299_REG_ID      0x00
+#define ADS1299_REG_CONFIG1 0x01
+#define ADS1299_REG_CONFIG2 0x02
+#define ADS1299_REG_CONFIG3 0x03
+#define ADS1299_REG_CH1SET  0x05
+#define ADS1299_REG_MISC1   0x15
+
+/*
+ * CONFIG1 data rate, the low three bits. The part divides its own internal
+ * oscillator, so these are nominal - the true rate is measured, not assumed.
+ */
+#define ADS1299_DR_16KSPS 0x00
+#define ADS1299_DR_8KSPS  0x01
+#define ADS1299_DR_4KSPS  0x02
+#define ADS1299_DR_2KSPS  0x03
+#define ADS1299_DR_1KSPS  0x04
+#define ADS1299_DR_500SPS 0x05
+#define ADS1299_DR_250SPS 0x06
+
+/* CONFIG1 bit 7 and bit 4 read back as 1; the rest we set. */
+#define ADS1299_CONFIG1_BASE 0x90
+
+/*
+ * CONFIG3 bits 6:5 must be written as 1. Bit 7 is PD_REFBUF: this board
+ * leaves VREFP with decoupling only, so the internal reference has to be
+ * switched on or every conversion is meaningless.
+ */
+#define ADS1299_CONFIG3_BASE      0x60
+#define ADS1299_CONFIG3_PD_REFBUF 0x80
+
+/* MISC1 bit 5 ties every channel's negative input to SRB1. */
+#define ADS1299_MISC1_SRB1 0x20
 
 /*
  * ID register layout:
@@ -76,6 +107,24 @@ int ads1299_probe(struct afe_probe *out);
  * Only meaningful when the AFE is present. Returns true if stuck.
  */
 bool ads1299_start_pin_stuck_high(void);
+
+/*
+ * Put the part into a known, converting state:
+ *   - internal reference on (mandatory on this board)
+ *   - the requested data rate
+ *   - SRB1 referential montage, matching how the electrodes are wired
+ *
+ * Leaves the part in SDATAC with conversions running, so DRDY pulses but no
+ * data is read. `rate` is one of the ADS1299_DR_* values.
+ */
+int ads1299_configure(uint8_t rate);
+
+/* START and STOP opcodes. Conversions run between them. */
+int ads1299_start_conversions(void);
+int ads1299_stop_conversions(void);
+
+/* Read one register. Exposed so a caller can verify what was written. */
+int ads1299_read_reg(uint8_t addr, uint8_t *val);
 
 /* Human-readable form of a probe result, for logging. */
 const char *afe_probe_str(afe_probe_result_t r);

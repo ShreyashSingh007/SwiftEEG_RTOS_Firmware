@@ -24,8 +24,37 @@ DSP, precise timestamps, and a transport-agnostic binary API.
 
 ## 0. Where we are  (read this first)
 
-**M1 is done**, now on the board with the ADS1299 fitted as well as the one
-without.
+**M1 is done. M2 is under way** - the hardware acquisition path is proven up
+to the point of actually fetching the samples.
+
+### M2 progress: hardware capture works
+
+DRDY is timestamped entirely in hardware. `TIMER1` free-runs at 1 MHz, and
+one PPI channel carries the DRDY falling edge to its capture task, so a
+sample's time is latched the instant it happens, with no CPU involved.
+
+Measured on the board at 250 SPS:
+
+```
+capture: 247 edges in 1000 ms -> 250 SPS (interval mean 3996 us, min 3996, max 3998)
+```
+
+**2 us peak to peak**, which is the 1 MHz timer's own resolution - there is
+no interrupt latency in that number because no interrupt is involved. The
+mean of 3996 us is ~250.2 SPS against a nominal 250, the AFE's internal
+oscillator running about 0.1 % fast. That offset is real and is exactly what
+the drift estimator will track; it is well inside the part's +/-2 % spec.
+
+BLE still advertises with this running, which confirms the PPI channel came
+from the shared allocator rather than one MPSL reserves for the radio.
+
+Still to do for M2: SPI DMA to fetch the 27-byte frames (attaches to the
+same PPI channel), then the ring buffer, DSP chain and streaming.
+
+---
+
+Everything below is M1, verified on the board with the ADS1299 fitted as
+well as the one without.
 
 ### Built and working on hardware
 - Board port, flashing, RTT logging
@@ -57,10 +86,10 @@ Connect, and write bytes to the Control characteristic. Those bytes are
 The codec exists but is not connected to either transport.
 
 ### Next, per the plan
-1. **Command layer** - define commands, wire the codec into BLE and USB.
-   Doable without hardware. Commands touching the AFE can be accepted and
-   stored but not applied until the populated board is connected.
-2. **M2, acquisition + DSP** - needs the board with the ADS1299 fitted.
+1. **SPI DMA fetch** - attach `SPIM3 TASKS_START` to the PPI channel that
+   already carries DRDY, double-buffer the 27-byte frames, and push them
+   into the ring buffer from the transfer-complete interrupt.
+2. **DSP chain and streaming**, then the command layer.
 
 ### Blocked on the user
 - `wsl --install` (admin + reboot) so tests can run without the board.

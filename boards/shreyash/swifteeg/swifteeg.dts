@@ -48,8 +48,8 @@
 	};
 
 	zephyr,user {
-		/* Named handle for the VDD measurement channel above. */
-		io-channels = <&adc 0>;
+		/* Handles for the three VDD measurement channels above. */
+		io-channels = <&adc 0>, <&adc 1>, <&adc 2>;
 	};
 
 	aliases {
@@ -156,9 +156,38 @@
 	#address-cells = <1>;
 	#size-cells = <0>;
 
+	/*
+	 * Three channels, all sampling the SoC's own VDD, differing only in
+	 * gain. This is a deliberate cross-check, not redundancy.
+	 *
+	 * Full scale is 0.6 V / gain:  1/6 -> 3.6 V, 1/5 -> 3.0 V, 1/4 -> 2.4 V.
+	 *
+	 * If VDD really is ~2.2 V, all three agree. If VDD is actually ~3.3 V
+	 * and the scaling is wrong, the 1/5 and 1/4 channels SATURATE, which
+	 * they cannot do if the low reading is genuine. That distinguishes a
+	 * real supply problem from a measurement error without a multimeter.
+	 */
 	channel@0 {
 		reg = <0>;
 		zephyr,gain = "ADC_GAIN_1_6";
+		zephyr,reference = "ADC_REF_INTERNAL";
+		zephyr,acquisition-time = <ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 40)>;
+		zephyr,input-positive = <NRF_SAADC_VDD>;
+		zephyr,resolution = <14>;
+	};
+
+	channel@1 {
+		reg = <1>;
+		zephyr,gain = "ADC_GAIN_1_5";
+		zephyr,reference = "ADC_REF_INTERNAL";
+		zephyr,acquisition-time = <ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 40)>;
+		zephyr,input-positive = <NRF_SAADC_VDD>;
+		zephyr,resolution = <14>;
+	};
+
+	channel@2 {
+		reg = <2>;
+		zephyr,gain = "ADC_GAIN_1_4";
 		zephyr,reference = "ADC_REF_INTERNAL";
 		zephyr,acquisition-time = <ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 40)>;
 		zephyr,input-positive = <NRF_SAADC_VDD>;

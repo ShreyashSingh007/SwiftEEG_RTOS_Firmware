@@ -36,6 +36,9 @@ static void report_supply(void)
 
 	LOG_INF("VDD rail: %d mV", mv);
 
+	/* Prove the reading rather than trusting a single gain setting. */
+	supply_selftest();
+
 	/*
 	 * LP5907 is a 3.3 V part. A reading well under that means either the
 	 * cell has sagged into the regulator's dropout or the rail is loaded
@@ -100,6 +103,13 @@ int main(void)
 	if (usb_transport_init() != 0) {
 		LOG_WRN("USB transport unavailable");
 	}
+
+	/*
+	 * Report the USB regulator state after init. The device controller
+	 * stays disabled until the SoC's internal USB regulator is ready, so
+	 * this distinguishes a firmware problem from a supply one.
+	 */
+	supply_log_usb_status();
 	if (ble_transport_init() != 0) {
 		LOG_WRN("BLE transport unavailable");
 	}

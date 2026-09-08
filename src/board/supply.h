@@ -16,4 +16,21 @@
 /* Reads VDD in millivolts. Negative errno on failure. */
 int supply_read_vdd_mv(void);
 
+/*
+ * Samples VDD at three SAADC gains and logs each.
+ *
+ * Diagnostic, not routine. Agreement across gains proves the reading is real;
+ * saturation on the narrower ranges would prove the rail is higher than
+ * reported and the scaling is at fault. Settles "is the supply low, or is the
+ * ADC lying" without a multimeter.
+ */
+void supply_selftest(void);
+
+/*
+ * Logs POWER.USBREGSTATUS. The nRF52840 keeps its USB device controller
+ * disabled until both VBUSDETECT and OUTPUTRDY are set, so this says whether
+ * a USB failure is the cable, the board, or the firmware.
+ */
+void supply_log_usb_status(void);
+
 #endif /* SWIFTEEG_BOARD_SUPPLY_H */

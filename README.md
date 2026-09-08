@@ -4,9 +4,21 @@
 nRF Connect SDK. Designed as a raw BCI tool: full hardware control, on-chip
 DSP, precise timestamps, and a transport-agnostic binary API.
 
-> **Status: M1 (bring-up), in progress.** Not yet built or flashed — the NCS
-> toolchain is not installed on the dev machine yet. Everything here is
-> authored but **unverified against a compiler**.
+> **Status: M1 complete, verified on hardware.**
+>
+> | Check | Result |
+> |---|---|
+> | Board port, flashing, RTT logging | pass |
+> | Both LEDs blinking | pass |
+> | IMU over SPI | pass, `chip id 0x70` |
+> | AFE absent handled, firmware continues | pass |
+> | VDD rail | 3315 mV |
+> | USB CDC ACM | enumerates as a serial port |
+> | BLE advertising as "SwiftEEG" | pass |
+> | Unit tests on target | 26/26 |
+>
+> Verified on a board built **without** the ADS1299. Acquisition and DSP
+> (M2) need the populated board.
 
 ---
 
@@ -137,6 +149,13 @@ west workspace, so west has no `build` command available.
 
 ---
 
+### 5.3 The debugger stops BLE
+
+Halting the core stops advertising. Every `openocd ... halt` - including the
+RTT attach in `rtt_halted.cfg` - freezes the radio, so a phone scanning at
+that moment sees nothing. If BLE looks dead, reset the board, detach the
+debugger entirely, and scan again before suspecting the firmware.
+
 ## 5. Flashing and logs
 
 **Probe:** ST-Link V2 over SWD to header **J4** (`1=GND 2=nRESET 3=SWDIO 4=SWDCLK`).
@@ -187,8 +206,8 @@ then `telnet localhost 9090`.
 
 ## 6. Milestones
 
-- **M1 — bring-up.** Board port, RTT logging, USB + BLE up, AFE and IMU IDs
-  verified over SPI, both LEDs blinking.
+- **M1 — bring-up. DONE.** Board port, RTT logging, USB + BLE up, IMU ID
+  verified over SPI, AFE absence handled, both LEDs blinking.
 - **M2 — acquisition + DSP.** PPI-latched `DRDY` timestamps, SPIM3 DMA
   acquisition 250 SPS→16 kSPS, IMU alignment, DSP chain, binary protocol over
   BLE and USB.

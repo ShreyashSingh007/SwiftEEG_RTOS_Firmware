@@ -20,7 +20,10 @@
 param(
     [ValidateSet("app", "proto", "dsp")]
     [string]$Target = "app",
-    [switch]$Pristine
+    [switch]$Pristine,
+    # Builds the app without BLE. RTT is unreliable while MPSL owns the bus,
+    # so this is how the USB path and boot logs get diagnosed.
+    [switch]$NoBle
 )
 
 # NOT "Stop": cmake and ninja write ordinary progress to stderr, and with
@@ -51,7 +54,13 @@ if ($Pristine -and (Test-Path $BuildDir)) {
 
 Write-Host "building '$Target' from $SourceDir"
 
-& "$Toolchain\opt\bin\cmake.exe" -B $BuildDir -S $SourceDir -GNinja -DBOARD=swifteeg
+$cmakeArgs = @("-B", $BuildDir, "-S", $SourceDir, "-GNinja", "-DBOARD=swifteeg")
+if ($NoBle -and $Target -eq "app") {
+    $cmakeArgs += ("-DEXTRA_CONF_FILE=" + (Join-Path $RepoRoot "usb_only.conf"))
+    Write-Host "  (BLE disabled via usb_only.conf)"
+}
+
+& "$Toolchain\opt\bin\cmake.exe" @cmakeArgs
 if ($LASTEXITCODE -ne 0) { throw "cmake configure failed" }
 
 & "$Toolchain\opt\bin\ninja.exe" -C $BuildDir

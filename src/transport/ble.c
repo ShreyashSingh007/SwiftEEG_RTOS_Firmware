@@ -1,5 +1,16 @@
 #include "ble.h"
 
+/*
+ * Everything below needs the Bluetooth subsystem. When CONFIG_BT is off the
+ * module compiles to stubs, which allows a BLE-less diagnostic build.
+ *
+ * That build exists for a concrete reason: once MPSL and the radio are
+ * running they hold the bus for timing, and RTT reads over the ST-Link HLA
+ * transport become unreliable enough to drop the debug connection entirely.
+ * Turning BLE off is currently the only way to get trustworthy logs.
+ */
+#if defined(CONFIG_BT)
+
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/bluetooth/gatt.h>
@@ -203,3 +214,29 @@ int ble_transport_send_stream(const void *data, uint16_t len)
 	/* Attribute 2 is the stream characteristic's value. */
 	return bt_gatt_notify(current_conn, &swifteeg_svc.attrs[3], data, len);
 }
+
+#else /* !CONFIG_BT */
+
+#include <zephyr/logging/log.h>
+
+LOG_MODULE_REGISTER(ble, CONFIG_LOG_DEFAULT_LEVEL);
+
+int ble_transport_init(void)
+{
+	LOG_INF("BLE disabled in this build");
+	return 0;
+}
+
+bool ble_transport_is_streaming(void)
+{
+	return false;
+}
+
+int ble_transport_send_stream(const void *data, uint16_t len)
+{
+	ARG_UNUSED(data);
+	ARG_UNUSED(len);
+	return -ENOTSUP;
+}
+
+#endif /* CONFIG_BT */

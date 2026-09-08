@@ -4,7 +4,7 @@
 nRF Connect SDK. Designed as a raw BCI tool: full hardware control, on-chip
 DSP, precise timestamps, and a transport-agnostic binary API.
 
-> **Status: M1 complete, verified on both board builds.**
+> **Status: M1 complete, fully verified on both board builds.**
 >
 > | Check | No-AFE board | AFE board |
 > |---|---|---|
@@ -14,7 +14,7 @@ DSP, precise timestamps, and a transport-agnostic binary API.
 > | ADS1299 over SPI | absent, handled | **present, ID 0x3e, 8 ch** |
 > | ADS1299 `START` not stuck high | n/a | **pass** |
 > | VDD rail | 3315 mV | 3309 mV |
-> | USB CDC ACM | enumerates as a serial port | pending |
+> | USB CDC ACM | COM3 | COM4 |
 > | BLE advertising as "SwiftEEG" | pass | pass |
 > | Unit tests on target | 26/26 | - |
 >
@@ -38,8 +38,8 @@ without.
 - **`START` pin is not stuck high** - the floating-pin risk is closed, no
   hardware change needed. See section on risks.
 - VDD rail 3315 mV (no-AFE board) / 3309 mV (AFE board)
-- USB CDC ACM enumerates as a serial port (no-AFE board; not yet retested
-  on the AFE board)
+- USB CDC ACM enumerates as a serial port, on both boards
+  (`VBUSDETECT=1 OUTPUTRDY=1` -> `usbd_cdc_acm: Configuration enabled`)
 - BLE advertises as "SwiftEEG"
 - 26/26 unit tests pass on target
 
@@ -65,10 +65,10 @@ The codec exists but is not connected to either transport.
 ### Blocked on the user
 - `wsl --install` (admin + reboot) so tests can run without the board.
   Optional; tests currently run on target instead.
-- Plug USB into the AFE board to confirm it enumerates there too.
 
-The solder-jumper question is **resolved**: the AFE board reads 3309 mV, so
-its supply is healthy and it did not have the fault that the other board had.
+Nothing else. The solder-jumper question is **resolved**: the AFE board reads
+3309 mV, so its supply is healthy and it never had the fault that the other
+board had.
 
 ### Scope reminder
 Milestone order is fixed: **(1) bring-up with USB+BLE -> (2) raw ADC + DSP
@@ -317,6 +317,16 @@ python tools/rtt.py --live 20
 Both are verified working on this rig. Live mode is the less dependable of
 the two - RTT reads race the running target over HLA - so prefer the halted
 dump unless you need to watch something that happens after boot.
+
+### 5.5 `usbd_ch9: not supported` is benign
+
+Windows asks every new device for a Microsoft OS descriptor. This firmware
+does not implement one, so channel 9 logs a protocol error and Windows moves
+on. Enumeration completes normally - `usbd_cdc_acm: Configuration enabled`
+follows a few hundred ms later, and the port appears. Not a fault.
+
+Also note the VID/PID are **Zephyr's test IDs** (0x2FE3/0x0001). They must be
+changed before this ships to anyone.
 
 ### 5.5 The debugger stops BLE
 

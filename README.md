@@ -22,6 +22,55 @@ DSP, precise timestamps, and a transport-agnostic binary API.
 
 ---
 
+## 0. Where we are  (read this first)
+
+**M1 is done.** Everything below was verified on the board built **without**
+an ADS1299.
+
+### Built and working on hardware
+- Board port, flashing, RTT logging
+- Both LEDs blinking
+- IMU responds over SPI (`chip id 0x70`) - driver initialises only, no
+  sample pipeline yet, and none is planned until M2 phase 2
+- ADS1299 absence detected; firmware carries on, so one binary runs on all
+  three boards
+- VDD rail 3315 mV
+- USB CDC ACM enumerates as a serial port
+- BLE advertises as "SwiftEEG"
+- 26/26 unit tests pass on target
+
+### Built, tested, but NOT wired into the application
+These compile and pass tests, but nothing calls them yet:
+- `src/proto` - binary protocol codec (9 tests)
+- `src/sys/ringbuf` - lock-free SPSC ring (5 tests)
+- `src/dsp` - DC removal, biquad cascade, filter design (12 tests)
+
+They are also **not in the app's CMakeLists** yet - test builds only.
+
+### What BLE can actually do today
+Connect, and write bytes to the Control characteristic. Those bytes are
+**logged and discarded**. There is no command set and no parameter control.
+The codec exists but is not connected to either transport.
+
+### Next, per the plan
+1. **Command layer** - define commands, wire the codec into BLE and USB.
+   Doable without hardware. Commands touching the AFE can be accepted and
+   stored but not applied until the populated board is connected.
+2. **M2, acquisition + DSP** - needs the board with the ADS1299 fitted.
+
+### Blocked on the user
+- `wsl --install` (admin + reboot) so tests can run without the board.
+  Optional; tests currently run on target instead.
+- Confirm the ADS1299 board got the **same solder-jumper fix**. Its
+  +/-2.5 V analog rails come off the supply that read 2.26 V here.
+
+### Scope reminder
+Milestone order is fixed: **(1) bring-up with USB+BLE -> (2) raw ADC + DSP
+-> (3) validate DSP -> SD last, may not happen.** No IMU streaming, no
+extra features, until the step that calls for them.
+
+---
+
 ## 1. Hardware
 
 | Part | Role |

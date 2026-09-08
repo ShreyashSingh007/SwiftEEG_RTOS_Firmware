@@ -18,7 +18,7 @@
         .\tools\build.ps1 -Pristine       # wipe the build dir first
 #>
 param(
-    [ValidateSet("app", "proto", "dsp")]
+    [ValidateSet("app", "proto", "dsp", "timebase")]
     [string]$Target = "app",
     [switch]$Pristine,
     # Builds the app without BLE. RTT is unreliable while MPSL owns the bus,
@@ -35,6 +35,20 @@ $Toolchain = "C:\ncs\toolchains\dcbdc366a1"
 $NcsVersion = "v3.4.0"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 
+# Zephyr's CMake and Kconfig split paths on spaces ("File not found:
+# D:/Electronics"), so everything is built through a space-free junction to
+# the same directory. Create it once with:
+#   New-Item -ItemType Junction -Path D:\SwiftEEG_RTOS -Target "<repo>"
+$Junction = "D:\SwiftEEG_RTOS"
+if ($RepoRoot -match " ") {
+    if (-not (Test-Path (Join-Path $Junction "CMakeLists.txt"))) {
+        throw "Repo path contains spaces and the junction $Junction is missing. " +
+              "Create it with: New-Item -ItemType Junction -Path $Junction -Target '$RepoRoot'"
+    }
+    Write-Host "building via $Junction (repo path contains spaces)"
+    $RepoRoot = $Junction
+}
+
 $env:PATH = "$Toolchain\opt\bin;$Toolchain\opt\zephyr-sdk\gnu\arm-zephyr-eabi\bin;$env:PATH"
 $env:ZEPHYR_BASE = "C:\ncs\$NcsVersion\zephyr"
 $env:ZEPHYR_TOOLCHAIN_VARIANT = "zephyr"
@@ -44,6 +58,7 @@ switch ($Target) {
     "app"   { $SourceDir = $RepoRoot }
     "proto" { $SourceDir = Join-Path $RepoRoot "tests\proto" }
     "dsp"   { $SourceDir = Join-Path $RepoRoot "tests\dsp" }
+    "timebase" { $SourceDir = Join-Path $RepoRoot "tests\timebase" }
 }
 $BuildDir = Join-Path $SourceDir "build"
 

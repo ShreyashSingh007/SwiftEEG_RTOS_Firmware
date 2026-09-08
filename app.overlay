@@ -1,0 +1,18 @@
+/*
+ * Application-level hardware choices, kept out of the board files because
+ * they are firmware policy rather than facts about the board.
+ */
+
+/*
+ * TIMER1 is the EEG sample timebase - see src/timebase.
+ *
+ * No Zephyr driver binds to this node: it is enabled purely so the
+ * application can take the peripheral and read its IRQ number from
+ * devicetree instead of hard-coding one.
+ *
+ * TIMER0 is not an option. MPSL owns it, along with RTC0, ECB, RADIO,
+ * CLOCK, TEMP and PPI channels 19, 30 and 31.
+ */
+&timer1 {
+	status = "okay";
+};

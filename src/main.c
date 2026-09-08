@@ -17,6 +17,7 @@
 #include "afe/ads1299.h"
 #include "board/leds.h"
 #include "board/supply.h"
+#include "timebase/timebase.h"
 #include "transport/ble.h"
 #include "transport/usb.h"
 
@@ -82,6 +83,49 @@ static void report_afe(void)
 	}
 }
 
+/*
+ * Bring up the sample timebase and prove it counts at the right rate.
+ *
+ * The check is against the kernel clock, which runs from the 32.768 kHz
+ * crystal, while the timebase counts HFCLK. Two independent crystals: if
+ * they agree the pair is trustworthy, and a disagreement points at whichever
+ * one is running off its internal RC oscillator instead.
+ */
+static void report_timebase(void)
+{
+	if (timebase_init() != 0) {
+		LOG_WRN("timebase unavailable");
+		return;
+	}
+
+	const uint32_t c0 = k_cycle_get_32();
+	const uint64_t t0 = timebase_now_us();
+
+	k_msleep(200);
+
+	const uint64_t t1 = timebase_now_us();
+	const uint32_t c1 = k_cycle_get_32();
+
+	const uint64_t tb_us = t1 - t0;
+	const uint64_t ref_us = k_cyc_to_us_near64(c1 - c0);
+
+	if (ref_us == 0) {
+		LOG_WRN("timebase check: reference clock did not advance");
+		return;
+	}
+
+	/*
+	 * Error in parts per thousand, signed. Crystals should land within a
+	 * count or two of zero; the internal RC would show tens.
+	 */
+	const int32_t err_ppt =
+		(int32_t)(((int64_t)tb_us - (int64_t)ref_us) * 1000 / (int64_t)ref_us);
+
+	LOG_INF("timebase: %llu us elapsed vs %llu us reference (%d ppt), HFXO %s",
+		tb_us, ref_us, err_ppt,
+		timebase_hfxo_running() ? "on" : "off");
+}
+
 int main(void)
 {
 	LOG_INF("SwiftEEG firmware starting (M1 bring-up)");
@@ -94,6 +138,7 @@ int main(void)
 
 	report_supply();
 	report_afe();
+	report_timebase();
 
 	/*
 	 * Transports are brought up but carry no protocol yet - the codec

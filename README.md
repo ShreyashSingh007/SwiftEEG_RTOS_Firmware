@@ -27,29 +27,62 @@ DSP, precise timestamps, and a transport-agnostic binary API.
 **M1 is done. M2 is under way** - the hardware acquisition path is proven up
 to the point of actually fetching the samples.
 
-### M2 progress: hardware capture works
+### M2 progress: samples are flowing through the DMA path
 
-DRDY is timestamped entirely in hardware. `TIMER1` free-runs at 1 MHz, and
-one PPI channel carries the DRDY falling edge to its capture task, so a
-sample's time is latched the instant it happens, with no CPU involved.
+DRDY drives the whole acquisition cycle in hardware. One PPI channel carries
+the falling edge to two tasks - `TIMER1` capture, which timestamps the
+sample, and `SPIM3 TASKS_START`, which fetches it. The CPU does nothing
+until 27 bytes are already in RAM.
 
 Measured on the board at 250 SPS:
 
 ```
-capture: 247 edges in 1000 ms -> 250 SPS (interval mean 3996 us, min 3996, max 3998)
+capture: 247 edges in 1000 ms -> 250 SPS (interval mean 3996 us, min 3996, max 3997)
+stream:  247 frames in 1000 ms (237 measured) -> 250 SPS (gap mean 3996 us, min 3996, max 3997)
+stream:  status word 0xc00000, bad 0, overruns 0
+stream:  ch1 shorted-input noise 31 counts p-p (~692 nV), min -977 max -946
 ```
 
-**2 us peak to peak**, which is the 1 MHz timer's own resolution - there is
-no interrupt latency in that number because no interrupt is involved. The
-mean of 3996 us is ~250.2 SPS against a nominal 250, the AFE's internal
-oscillator running about 0.1 % fast. That offset is real and is exactly what
-the drift estimator will track; it is well inside the part's +/-2 % spec.
+What each line is worth:
 
-BLE still advertises with this running, which confirms the PPI channel came
-from the shared allocator rather than one MPSL reserves for the radio.
+- **1 us jitter.** That is the 1 MHz timer's own resolution. No interrupt
+  latency appears in a timestamp because no interrupt is involved in taking
+  it.
+- **`status word 0xc00000`, 0 bad in 237.** The ADS1299 hard-wires the top
+  four status bits to `1100`. Every frame carrying `0xC` means none slipped
+  by a byte - the failure mode to fear when hardware, not code, starts the
+  transfer.
+- **0 overruns.** No transfer was still running when the next DRDY arrived.
+- **692 nV peak-to-peak, shorted inputs, gain 24.** The datasheet's
+  input-referred noise is ~0.14 uV RMS at this setting, which is roughly
+  0.9 uV peak-to-peak for Gaussian noise. The analog front end is behaving.
 
-Still to do for M2: SPI DMA to fetch the 27-byte frames (attaches to the
-same PPI channel), then the ring buffer, DSP chain and streaming.
+The mean gap of 3996 us is ~250.2 SPS against a nominal 250 - the AFE's
+internal oscillator running about 0.1 % fast, well inside its +/-2 % spec,
+and exactly the offset the drift estimator exists to measure.
+
+BLE still advertises through all of this, which is the real check that the
+PPI and GPIOTE channels came from the shared allocators rather than ones
+MPSL reserves for the radio.
+
+### Two things the SPI bring-up settled
+
+**SPIM3 is driven through the HAL, not Zephyr's SPI API.** The transfer has
+to be started by PPI on the DRDY edge with no code in between, which that
+API cannot express. The `spi3` node is left disabled for Zephyr's driver and
+`src/afe` owns the peripheral; pins still come from devicetree via pinctrl,
+and `spi2` keeps using the normal driver for the IMU.
+
+**Hardware chip select is not used, and cannot be.** SPIM3 is the only
+instance with one, and it is configured correctly - `PSEL.CSN`, `CSNPOL`,
+`CSNDUR` all read back right - but the part never answers through it. Its
+guard time tops out around 4 us and the ADS1299 needs longer between CS
+falling and the first clock. So CS is a plain GPIO: toggled around register
+access, and held low for the whole streaming session, which is the
+arrangement the datasheet describes for continuous read.
+
+Still to do for M2: ring buffer between the interrupt and a DSP thread, the
+DSP chain itself, and streaming out over BLE and USB.
 
 ---
 
@@ -86,10 +119,9 @@ Connect, and write bytes to the Control characteristic. Those bytes are
 The codec exists but is not connected to either transport.
 
 ### Next, per the plan
-1. **SPI DMA fetch** - attach `SPIM3 TASKS_START` to the PPI channel that
-   already carries DRDY, double-buffer the 27-byte frames, and push them
-   into the ring buffer from the transfer-complete interrupt.
-2. **DSP chain and streaming**, then the command layer.
+1. **Ring buffer** - move frames from the transfer-complete interrupt to a
+   DSP thread. `src/sys/ringbuf` is written and tested but not yet wired in.
+2. **DSP chain**, then streaming, then the command layer.
 
 ### Blocked on the user
 - `wsl --install` (admin + reboot) so tests can run without the board.

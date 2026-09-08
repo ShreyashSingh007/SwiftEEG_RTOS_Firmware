@@ -1,69 +1,213 @@
 #include "ads1299.h"
 
+#include "timebase/timebase.h"
+
 #include <zephyr/device.h>
 #include <zephyr/drivers/gpio.h>
-#include <zephyr/drivers/spi.h>
+#include <zephyr/drivers/pinctrl.h>
+#include <zephyr/irq.h>
 #include <zephyr/kernel.h>
+#include <string.h>
 #include <zephyr/logging/log.h>
+
+#include <hal/nrf_gpio.h>
+#include <hal/nrf_spim.h>
 
 LOG_MODULE_REGISTER(afe, CONFIG_LOG_DEFAULT_LEVEL);
 
-#define AFE_NODE DT_ALIAS(eeg_afe)
+#define AFE_NODE     DT_ALIAS(eeg_afe)
+#define AFE_SPI_NODE DT_NODELABEL(spi3)
+#define AFE_SPIM     NRF_SPIM3
+
+/*
+ * SPIM3 is driven through the HAL rather than Zephyr's SPI API.
+ *
+ * The acquisition path needs the transfer started by PPI on the DRDY edge,
+ * with the CPU asleep. Zephyr's API has no way to express that - it starts
+ * transfers from a function call - so this driver owns the peripheral
+ * directly and the spi3 node is left disabled for Zephyr's driver.
+ *
+ * SPIM3 specifically because it is the only instance on this part with
+ * hardware chip select, which the PPI-triggered transfer needs: nothing can
+ * toggle CS in software when no code runs between DRDY and the transfer.
+ *
+ * Pins still come from devicetree - pinctrl routes SCK, MOSI and MISO, and
+ * CS comes from the node's cs-gpios.
+ */
+PINCTRL_DT_DEFINE(AFE_SPI_NODE);
+static const struct pinctrl_dev_config *afe_pcfg =
+	PINCTRL_DT_DEV_CONFIG_GET(AFE_SPI_NODE);
+
+#define AFE_CS_PORT DT_PROP(DT_SPI_DEV_CS_GPIOS_CTLR(AFE_NODE), port)
+#define AFE_CS_PIN  DT_SPI_DEV_CS_GPIOS_PIN(AFE_NODE)
+
+static const struct gpio_dt_spec afe_drdy =
+	GPIO_DT_SPEC_GET(AFE_NODE, drdy_gpios);
 
 /*
  * ADS1299 is SPI mode 1 (CPOL=0, CPHA=1).
  *
- * Register access runs at 1 MHz rather than the 16 MHz in the devicetree.
- * The part needs ~4 tCLK (about 2 us at its 2.048 MHz internal oscillator)
- * between a command and the data that follows it. At 1 MHz one byte takes
- * 8 us, which satisfies that naturally and lets each register operation be a
- * single transfer. Streaming in M2 uses the full 16 MHz, where that timing is
- * handled by the DMA framing instead.
+ * Register access runs at 1 MHz rather than the 16 MHz the part can take.
+ * It needs ~4 tCLK (about 2 us at its 2.048 MHz internal oscillator) between
+ * a command and the data that follows. At 1 MHz one byte takes 8 us, which
+ * satisfies that naturally and lets each register operation be a single
+ * transfer. Streaming switches to 16 MHz, where the gap is handled by the
+ * framing instead.
  */
-#define AFE_REG_FREQ_HZ 1000000U
-#define AFE_SPI_OP (SPI_WORD_SET(8) | SPI_TRANSFER_MSB | SPI_MODE_CPHA)
+#define AFE_FREQ_REGS   NRF_SPIM_FREQ_1M
+#define AFE_FREQ_STREAM NRF_SPIM_FREQ_8M
 
-static struct spi_dt_spec afe_spi = SPI_DT_SPEC_GET(AFE_NODE, AFE_SPI_OP);
-static const struct gpio_dt_spec afe_drdy =
-	GPIO_DT_SPEC_GET(AFE_NODE, drdy_gpios);
+/*
+ * CSN guard time, in 15.625 ns units. The ADS1299 wants CS settled well
+ * before the first clock edge; 16 gives 250 ns, comfortably over its
+ * requirement and costing nothing at these rates.
+ */
+#define AFE_CSN_DURATION 16
+
+/*
+ * EasyDMA can only reach RAM, so command bytes cannot be sent from a const
+ * array in flash. Everything goes through these.
+ */
+static uint8_t afe_tx[8];
+static uint8_t afe_rx[8];
+
+static bool afe_bus_ready;
+
+/*
+ * True while the transfer-complete interrupt is armed, and while CS is being
+ * held low for a streaming session. Blocking transfers have to know both:
+ * see afe_xfer().
+ */
+static bool afe_irq_on;
+static bool afe_cs_held;
+
+static uint32_t afe_cs_pin(void)
+{
+	return NRF_GPIO_PIN_MAP(AFE_CS_PORT, AFE_CS_PIN);
+}
+
+static int afe_bus_init(void)
+{
+	if (afe_bus_ready) {
+		return 0;
+	}
+
+	int err = pinctrl_apply_state(afe_pcfg, PINCTRL_STATE_DEFAULT);
+
+	if (err < 0) {
+		LOG_ERR("AFE pinctrl failed (%d)", err);
+		return err;
+	}
+
+	nrf_spim_disable(AFE_SPIM);
+	nrf_spim_configure(AFE_SPIM, NRF_SPIM_MODE_1, NRF_SPIM_BIT_ORDER_MSB_FIRST);
+	nrf_spim_frequency_set(AFE_SPIM, AFE_FREQ_REGS);
+
+	/*
+	 * Chip select is driven as a plain GPIO for register access. The pad
+	 * has to be an output either way: csn_configure() only routes CSN
+	 * inside the peripheral and never touches GPIO, and CS is not in the
+	 * pinctrl group because devicetree models it as cs-gpios.
+	 */
+	nrf_gpio_pin_set(afe_cs_pin()); /* idle high */
+	nrf_gpio_cfg_output(afe_cs_pin());
+
+	/* Bytes clocked out once the TX buffer runs dry during a longer read. */
+	nrf_spim_orc_set(AFE_SPIM, 0x00);
+
+	nrf_spim_enable(AFE_SPIM);
+
+	afe_bus_ready = true;
+	return 0;
+}
+
+static void afe_xfer_done(void)
+{
+	if (!afe_cs_held) {
+		nrf_gpio_pin_set(afe_cs_pin());
+	}
+	if (afe_irq_on) {
+		nrf_spim_int_enable(AFE_SPIM, NRF_SPIM_INT_END_MASK);
+	}
+}
+
+/* Blocking transfer. Used for register access only; streaming is DMA. */
+static int afe_xfer(size_t len)
+{
+	if (!afe_bus_ready) {
+		return -ENODEV;
+	}
+
+	/*
+	 * Take the END interrupt down for the duration. This function decides
+	 * the transfer is finished by polling that same event, and the ISR
+	 * clears it - so with the interrupt armed the poll never sees it and
+	 * every register access times out.
+	 */
+	if (afe_irq_on) {
+		nrf_spim_int_disable(AFE_SPIM, NRF_SPIM_INT_END_MASK);
+	}
+
+	nrf_spim_tx_buffer_set(AFE_SPIM, afe_tx, len);
+	nrf_spim_rx_buffer_set(AFE_SPIM, afe_rx, len);
+
+	/* During streaming CS is already low and must stay there. */
+	if (!afe_cs_held) {
+		nrf_gpio_pin_clear(afe_cs_pin());
+	}
+
+	nrf_spim_event_clear(AFE_SPIM, NRF_SPIM_EVENT_END);
+	nrf_spim_task_trigger(AFE_SPIM, NRF_SPIM_TASK_START);
+
+	/*
+	 * Bounded wait. At 1 MHz an 8-byte transfer takes 64 us, so anything
+	 * approaching this limit means the peripheral is not running.
+	 */
+	for (int i = 0; i < 10000; i++) {
+		if (nrf_spim_event_check(AFE_SPIM, NRF_SPIM_EVENT_END)) {
+			nrf_spim_event_clear(AFE_SPIM, NRF_SPIM_EVENT_END);
+			afe_xfer_done();
+			return 0;
+		}
+		k_busy_wait(1);
+	}
+
+	afe_xfer_done();
+	LOG_ERR("AFE SPI transfer timed out");
+	return -ETIMEDOUT;
+}
 
 static int afe_cmd(uint8_t cmd)
 {
-	const struct spi_buf tx = { .buf = &cmd, .len = 1 };
-	const struct spi_buf_set tx_set = { .buffers = &tx, .count = 1 };
-
-	return spi_write_dt(&afe_spi, &tx_set);
+	afe_tx[0] = cmd;
+	return afe_xfer(1);
 }
 
 static int afe_read_reg(uint8_t addr, uint8_t *val)
 {
-	/* RREG: [0x20|addr][n-1][data]. Single transfer, CS held throughout. */
-	uint8_t tx_buf[3] = { ADS1299_CMD_RREG | addr, 0x00, 0x00 };
-	uint8_t rx_buf[3] = { 0 };
+	/* RREG: [0x20|addr][n-1][data]. One transfer, CS held throughout. */
+	afe_tx[0] = ADS1299_CMD_RREG | addr;
+	afe_tx[1] = 0x00;
+	afe_tx[2] = 0x00;
 
-	const struct spi_buf tx = { .buf = tx_buf, .len = sizeof(tx_buf) };
-	const struct spi_buf rx = { .buf = rx_buf, .len = sizeof(rx_buf) };
-	const struct spi_buf_set tx_set = { .buffers = &tx, .count = 1 };
-	const struct spi_buf_set rx_set = { .buffers = &rx, .count = 1 };
+	int err = afe_xfer(3);
 
-	int err = spi_transceive_dt(&afe_spi, &tx_set, &rx_set);
 	if (err) {
 		return err;
 	}
 
-	*val = rx_buf[2];
+	*val = afe_rx[2];
 	return 0;
 }
 
 static int afe_write_reg(uint8_t addr, uint8_t val)
 {
-	/* WREG: [0x40|addr][n-1][data]. Single transfer, CS held throughout. */
-	uint8_t tx_buf[3] = { ADS1299_CMD_WREG | addr, 0x00, val };
+	/* WREG: [0x40|addr][n-1][data]. */
+	afe_tx[0] = ADS1299_CMD_WREG | addr;
+	afe_tx[1] = 0x00;
+	afe_tx[2] = val;
 
-	const struct spi_buf tx = { .buf = tx_buf, .len = sizeof(tx_buf) };
-	const struct spi_buf_set tx_set = { .buffers = &tx, .count = 1 };
-
-	return spi_write_dt(&afe_spi, &tx_set);
+	return afe_xfer(3);
 }
 
 int ads1299_read_reg(uint8_t addr, uint8_t *val)
@@ -153,13 +297,11 @@ int ads1299_probe(struct afe_probe *out)
 	out->result = AFE_BUS_ERROR;
 	out->raw_id = 0;
 
-	if (!spi_is_ready_dt(&afe_spi)) {
-		LOG_ERR("AFE SPI bus not ready");
-		return -ENODEV;
-	}
+	int bus_err = afe_bus_init();
 
-	/* Slow down for register access - see AFE_REG_FREQ_HZ above. */
-	afe_spi.config.frequency = AFE_REG_FREQ_HZ;
+	if (bus_err) {
+		return bus_err;
+	}
 
 	/*
 	 * RESET opcode, not a pin: RESET is tied high through a pull-up on
@@ -237,4 +379,153 @@ bool ads1299_start_pin_stuck_high(void)
 	}
 
 	return false;
+}
+
+
+/* ---- continuous acquisition ---------------------------------------- */
+
+/*
+ * Two frame buffers. EasyDMA writes one while the callback reads the other,
+ * so a frame is never being overwritten while it is being consumed. They
+ * must live in RAM - EasyDMA cannot reach flash.
+ */
+static uint8_t afe_frame[2][ADS1299_FRAME_BYTES];
+static uint8_t afe_dummy[ADS1299_FRAME_BYTES];
+static uint8_t afe_active;
+
+static ads1299_frame_cb_t afe_cb;
+static volatile uint32_t afe_overrun;
+static bool afe_streaming;
+
+static void afe_spim_isr(const void *arg)
+{
+	ARG_UNUSED(arg);
+
+	if (!nrf_spim_event_check(AFE_SPIM, NRF_SPIM_EVENT_END)) {
+		return;
+	}
+	nrf_spim_event_clear(AFE_SPIM, NRF_SPIM_EVENT_END);
+
+	/*
+	 * The timestamp was latched when DRDY fell, before this interrupt was
+	 * ever raised, so none of its latency is in the number.
+	 */
+	const uint64_t ts = timebase_stamp_us(timebase_capture_get());
+
+	const uint8_t done = afe_active;
+
+	/*
+	 * Point the DMA at the other buffer before doing anything else. The
+	 * next DRDY can start a transfer at any moment and nothing in software
+	 * gates it.
+	 */
+	afe_active ^= 1;
+	nrf_spim_rx_buffer_set(AFE_SPIM, afe_frame[afe_active],
+			       ADS1299_FRAME_BYTES);
+
+	if (afe_cb != NULL) {
+		afe_cb(afe_frame[done], ts);
+	}
+}
+
+uint32_t ads1299_start_task_addr(void)
+{
+	return nrf_spim_task_address_get(AFE_SPIM, NRF_SPIM_TASK_START);
+}
+
+uint32_t ads1299_overruns(void)
+{
+	return afe_overrun;
+}
+
+int ads1299_stream_start(ads1299_frame_cb_t cb)
+{
+	if (afe_streaming) {
+		return -EALREADY;
+	}
+	if (!afe_bus_ready) {
+		return -ENODEV;
+	}
+
+	afe_cb = cb;
+	afe_active = 0;
+	afe_overrun = 0;
+
+	/* Enter continuous-read mode: the part clocks out a frame per DRDY. */
+	int err = afe_cmd(ADS1299_CMD_RDATAC);
+
+	if (err) {
+		return err;
+	}
+
+	/*
+	 * Faster clock for the payload. 27 bytes at 8 MHz take 27 us, which
+	 * fits inside even the 62.5 us budget of the highest sample rate.
+	 */
+	nrf_spim_frequency_set(AFE_SPIM, AFE_FREQ_STREAM);
+
+	/*
+	 * Chip select stays low for the whole session rather than being
+	 * toggled per transfer.
+	 *
+	 * Nothing runs between the DRDY edge and the transfer it triggers, so
+	 * software cannot drive CS, and the peripheral's hardware chip select
+	 * does not work here: its guard time maxes out at about 4 us and the
+	 * ADS1299 needs longer between CS falling and the first clock. Holding
+	 * CS low throughout is the arrangement the datasheet describes for
+	 * continuous read, and it removes the timing question entirely.
+	 */
+	nrf_gpio_pin_clear(afe_cs_pin());
+	afe_cs_held = true;
+
+	/*
+	 * TX is a buffer of zeros: the part ignores DIN during RDATAC, but
+	 * SPIM needs something to clock out to generate SCK.
+	 */
+	memset(afe_dummy, 0, sizeof(afe_dummy));
+	nrf_spim_tx_buffer_set(AFE_SPIM, afe_dummy, ADS1299_FRAME_BYTES);
+	nrf_spim_rx_buffer_set(AFE_SPIM, afe_frame[afe_active],
+			       ADS1299_FRAME_BYTES);
+
+	nrf_spim_event_clear(AFE_SPIM, NRF_SPIM_EVENT_END);
+
+	IRQ_CONNECT(DT_IRQN(AFE_SPI_NODE), DT_IRQ(AFE_SPI_NODE, priority),
+		    afe_spim_isr, NULL, 0);
+	irq_enable(DT_IRQN(AFE_SPI_NODE));
+	nrf_spim_int_enable(AFE_SPIM, NRF_SPIM_INT_END_MASK);
+	afe_irq_on = true;
+
+	afe_streaming = true;
+
+	/* Conversions last: everything must be ready before the first DRDY. */
+	err = ads1299_start_conversions();
+	if (err) {
+		ads1299_stream_stop();
+		return err;
+	}
+
+	return 0;
+}
+
+void ads1299_stream_stop(void)
+{
+	if (!afe_streaming) {
+		return;
+	}
+
+	(void)ads1299_stop_conversions();
+
+	nrf_spim_int_disable(AFE_SPIM, NRF_SPIM_INT_END_MASK);
+	irq_disable(DT_IRQN(AFE_SPI_NODE));
+	afe_irq_on = false;
+
+	afe_cs_held = false;
+	nrf_gpio_pin_set(afe_cs_pin());
+	nrf_spim_frequency_set(AFE_SPIM, AFE_FREQ_REGS);
+
+	afe_streaming = false;
+	afe_cb = NULL;
+
+	/* Back to command mode so registers can be written again. */
+	(void)afe_cmd(ADS1299_CMD_SDATAC);
 }

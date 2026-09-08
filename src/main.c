@@ -223,6 +223,151 @@ static void report_capture(void)
 	}
 }
 
+/*
+ * Stream real samples through the DMA path.
+ *
+ * One PPI channel now carries the DRDY edge to two tasks: the timer capture
+ * that timestamps the sample, and the SPI transfer that fetches it. The CPU
+ * does nothing until the 27 bytes are already in RAM.
+ */
+#define STREAM_TEST_MS 1000
+
+/*
+ * Frames to discard before measuring. The first transfer is started by the
+ * first DRDY after RDATAC is entered, and the part has not necessarily put a
+ * complete sample on the bus by then - that frame reads back as zeros and
+ * would otherwise sit in the noise figure as a large fake excursion.
+ */
+#define STREAM_WARMUP 10
+
+static volatile uint32_t sf_count;
+static volatile uint32_t sf_total;
+static volatile uint32_t sf_bad_status;
+static volatile uint64_t sf_first_us;
+static volatile uint64_t sf_last_us;
+static volatile uint32_t sf_min_gap;
+static volatile uint32_t sf_max_gap;
+static volatile int32_t sf_ch1_min;
+static volatile int32_t sf_ch1_max;
+static volatile uint32_t sf_last_status;
+
+/* Sign-extend one 24-bit big-endian channel word. */
+static int32_t decode_ch(const uint8_t *p)
+{
+	const uint32_t raw = ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | p[2];
+
+	return (raw & 0x800000u) ? (int32_t)(raw | 0xFF000000u) : (int32_t)raw;
+}
+
+static void on_frame(const uint8_t *frame, uint64_t ts_us)
+{
+	sf_last_status = ((uint32_t)frame[0] << 16) | ((uint32_t)frame[1] << 8) |
+			 frame[2];
+
+	sf_total++;
+
+	if (sf_total <= STREAM_WARMUP) {
+		sf_last_us = ts_us;
+		return;
+	}
+
+	if (sf_count == 0) {
+		sf_first_us = ts_us;
+		sf_ch1_min = INT32_MAX;
+		sf_ch1_max = INT32_MIN;
+	} else {
+		const uint32_t gap = (uint32_t)(ts_us - sf_last_us);
+
+		if (gap < sf_min_gap) {
+			sf_min_gap = gap;
+		}
+		if (gap > sf_max_gap) {
+			sf_max_gap = gap;
+		}
+	}
+
+	/*
+	 * The status word's top four bits are hard-wired to 1100. Anything
+	 * else means the frame is misaligned, which is the failure mode to
+	 * watch for when a transfer is started by hardware rather than code.
+	 */
+	if ((frame[0] & 0xF0u) != 0xC0u) {
+		sf_bad_status++;
+	}
+
+	const int32_t ch1 = decode_ch(&frame[ADS1299_STATUS_BYTES]);
+
+	if (ch1 < sf_ch1_min) {
+		sf_ch1_min = ch1;
+	}
+	if (ch1 > sf_ch1_max) {
+		sf_ch1_max = ch1;
+	}
+
+	sf_last_us = ts_us;
+	sf_count++;
+}
+
+static void report_stream(void)
+{
+	if (!afe_present) {
+		return;
+	}
+
+	if (capture_attach_task(ads1299_start_task_addr()) != 0) {
+		LOG_ERR("could not attach the SPI start task to DRDY");
+		return;
+	}
+
+	sf_count = 0;
+	sf_total = 0;
+	sf_bad_status = 0;
+	sf_min_gap = UINT32_MAX;
+	sf_max_gap = 0;
+
+	if (ads1299_stream_start(on_frame) != 0) {
+		LOG_ERR("stream start failed");
+		return;
+	}
+
+	k_msleep(STREAM_TEST_MS);
+	ads1299_stream_stop();
+
+	const uint32_t n = sf_count;
+
+	if (n < 2) {
+		LOG_ERR("stream: %u frames in %d ms - DRDY is not starting the "
+			"SPI transfer", n, STREAM_TEST_MS);
+		return;
+	}
+
+	const uint32_t mean_us = (uint32_t)((sf_last_us - sf_first_us) / (n - 1));
+
+	LOG_INF("stream: %u frames in %d ms (%u measured) -> %u SPS "
+		"(gap mean %u us, min %u, max %u)",
+		sf_total, STREAM_TEST_MS, n,
+		mean_us ? (TIMEBASE_HZ / mean_us) : 0,
+		mean_us, sf_min_gap, sf_max_gap);
+
+	LOG_INF("stream: status word 0x%06x, bad %u, overruns %u",
+		sf_last_status, sf_bad_status, ads1299_overruns());
+
+	/*
+	 * Channels sit at their reset setting, which is gain 24 with the
+	 * inputs shorted internally - so this is a noise-floor reading, not
+	 * EEG. LSB is 4.5 V / (24 * 2^23), about 22.35 nV.
+	 */
+	const int32_t span = sf_ch1_max - sf_ch1_min;
+
+	LOG_INF("stream: ch1 shorted-input noise %d counts p-p (~%d nV), "
+		"min %d max %d", span, span * 2235 / 100, sf_ch1_min, sf_ch1_max);
+
+	if (sf_bad_status != 0) {
+		LOG_WRN("%u frames had a bad status word - transfers are "
+			"misaligned with DRDY", sf_bad_status);
+	}
+}
+
 int main(void)
 {
 	LOG_INF("SwiftEEG firmware starting (M1 bring-up)");
@@ -237,6 +382,7 @@ int main(void)
 	report_afe();
 	report_timebase();
 	report_capture();
+	report_stream();
 
 	/*
 	 * Transports are brought up but carry no protocol yet - the codec

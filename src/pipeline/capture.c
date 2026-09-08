@@ -5,6 +5,7 @@
 #include <zephyr/logging/log.h>
 
 #include <helpers/nrfx_gppi.h>
+#include <hal/nrf_gpio.h>
 #include <nrfx_gpiote.h>
 
 #include "timebase/timebase.h"
@@ -52,6 +53,13 @@ int capture_init(void)
 			return -EIO;
 		}
 	}
+
+	/*
+	 * GPIOTE can only see an edge if the pad's input buffer is connected.
+	 * Do it here rather than relying on some earlier caller having
+	 * configured the pin, which is an easy dependency to break.
+	 */
+	nrf_gpio_cfg_input(drdy_pin(), NRF_GPIO_PIN_NOPULL);
 
 	int err = nrfx_gpiote_channel_alloc(&gpiote, &drdy_ch);
 	if (err != 0) {
@@ -115,6 +123,22 @@ int capture_init(void)
 
 	LOG_INF("DRDY capture wired: P%u.%02u -> TIMER1 CC[0] (GPIOTE ch %u)",
 		DRDY_PORT, DRDY_PIN, drdy_ch);
+
+	return 0;
+}
+
+int capture_attach_task(uint32_t task_addr)
+{
+	if (!capture_ready) {
+		return -ENODEV;
+	}
+
+	int err = nrfx_gppi_ep_attach(task_addr, ppi_handle);
+
+	if (err != 0) {
+		LOG_ERR("second task attach failed (%d)", err);
+		return -EIO;
+	}
 
 	return 0;
 }

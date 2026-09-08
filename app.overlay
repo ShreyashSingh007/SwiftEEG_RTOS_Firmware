@@ -16,3 +16,18 @@
 &timer1 {
 	status = "okay";
 };
+
+/*
+ * SPIM3 belongs to the AFE driver, not to Zephyr's SPI driver.
+ *
+ * The acquisition path needs the transfer started by PPI on the DRDY edge
+ * with no code running in between, which Zephyr's SPI API cannot express.
+ * src/afe owns the peripheral through the HAL instead.
+ *
+ * The node stays in the tree - pinctrl, cs-gpios and the ads1299 child are
+ * all still read from devicetree. Only the driver binding is switched off.
+ * SPI itself stays enabled for the IMU on spi2.
+ */
+&spi3 {
+	status = "disabled";
+};

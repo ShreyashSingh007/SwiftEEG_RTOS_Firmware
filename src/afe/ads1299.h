@@ -126,6 +126,42 @@ int ads1299_stop_conversions(void);
 /* Read one register. Exposed so a caller can verify what was written. */
 int ads1299_read_reg(uint8_t addr, uint8_t *val);
 
+/*
+ * One RDATAC frame: 3 status bytes then 8 channels of 24-bit data.
+ * The status word carries the lead-off and GPIO bits.
+ */
+#define ADS1299_FRAME_BYTES 27
+#define ADS1299_STATUS_BYTES 3
+#define ADS1299_CHANNELS 8
+
+/*
+ * Called from the SPI transfer-complete interrupt, once per sample.
+ * `ts_us` was latched by hardware when DRDY fell, so it carries none of the
+ * interrupt's latency. `frame` stays valid only until the next callback.
+ */
+typedef void (*ads1299_frame_cb_t)(const uint8_t *frame, uint64_t ts_us);
+
+/*
+ * Begin continuous acquisition.
+ *
+ * Puts the part into RDATAC and hands the SPI start task to the caller, so
+ * the DRDY edge can trigger the transfer through PPI with no CPU in the
+ * loop. `cb` runs from the transfer-complete interrupt.
+ */
+int ads1299_stream_start(ads1299_frame_cb_t cb);
+
+/* Stop acquisition and return the part to command mode. */
+void ads1299_stream_stop(void);
+
+/* Address of SPI TASKS_START, to hang off the same PPI channel as DRDY. */
+uint32_t ads1299_start_task_addr(void);
+
+/*
+ * Frames whose transfer had not finished when the next DRDY arrived. Any
+ * non-zero value means samples were lost.
+ */
+uint32_t ads1299_overruns(void);
+
 /* Human-readable form of a probe result, for logging. */
 const char *afe_probe_str(afe_probe_result_t r);
 

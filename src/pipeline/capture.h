@@ -44,6 +44,13 @@ int capture_init(void);
  */
 void capture_measure(uint32_t ms, struct capture_stats *out);
 
+/*
+ * Hang a second task off the DRDY channel, so one edge both timestamps the
+ * sample and starts its SPI transfer. nRF52 PPI allows one event and two
+ * tasks per channel, which is exactly the two we need.
+ */
+int capture_attach_task(uint32_t task_addr);
+
 /* Timestamp of the most recent DRDY, in microseconds. */
 uint64_t capture_last_us(void);
 

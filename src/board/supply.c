@@ -29,8 +29,13 @@ static const struct adc_dt_spec vdd_ch[] = {
 static const int fs_mv[] = { 3600, 3000, 2400 };
 static const char *const gain_name[] = { "1/6", "1/5", "1/4" };
 
-/* 14-bit single-ended: the largest code the SAADC can return. */
-#define ADC_FULL_SCALE_COUNT 16383
+/*
+ * 14-bit single-ended tops out at 16383 in theory, but gain and reference
+ * tolerance mean a saturated channel reads slightly under that - 16380 was
+ * observed on this part. Compare against a threshold rather than the exact
+ * maximum, or genuine saturation goes unflagged.
+ */
+#define ADC_SATURATED_COUNT 16300
 
 static int read_channel(const struct adc_dt_spec *spec, int16_t *raw_out)
 {
@@ -105,15 +110,13 @@ void supply_selftest(void)
 		 * channel's full scale pins the code at maximum, which a
 		 * genuinely lower rail can never do.
 		 */
-		const bool saturated = (raw >= ADC_FULL_SCALE_COUNT);
+		const bool saturated = (raw >= ADC_SATURATED_COUNT);
 
 		LOG_INF("  gain %s (full scale %d mV): raw %5d -> %4d mV%s",
 			gain_name[i], fs_mv[i], raw, mv,
 			saturated ? "  <-- SATURATED, VDD exceeds this range" : "");
 	}
 
-	LOG_INF("If all three agree, the rail really is that voltage.");
-	LOG_INF("If the narrow ranges saturate, VDD is higher and scaling is wrong.");
 }
 
 void supply_log_usb_status(void)

@@ -14,6 +14,9 @@ target_sources(app PRIVATE
   src/afe/ads1299.c
   src/timebase/timebase.c
   src/pipeline/capture.c
+  src/pipeline/pipeline.c
+  src/dsp/dsp.c
+  src/sys/ringbuf.c
   src/transport/usb.c
   src/transport/ble.c
 )

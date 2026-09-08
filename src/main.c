@@ -18,6 +18,7 @@
 #include "board/leds.h"
 #include "board/supply.h"
 #include "pipeline/capture.h"
+#include "pipeline/pipeline.h"
 #include "timebase/timebase.h"
 #include "transport/ble.h"
 #include "transport/usb.h"
@@ -224,147 +225,68 @@ static void report_capture(void)
 }
 
 /*
- * Stream real samples through the DMA path.
+ * Run the acquisition pipeline and report what came out.
  *
- * One PPI channel now carries the DRDY edge to two tasks: the timer capture
- * that timestamps the sample, and the SPI transfer that fetches it. The CPU
- * does nothing until the 27 bytes are already in RAM.
+ * This is the whole chain: DRDY starts the DMA transfer in hardware, the
+ * transfer-complete interrupt drops the frame into a lock-free ring, and a
+ * thread decodes, removes DC in the integer domain, scales to microvolts
+ * and runs the mains notch.
  */
-#define STREAM_TEST_MS 1000
+#define PIPELINE_TEST_MS 1000
 
-/*
- * Frames to discard before measuring. The first transfer is started by the
- * first DRDY after RDATAC is entered, and the part has not necessarily put a
- * complete sample on the bus by then - that frame reads back as zeros and
- * would otherwise sit in the noise figure as a large fake excursion.
- */
-#define STREAM_WARMUP 10
-
-static volatile uint32_t sf_count;
-static volatile uint32_t sf_total;
-static volatile uint32_t sf_bad_status;
-static volatile uint64_t sf_first_us;
-static volatile uint64_t sf_last_us;
-static volatile uint32_t sf_min_gap;
-static volatile uint32_t sf_max_gap;
-static volatile int32_t sf_ch1_min;
-static volatile int32_t sf_ch1_max;
-static volatile uint32_t sf_last_status;
-
-/* Sign-extend one 24-bit big-endian channel word. */
-static int32_t decode_ch(const uint8_t *p)
-{
-	const uint32_t raw = ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | p[2];
-
-	return (raw & 0x800000u) ? (int32_t)(raw | 0xFF000000u) : (int32_t)raw;
-}
-
-static void on_frame(const uint8_t *frame, uint64_t ts_us)
-{
-	sf_last_status = ((uint32_t)frame[0] << 16) | ((uint32_t)frame[1] << 8) |
-			 frame[2];
-
-	sf_total++;
-
-	if (sf_total <= STREAM_WARMUP) {
-		sf_last_us = ts_us;
-		return;
-	}
-
-	if (sf_count == 0) {
-		sf_first_us = ts_us;
-		sf_ch1_min = INT32_MAX;
-		sf_ch1_max = INT32_MIN;
-	} else {
-		const uint32_t gap = (uint32_t)(ts_us - sf_last_us);
-
-		if (gap < sf_min_gap) {
-			sf_min_gap = gap;
-		}
-		if (gap > sf_max_gap) {
-			sf_max_gap = gap;
-		}
-	}
-
-	/*
-	 * The status word's top four bits are hard-wired to 1100. Anything
-	 * else means the frame is misaligned, which is the failure mode to
-	 * watch for when a transfer is started by hardware rather than code.
-	 */
-	if ((frame[0] & 0xF0u) != 0xC0u) {
-		sf_bad_status++;
-	}
-
-	const int32_t ch1 = decode_ch(&frame[ADS1299_STATUS_BYTES]);
-
-	if (ch1 < sf_ch1_min) {
-		sf_ch1_min = ch1;
-	}
-	if (ch1 > sf_ch1_max) {
-		sf_ch1_max = ch1;
-	}
-
-	sf_last_us = ts_us;
-	sf_count++;
-}
-
-static void report_stream(void)
+static void report_pipeline(void)
 {
 	if (!afe_present) {
+		LOG_INF("pipeline test skipped: no AFE on this board");
 		return;
 	}
 
-	if (capture_attach_task(ads1299_start_task_addr()) != 0) {
-		LOG_ERR("could not attach the SPI start task to DRDY");
+	if (pipeline_start(ADS1299_DR_250SPS) != 0) {
+		LOG_ERR("pipeline failed to start");
 		return;
 	}
 
-	sf_count = 0;
-	sf_total = 0;
-	sf_bad_status = 0;
-	sf_min_gap = UINT32_MAX;
-	sf_max_gap = 0;
+	k_msleep(PIPELINE_TEST_MS);
 
-	if (ads1299_stream_start(on_frame) != 0) {
-		LOG_ERR("stream start failed");
+	struct pipeline_stats st;
+
+	pipeline_get_stats(&st);
+	pipeline_stop();
+
+	if (st.processed == 0) {
+		LOG_ERR("pipeline: no samples processed");
 		return;
 	}
 
-	k_msleep(STREAM_TEST_MS);
-	ads1299_stream_stop();
-
-	const uint32_t n = sf_count;
-
-	if (n < 2) {
-		LOG_ERR("stream: %u frames in %d ms - DRDY is not starting the "
-			"SPI transfer", n, STREAM_TEST_MS);
-		return;
-	}
-
-	const uint32_t mean_us = (uint32_t)((sf_last_us - sf_first_us) / (n - 1));
-
-	LOG_INF("stream: %u frames in %d ms (%u measured) -> %u SPS "
-		"(gap mean %u us, min %u, max %u)",
-		sf_total, STREAM_TEST_MS, n,
-		mean_us ? (TIMEBASE_HZ / mean_us) : 0,
-		mean_us, sf_min_gap, sf_max_gap);
-
-	LOG_INF("stream: status word 0x%06x, bad %u, overruns %u",
-		sf_last_status, sf_bad_status, ads1299_overruns());
+	LOG_INF("pipeline: %u frames, %u processed, %u dropped, %u bad status",
+		st.frames, st.processed, st.ring_drops, st.bad_status);
 
 	/*
-	 * Channels sit at their reset setting, which is gain 24 with the
-	 * inputs shorted internally - so this is a noise-floor reading, not
-	 * EEG. LSB is 4.5 V / (24 * 2^23), about 22.35 nV.
+	 * Cost per sample decides which rates are reachable, so report it as
+	 * a load rather than leaving it to be worked out. Tenths of a percent
+	 * because at 250 SPS whole percent rounds to zero and reads as free.
+	 *
+	 * The 16 kSPS projection is the number that actually constrains the
+	 * design: a 62.5 us sample period leaves far less room.
 	 */
-	const int32_t span = sf_ch1_max - sf_ch1_min;
+	const uint32_t period_us = TIMEBASE_HZ / 250U;
+	const uint32_t load_tenths = st.dsp_mean_us * 1000U / period_us;
+	/* 16 kSPS is a 62.5 us period, so tenths of a percent is us * 16. */
+	const uint32_t load_16k = st.dsp_mean_us * 16U;
 
-	LOG_INF("stream: ch1 shorted-input noise %d counts p-p (~%d nV), "
-		"min %d max %d", span, span * 2235 / 100, sf_ch1_min, sf_ch1_max);
+	LOG_INF("pipeline: DSP %u us/sample mean, %u us worst -> %u.%u %% at "
+		"250 SPS, would be %u.%u %% at 16 kSPS",
+		st.dsp_mean_us, st.dsp_max_us,
+		load_tenths / 10U, load_tenths % 10U,
+		load_16k / 10U, load_16k % 10U);
 
-	if (sf_bad_status != 0) {
-		LOG_WRN("%u frames had a bad status word - transfers are "
-			"misaligned with DRDY", sf_bad_status);
+	/* Integer nanovolts: float formatting is not built into the log. */
+	LOG_INF("pipeline: ch1 %d to %d nV after DC removal and notch",
+		(int)(st.ch1_min_uv * 1000.0f), (int)(st.ch1_max_uv * 1000.0f));
+
+	if (st.ring_drops != 0) {
+		LOG_WRN("%u frames dropped - the DSP thread is not keeping up",
+			st.ring_drops);
 	}
 }
 
@@ -382,7 +304,7 @@ int main(void)
 	report_afe();
 	report_timebase();
 	report_capture();
-	report_stream();
+	report_pipeline();
 
 	/*
 	 * Transports are brought up but carry no protocol yet - the codec

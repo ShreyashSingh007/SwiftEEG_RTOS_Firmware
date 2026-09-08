@@ -260,6 +260,16 @@ int ads1299_configure(uint8_t rate)
 	}
 
 	/*
+	 * Normal electrode input at gain 24. Without this the channels stay
+	 * at their reset setting, which is internally shorted - a noise
+	 * measurement, not EEG.
+	 */
+	err = ads1299_set_channels(ADS1299_GAIN_24, ADS1299_MUX_NORMAL);
+	if (err) {
+		return err;
+	}
+
+	/*
 	 * Read back the two registers that decide whether the data is valid at
 	 * all. A silent SPI failure here would otherwise look like real EEG.
 	 */
@@ -277,7 +287,40 @@ int ads1299_configure(uint8_t rate)
 		return -EIO;
 	}
 
-	LOG_INF("AFE configured: CONFIG1 %02x, CONFIG3 %02x, SRB1 on", cfg1, cfg3);
+	uint8_t ch1 = 0;
+
+	(void)afe_read_reg(ADS1299_REG_CH1SET, &ch1);
+
+	LOG_INF("AFE configured: CONFIG1 %02x, CONFIG3 %02x, CH1SET %02x, SRB1 on",
+		cfg1, cfg3, ch1);
+	return 0;
+}
+
+int ads1299_set_channels(uint8_t gain, uint8_t mux)
+{
+	const uint8_t val = (uint8_t)(((gain & 0x07u) << 4) | (mux & 0x07u));
+
+	for (uint8_t i = 0; i < ADS1299_CHANNELS; i++) {
+		int err = afe_write_reg(ADS1299_REG_CH1SET + i, val);
+
+		if (err) {
+			LOG_ERR("CH%uSET write failed (%d)", i + 1, err);
+			return err;
+		}
+	}
+
+	/* One readback is enough to catch a bus that is not working at all. */
+	uint8_t back = 0;
+	int err = afe_read_reg(ADS1299_REG_CH1SET, &back);
+
+	if (err) {
+		return err;
+	}
+	if (back != val) {
+		LOG_ERR("CH1SET readback %02x, wanted %02x", back, val);
+		return -EIO;
+	}
+
 	return 0;
 }
 

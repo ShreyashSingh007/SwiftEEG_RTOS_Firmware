@@ -61,6 +61,24 @@
 #define ADS1299_CONFIG3_BASE      0x60
 #define ADS1299_CONFIG3_PD_REFBUF 0x80
 
+/*
+ * CHnSET: [7] power down, [6:4] gain, [3] SRB2, [2:0] mux.
+ *
+ * Reset is 0x61 - gain 24 with the inputs shorted, which measures the part's
+ * own noise rather than anything on the electrodes. Normal input is mux 000.
+ */
+#define ADS1299_MUX_NORMAL  0x00
+#define ADS1299_MUX_SHORTED 0x01
+#define ADS1299_MUX_TEST    0x05	/* internal square wave, for M3 */
+
+#define ADS1299_GAIN_1  0x00
+#define ADS1299_GAIN_2  0x01
+#define ADS1299_GAIN_4  0x02
+#define ADS1299_GAIN_6  0x03
+#define ADS1299_GAIN_8  0x04
+#define ADS1299_GAIN_12 0x05
+#define ADS1299_GAIN_24 0x06
+
 /* MISC1 bit 5 ties every channel's negative input to SRB1. */
 #define ADS1299_MISC1_SRB1 0x20
 
@@ -118,6 +136,12 @@ bool ads1299_start_pin_stuck_high(void);
  * data is read. `rate` is one of the ADS1299_DR_* values.
  */
 int ads1299_configure(uint8_t rate);
+
+/*
+ * Set every channel's gain and input mux. SRB2 is left open: the negative
+ * inputs come from SRB1 instead, which is how this board is wired.
+ */
+int ads1299_set_channels(uint8_t gain, uint8_t mux);
 
 /* START and STOP opcodes. Conversions run between them. */
 int ads1299_start_conversions(void);

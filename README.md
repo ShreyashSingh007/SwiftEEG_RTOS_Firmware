@@ -148,22 +148,48 @@ LEDs are **active high** — the MCU drives the anode.
 
 ## 2. Repo layout
 
+Written, and compiled into the application:
+
 ```
 boards/shreyash/swifteeg/   out-of-tree board port (HWMv2)
 dts/bindings/               ti,ads1299 binding
-src/board/                  LEDs, power, battery
-src/afe/                    ADS1299 driver
-src/imu/                    LSM6DSV16X driver
-src/timebase/               PPI capture, 64-bit clock, drift, host sync
-src/dsp/                    filter chain (CMSIS-DSP)
-src/pipeline/               acquisition -> DSP -> sink fan-out
-src/transport/              BLE + USB behind one sink interface
-src/proto/                  binary codec (pure, host-testable)
-src/storage/                SD block layer
-src/sys/                    ring buffers, error handling
-tests/                      ztest suites
-tools/                      Python: golden vectors, host client, R&D harness
+src/board/                  LEDs, VDD self-test
+src/afe/                    ADS1299 probe + START self-test (probe only)
+src/transport/              BLE GATT service, USB CDC ACM
 openocd/                    ST-Link runner config
+tools/                      build, flash, RTT, Python oracles
+```
+
+Written and tested, but **not yet in the application's CMakeLists** - test
+builds only, nothing calls them:
+
+```
+src/proto/                  binary codec          (9 tests)
+src/dsp/                    DC removal, biquads   (12 tests)
+src/sys/                    lock-free SPSC ring   (5 tests)
+```
+
+**Empty placeholders** - directories exist to fix the shape of the tree, but
+there is no code in them yet:
+
+```
+src/timebase/               M2: PPI capture, 64-bit clock, drift, host sync
+src/pipeline/               M2: acquisition -> DSP -> sink fan-out
+src/storage/                M4: SD block layer
+src/imu/                    M2 phase 2: artifact reference input
+```
+
+There is no SwiftEEG IMU driver and none is needed for M1 - the `chip id
+0x70` in the boot log comes from Zephyr's in-tree `LSM6DSV16X` driver, bound
+in devicetree.
+
+Test layout does not mirror `src/`: the **ringbuf suite lives inside
+`tests/dsp/`**, since both link the same test binary. `tests/ringbuf/` and
+`tests/timebase/` are empty directories - ignore them.
+
+```
+tests/proto/                proto suite            9 tests
+tests/dsp/                  dsp + ringbuf suites   17 tests
 ```
 
 ---
@@ -288,8 +314,9 @@ target instead:
 python tools/rtt.py --live 20
 ```
 
-Live mode is less dependable: RTT reads race the running target over HLA.
-Prefer the halted dump unless you need to watch something post-boot.
+Both are verified working on this rig. Live mode is the less dependable of
+the two - RTT reads race the running target over HLA - so prefer the halted
+dump unless you need to watch something that happens after boot.
 
 ### 5.5 The debugger stops BLE
 

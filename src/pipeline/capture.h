@@ -18,6 +18,7 @@
 #ifndef SWIFTEEG_CAPTURE_H
 #define SWIFTEEG_CAPTURE_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 /* What the DRDY intervals looked like over a measurement window. */
@@ -50,6 +51,16 @@ void capture_measure(uint32_t ms, struct capture_stats *out);
  * tasks per channel, which is exactly the two we need.
  */
 int capture_attach_task(uint32_t task_addr);
+
+/*
+ * Enable or disable the DRDY trigger.
+ *
+ * Disabling stops the edge from reaching either task, so no transfer can
+ * start behind the CPU's back. Anything that talks to the AFE over SPI
+ * outside the streaming path has to do this first, or its transfer collides
+ * with a hardware-started one and both are corrupted.
+ */
+void capture_set_trigger(bool on);
 
 /* Timestamp of the most recent DRDY, in microseconds. */
 uint64_t capture_last_us(void);

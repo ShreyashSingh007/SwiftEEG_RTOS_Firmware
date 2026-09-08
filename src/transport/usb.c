@@ -1,7 +1,9 @@
 #include "usb.h"
 
 #include <zephyr/device.h>
+#include <zephyr/sys/atomic.h>
 #include <zephyr/drivers/uart.h>
+#include <zephyr/sys/ring_buffer.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 /*
@@ -43,6 +45,19 @@ USBD_DESC_CONFIG_DEFINE(swifteeg_fs_cfg_desc, "SwiftEEG FS Configuration");
 
 /* Bus-powered, 250 mA. No remote wakeup: nothing here needs to wake a host. */
 USBD_CONFIGURATION_DEFINE(swifteeg_fs_config, 0, 250, &swifteeg_fs_cfg_desc);
+
+/* Transmit path; defined at the bottom of this file. */
+#define USB_TX_BUF_BYTES 8192
+static uint8_t usb_tx_storage[USB_TX_BUF_BYTES];
+static struct ring_buf usb_tx_rb;
+static atomic_t usb_tx_dropped;
+static bool usb_tx_ready;
+static void cdc_irq_handler(const struct device *dev, void *user_data);
+
+/* Inbound buffer. Commands are small and rare; 512 bytes is generous. */
+#define USB_RX_BUF_BYTES 512
+static uint8_t usb_rx_storage[USB_RX_BUF_BYTES];
+static struct ring_buf usb_rx_rb;
 
 static const struct device *const cdc_dev =
 	DEVICE_DT_GET(DT_NODELABEL(cdc_acm_uart0));
@@ -107,6 +122,12 @@ int usb_transport_init(void)
 		return err;
 	}
 
+	ring_buf_init(&usb_tx_rb, sizeof(usb_tx_storage), usb_tx_storage);
+	ring_buf_init(&usb_rx_rb, sizeof(usb_rx_storage), usb_rx_storage);
+	uart_irq_callback_user_data_set(cdc_dev, cdc_irq_handler, NULL);
+	uart_irq_rx_enable(cdc_dev);
+	usb_tx_ready = true;
+
 	LOG_INF("USB CDC ACM up (VID 0x%04x PID 0x%04x)",
 		SWIFTEEG_USB_VID, SWIFTEEG_USB_PID);
 	return 0;
@@ -122,4 +143,81 @@ bool usb_transport_is_connected(void)
 
 	(void)uart_line_ctrl_get(cdc_dev, UART_LINE_CTRL_DTR, &dtr);
 	return dtr != 0;
+}
+
+
+/* ---- transmit path -------------------------------------------------- */
+
+/*
+ * The outbound buffer is 8 kB, about 30 ms of 8-channel data at 1 kSPS -
+ * enough to ride out the host pausing briefly without losing anything.
+ */
+static void cdc_irq_handler(const struct device *dev, void *user_data)
+{
+	ARG_UNUSED(user_data);
+
+	while (uart_irq_update(dev) && uart_irq_is_pending(dev)) {
+		if (uart_irq_rx_ready(dev)) {
+			uint8_t rx[64];
+			const int n = uart_fifo_read(dev, rx, sizeof(rx));
+
+			if (n > 0) {
+				/* A full buffer drops commands rather than
+				 * stalling the interrupt. */
+				(void)ring_buf_put(&usb_rx_rb, rx, (uint32_t)n);
+			}
+		}
+
+		if (!uart_irq_tx_ready(dev)) {
+			continue;
+		}
+
+		uint8_t *data;
+		const uint32_t claimed =
+			ring_buf_get_claim(&usb_tx_rb, &data, USB_TX_BUF_BYTES);
+
+		if (claimed == 0) {
+			/* Nothing left: stop asking to be interrupted. */
+			uart_irq_tx_disable(dev);
+			(void)ring_buf_get_finish(&usb_tx_rb, 0);
+			continue;
+		}
+
+		const int sent = uart_fifo_fill(dev, data, (int)claimed);
+
+		(void)ring_buf_get_finish(&usb_tx_rb, (sent > 0) ? sent : 0);
+	}
+}
+
+size_t usb_transport_write(const uint8_t *buf, size_t len)
+{
+	if (!usb_tx_ready || !usb_transport_is_connected()) {
+		return 0;
+	}
+
+	const uint32_t put = ring_buf_put(&usb_tx_rb, buf, len);
+
+	if (put < len) {
+		atomic_add(&usb_tx_dropped, (atomic_val_t)(len - put));
+	}
+
+	if (put != 0) {
+		uart_irq_tx_enable(cdc_dev);
+	}
+
+	return put;
+}
+
+uint32_t usb_transport_dropped(void)
+{
+	return (uint32_t)atomic_get(&usb_tx_dropped);
+}
+
+size_t usb_transport_read(uint8_t *buf, size_t len)
+{
+	if (!usb_tx_ready) {
+		return 0;
+	}
+
+	return ring_buf_get(&usb_rx_rb, buf, (uint32_t)len);
 }

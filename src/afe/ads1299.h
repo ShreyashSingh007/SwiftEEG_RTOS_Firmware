@@ -79,6 +79,31 @@
 #define ADS1299_GAIN_12 0x05
 #define ADS1299_GAIN_24 0x06
 
+/*
+ * CONFIG2 drives the built-in test generator. Bits 7:6 read back as 1.
+ *
+ *   bit 4  INT_CAL    1 = generate the signal internally
+ *   bit 2  CAL_AMP    0 = 1 x (VREFP-VREFN)/2400, 1 = twice that
+ *   bits 1:0 CAL_FREQ 00 = fCLK/2^21, 01 = fCLK/2^20, 11 = DC
+ *
+ * With the internal 2.048 MHz oscillator and the internal 4.5 V reference,
+ * CAL_FREQ 00 gives a ~0.98 Hz square wave of +/-1.875 mV at the inputs.
+ * That is a known amplitude and a known frequency, which is what makes it
+ * worth anything as a check.
+ */
+#define ADS1299_CONFIG2_BASE     0xC0
+#define ADS1299_CONFIG2_INT_CAL  0x10
+#define ADS1299_CONFIG2_CAL_AMP  0x04
+#define ADS1299_CAL_FREQ_DIV21   0x00	/* ~0.98 Hz */
+#define ADS1299_CAL_FREQ_DIV20   0x01	/* ~1.95 Hz */
+#define ADS1299_CAL_FREQ_DC      0x03
+
+/*
+ * Test signal amplitude at the input, in nanovolts: (4.5 / 2400) volts.
+ * The square wave swings either side of zero, so peak-to-peak is twice this.
+ */
+#define ADS1299_CAL_AMPLITUDE_NV 1875000
+
 /* MISC1 bit 5 ties every channel's negative input to SRB1. */
 #define ADS1299_MISC1_SRB1 0x20
 
@@ -143,12 +168,27 @@ int ads1299_configure(uint8_t rate);
  */
 int ads1299_set_channels(uint8_t gain, uint8_t mux);
 
+/*
+ * Switch every channel to the internal test generator, or back to the
+ * electrodes. The generated square wave has a known amplitude and frequency,
+ * so what comes out the far end of the DSP chain can be checked rather than
+ * eyeballed.
+ */
+int ads1299_test_signal(bool on, uint8_t cal_freq);
+
 /* START and STOP opcodes. Conversions run between them. */
 int ads1299_start_conversions(void);
 int ads1299_stop_conversions(void);
 
-/* Read one register. Exposed so a caller can verify what was written. */
+/* Read one register. Only valid when the part is already in command mode. */
 int ads1299_read_reg(uint8_t addr, uint8_t *val);
+
+/*
+ * Read one register from anywhere, including mid-acquisition: drops the part
+ * into command mode, reads, and puts it back. Registers read back as zero in
+ * continuous-read mode, so the plain version silently lies while streaming.
+ */
+int ads1299_read_reg_safe(uint8_t addr, uint8_t *val);
 
 /*
  * One RDATAC frame: 3 status bytes then 8 channels of 24-bit data.
@@ -176,6 +216,14 @@ int ads1299_stream_start(ads1299_frame_cb_t cb);
 
 /* Stop acquisition and return the part to command mode. */
 void ads1299_stream_stop(void);
+
+/*
+ * Hook the driver uses to stop DRDY starting transfers while it talks to the
+ * part directly. Whoever wired the trigger installs this; without it, any
+ * register access during acquisition races a hardware-started transfer.
+ */
+typedef void (*ads1299_trigger_gate_t)(bool enable);
+void ads1299_set_trigger_gate(ads1299_trigger_gate_t gate);
 
 /* Address of SPI TASKS_START, to hang off the same PPI channel as DRDY. */
 uint32_t ads1299_start_task_addr(void);

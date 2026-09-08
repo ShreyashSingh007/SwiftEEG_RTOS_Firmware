@@ -27,9 +27,19 @@ struct eeg_sample {
 	uint64_t ts_us;                     /* latched in hardware at DRDY */
 	uint32_t seq;
 	uint32_t status;                    /* AFE status word, lead-off bits */
-	float    ch_uv[ADS1299_CHANNELS];
+	int32_t  ch_raw[ADS1299_CHANNELS];  /* ADC counts, before any DSP */
+	float    ch_uv[ADS1299_CHANNELS];   /* microvolts, after the chain */
 	uint8_t  flags;
 };
+
+/*
+ * Called from the DSP thread for every completed sample. Keep it short: it
+ * runs in the acquisition path, ahead of the next frame.
+ */
+typedef void (*pipeline_sink_t)(const struct eeg_sample *s);
+
+/* Install the sink. Pass NULL to detach. Set before pipeline_start(). */
+void pipeline_set_sink(pipeline_sink_t sink);
 
 struct pipeline_stats {
 	uint32_t frames;      /* frames the interrupt handed over */

@@ -19,6 +19,8 @@
 #include "board/supply.h"
 #include "pipeline/capture.h"
 #include "pipeline/pipeline.h"
+#include "transport/command.h"
+#include "transport/stream.h"
 #include "timebase/timebase.h"
 #include "transport/ble.h"
 #include "transport/usb.h"
@@ -225,69 +227,51 @@ static void report_capture(void)
 }
 
 /*
- * Run the acquisition pipeline and report what came out.
+ * Start acquisition and leave it running.
  *
- * This is the whole chain: DRDY starts the DMA transfer in hardware, the
- * transfer-complete interrupt drops the frame into a lock-free ring, and a
- * thread decodes, removes DC in the integer domain, scales to microvolts
- * and runs the mains notch.
+ * Samples go out over USB as protocol DATA frames, in raw ADC counts by
+ * default - which is what the host needs to check the AFE against its own
+ * test generator, since a known amplitude in counts is only known before
+ * anything filters it.
+ *
+ * Streaming starts switched off. The host turns it on, so a device sitting
+ * on a bench with nobody listening is not filling a buffer nobody reads.
  */
-#define PIPELINE_TEST_MS 1000
-
-static void report_pipeline(void)
+static void start_acquisition(void)
 {
 	if (!afe_present) {
-		LOG_INF("pipeline test skipped: no AFE on this board");
+		LOG_INF("acquisition skipped: no AFE on this board");
 		return;
 	}
+
+	pipeline_set_sink(stream_on_sample);
 
 	if (pipeline_start(ADS1299_DR_250SPS) != 0) {
 		LOG_ERR("pipeline failed to start");
 		return;
 	}
 
-	k_msleep(PIPELINE_TEST_MS);
-
-	struct pipeline_stats st;
-
-	pipeline_get_stats(&st);
-	pipeline_stop();
-
-	if (st.processed == 0) {
-		LOG_ERR("pipeline: no samples processed");
-		return;
+	if (command_init() != 0) {
+		LOG_WRN("command handler unavailable");
 	}
 
-	LOG_INF("pipeline: %u frames, %u processed, %u dropped, %u bad status",
-		st.frames, st.processed, st.ring_drops, st.bad_status);
+	LOG_INF("acquiring at 250 SPS; waiting for the host to start the stream");
+}
 
-	/*
-	 * Cost per sample decides which rates are reachable, so report it as
-	 * a load rather than leaving it to be worked out. Tenths of a percent
-	 * because at 250 SPS whole percent rounds to zero and reads as free.
-	 *
-	 * The 16 kSPS projection is the number that actually constrains the
-	 * design: a 62.5 us sample period leaves far less room.
-	 */
-	const uint32_t period_us = TIMEBASE_HZ / 250U;
-	const uint32_t load_tenths = st.dsp_mean_us * 1000U / period_us;
-	/* 16 kSPS is a 62.5 us period, so tenths of a percent is us * 16. */
-	const uint32_t load_16k = st.dsp_mean_us * 16U;
+/* Periodic health line, so a long run leaves some evidence in the log. */
+static void report_health(void)
+{
+	struct pipeline_stats ps;
+	struct stream_stats ss;
 
-	LOG_INF("pipeline: DSP %u us/sample mean, %u us worst -> %u.%u %% at "
-		"250 SPS, would be %u.%u %% at 16 kSPS",
-		st.dsp_mean_us, st.dsp_max_us,
-		load_tenths / 10U, load_tenths % 10U,
-		load_16k / 10U, load_16k % 10U);
+	pipeline_get_stats(&ps);
+	stream_get_stats(&ss);
 
-	/* Integer nanovolts: float formatting is not built into the log. */
-	LOG_INF("pipeline: ch1 %d to %d nV after DC removal and notch",
-		(int)(st.ch1_min_uv * 1000.0f), (int)(st.ch1_max_uv * 1000.0f));
-
-	if (st.ring_drops != 0) {
-		LOG_WRN("%u frames dropped - the DSP thread is not keeping up",
-			st.ring_drops);
-	}
+	LOG_INF("health: %u samples, %u dropped, %u bad; stream %u frames, "
+		"%u samples, %u bytes lost; DSP %u us",
+		ps.processed, ps.ring_drops, ps.bad_status,
+		ss.frames_sent, ss.samples_sent, ss.bytes_dropped,
+		ps.dsp_mean_us);
 }
 
 int main(void)
@@ -304,7 +288,6 @@ int main(void)
 	report_afe();
 	report_timebase();
 	report_capture();
-	report_pipeline();
 
 	/*
 	 * Transports are brought up but carry no protocol yet - the codec
@@ -332,12 +315,21 @@ int main(void)
 	(void)leds_set(LED_YELLOW, true);
 	(void)leds_set(LED_BLUE, false);
 
+	start_acquisition();
+
 	LOG_INF("Entering blink loop");
+
+	uint32_t ticks = 0;
 
 	while (1) {
 		(void)leds_toggle(LED_YELLOW);
 		(void)leds_toggle(LED_BLUE);
 		k_msleep(BLINK_PERIOD_MS);
+
+		/* Roughly every 10 s at a 500 ms blink. */
+		if (afe_present && (++ticks % 20u) == 0u) {
+			report_health();
+		}
 	}
 
 	return 0;

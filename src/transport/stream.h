@@ -1,0 +1,44 @@
+/*
+ * Sample streaming over the binary protocol.
+ *
+ * Takes completed samples from the DSP thread, batches them, and sends them
+ * out as protocol DATA frames. Batching matters: a frame carries 10 bytes of
+ * protocol overhead plus a 16-byte data header, so sending one sample at a
+ * time would spend more on headers than on signal.
+ *
+ * Encoding is raw ADC counts by default. That is what the host needs to
+ * check the AFE against its own test generator - a known amplitude in counts
+ * is only known before anything filters it.
+ */
+#ifndef SWIFTEEG_TRANSPORT_STREAM_H
+#define SWIFTEEG_TRANSPORT_STREAM_H
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#include "pipeline/pipeline.h"
+
+/* What the samples in a DATA frame look like. */
+#define STREAM_ENC_RAW_I32 0u /* ADC counts, before the DSP chain */
+#define STREAM_ENC_UV_F32  1u /* microvolts, after the DSP chain */
+
+struct stream_stats {
+	uint32_t frames_sent;
+	uint32_t samples_sent;
+	uint32_t bytes_dropped; /* transport buffer was full */
+};
+
+/* Choose what gets sent. Takes effect on the next batch. */
+void stream_set_encoding(uint8_t encoding);
+
+/* Start and stop transmitting. */
+void stream_enable(bool on);
+bool stream_enabled(void);
+
+/* Install as the pipeline's sink. Runs in the DSP thread. */
+void stream_on_sample(const struct eeg_sample *s);
+
+void stream_get_stats(struct stream_stats *out);
+void stream_reset_stats(void);
+
+#endif /* SWIFTEEG_TRANSPORT_STREAM_H */

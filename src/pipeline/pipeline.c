@@ -68,6 +68,7 @@ static volatile uint32_t st_dsp_max_us;
 static volatile float st_ch1_min;
 static volatile float st_ch1_max;
 static uint32_t st_seq;
+static pipeline_sink_t sink;
 
 /*
  * Cost of the two timebase reads that bracket process(), measured once at
@@ -161,6 +162,8 @@ static void process(const struct raw_frame *rf)
 		 * mantissa - so converting a DC-laden sample first would leave
 		 * almost no resolution for the microvolt signal riding on top.
 		 */
+		out.ch_raw[ch] = raw;
+
 		const int32_t ac = dsp_dc_apply(&dc[ch], raw);
 
 		float uv = (float)ac * lsb_uv;
@@ -175,6 +178,10 @@ static void process(const struct raw_frame *rf)
 	}
 	if (out.ch_uv[0] > st_ch1_max) {
 		st_ch1_max = out.ch_uv[0];
+	}
+
+	if (sink != NULL) {
+		sink(&out);
 	}
 
 	const uint32_t dt = (uint32_t)timebase_now_us() - t0;
@@ -284,6 +291,10 @@ int pipeline_start(uint8_t rate)
 		return err;
 	}
 
+	/* Let the AFE driver suspend the hardware trigger when it needs the
+	 * bus to itself. */
+	ads1299_set_trigger_gate(capture_set_trigger);
+
 	measure_timing_overhead();
 
 	pipeline_reset_stats();
@@ -325,6 +336,11 @@ void pipeline_stop(void)
 		(void)k_thread_join(&dsp_thread, K_MSEC(500));
 		dsp_tid = NULL;
 	}
+}
+
+void pipeline_set_sink(pipeline_sink_t s)
+{
+	sink = s;
 }
 
 void pipeline_reset_stats(void)

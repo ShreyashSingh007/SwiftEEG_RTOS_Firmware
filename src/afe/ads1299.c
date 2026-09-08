@@ -81,6 +81,12 @@ static bool afe_bus_ready;
 static bool afe_irq_on;
 static bool afe_cs_held;
 
+/* True between stream_start() and stream_stop(): the part is in RDATAC. */
+static bool afe_streaming;
+
+/* Installed by whoever wired DRDY to the transfer; see the header. */
+static ads1299_trigger_gate_t afe_gate;
+
 static uint32_t afe_cs_pin(void)
 {
 	return NRF_GPIO_PIN_MAP(AFE_CS_PORT, AFE_CS_PIN);
@@ -296,6 +302,174 @@ int ads1299_configure(uint8_t rate)
 	return 0;
 }
 
+/*
+ * Registers are only writable in command mode. While acquiring, the part is
+ * in RDATAC and silently ignores WREG, so a change made without dropping out
+ * of it appears to succeed and does nothing.
+ *
+ * Conversions are stopped as well, not just RDATAC exited: DRDY still drives
+ * the PPI channel, and an edge arriving mid-transfer would restart the SPI
+ * transfer underneath a register access.
+ */
+static int afe_enter_command_mode(bool *was_streaming)
+{
+	*was_streaming = afe_streaming;
+
+	if (!*was_streaming) {
+		return 0;
+	}
+
+	/*
+	 * Stop DRDY from starting transfers before touching the bus at all.
+	 * Masking the transfer-complete interrupt is not enough: the edge
+	 * reaches the SPI start task through PPI regardless, so a blocking
+	 * register access would collide with a hardware-started transfer and
+	 * read back whatever that left behind.
+	 */
+	if (afe_gate != NULL) {
+		afe_gate(false);
+	}
+
+	/*
+	 * Drop back to the register clock. Streaming runs the bus at 8 MHz,
+	 * where a byte takes 1 us - shorter than the ~2 us the part needs
+	 * between a command byte and the data that follows it, so reads come
+	 * back as whatever was on the bus rather than the register.
+	 */
+	nrf_spim_frequency_set(AFE_SPIM, AFE_FREQ_REGS);
+
+	/*
+	 * Release the continuous chip select first, before sending anything.
+	 *
+	 * The part frames commands on the CS edges. Held low - which is how
+	 * the streaming path runs it - consecutive commands arrive as one
+	 * undelimited byte stream, so writes land in the wrong registers and
+	 * reads come back as whatever was last on the bus. Raising CS also
+	 * resets the serial interface, which is what puts it back in step.
+	 */
+	afe_cs_held = false;
+	nrf_gpio_pin_set(afe_cs_pin());
+	k_busy_wait(20);
+
+	/* SDATAC is the one command continuous-read mode honours. */
+	int err = afe_cmd(ADS1299_CMD_SDATAC);
+
+	k_busy_wait(20);
+
+	if (err) {
+		return err;
+	}
+
+	err = afe_cmd(ADS1299_CMD_STOP);
+	k_busy_wait(20);
+
+	return err;
+}
+
+static int afe_resume_streaming(bool was_streaming)
+{
+	if (!was_streaming) {
+		return 0;
+	}
+
+	/* Still framed by CS while we are issuing commands. */
+	int err = afe_cmd(ADS1299_CMD_RDATAC);
+
+	if (err) {
+		return err;
+	}
+
+	/*
+	 * Back to holding CS low for the PPI-driven transfers - nothing runs
+	 * between the DRDY edge and the transfer it starts, so there is no
+	 * opportunity to assert it per frame.
+	 */
+	nrf_gpio_pin_clear(afe_cs_pin());
+	afe_cs_held = true;
+
+	err = afe_cmd(ADS1299_CMD_START);
+
+	/* Payload rate again now the commands are done. */
+	nrf_spim_frequency_set(AFE_SPIM, AFE_FREQ_STREAM);
+
+	/* Only now let DRDY drive transfers again. */
+	if (afe_gate != NULL) {
+		afe_gate(true);
+	}
+
+	return err;
+}
+
+void ads1299_set_trigger_gate(ads1299_trigger_gate_t gate)
+{
+	afe_gate = gate;
+}
+
+int ads1299_read_reg_safe(uint8_t addr, uint8_t *val)
+{
+	bool was_streaming = false;
+
+	int err = afe_enter_command_mode(&was_streaming);
+
+	if (err) {
+		return err;
+	}
+
+	err = afe_read_reg(addr, val);
+
+	const int resume_err = afe_resume_streaming(was_streaming);
+
+	return err ? err : resume_err;
+}
+
+int ads1299_test_signal(bool on, uint8_t cal_freq)
+{
+	bool was_streaming = false;
+
+	int mode_err = afe_enter_command_mode(&was_streaming);
+
+	if (mode_err) {
+		return mode_err;
+	}
+
+	const uint8_t cfg2 = on ? (ADS1299_CONFIG2_BASE |
+				   ADS1299_CONFIG2_INT_CAL |
+				   (cal_freq & 0x03u))
+				: ADS1299_CONFIG2_BASE;
+
+	int err = afe_write_reg(ADS1299_REG_CONFIG2, cfg2);
+
+	if (err == 0) {
+		/* The mux has to be routed too, or CONFIG2 changes nothing. */
+		err = ads1299_set_channels(ADS1299_GAIN_24,
+					   on ? ADS1299_MUX_TEST
+					      : ADS1299_MUX_NORMAL);
+	}
+
+	uint8_t back = 0;
+
+	if (err == 0) {
+		err = afe_read_reg(ADS1299_REG_CONFIG2, &back);
+	}
+	if (err == 0 && back != cfg2) {
+		LOG_ERR("CONFIG2 readback %02x, wanted %02x", back, cfg2);
+		err = -EIO;
+	}
+
+	/* Put the part back the way it was, whatever happened above. */
+	const int resume_err = afe_resume_streaming(was_streaming);
+
+	if (err) {
+		return err;
+	}
+	if (resume_err) {
+		return resume_err;
+	}
+
+	LOG_INF("AFE test signal %s (CONFIG2 %02x)", on ? "ON" : "off", back);
+	return 0;
+}
+
 int ads1299_set_channels(uint8_t gain, uint8_t mux)
 {
 	const uint8_t val = (uint8_t)(((gain & 0x07u) << 4) | (mux & 0x07u));
@@ -438,7 +612,6 @@ static uint8_t afe_active;
 
 static ads1299_frame_cb_t afe_cb;
 static volatile uint32_t afe_overrun;
-static bool afe_streaming;
 
 static void afe_spim_isr(const void *arg)
 {

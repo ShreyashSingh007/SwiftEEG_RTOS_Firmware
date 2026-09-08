@@ -143,6 +143,19 @@ int capture_attach_task(uint32_t task_addr)
 	return 0;
 }
 
+void capture_set_trigger(bool on)
+{
+	if (!capture_ready) {
+		return;
+	}
+
+	if (on) {
+		nrfx_gppi_conn_enable(ppi_handle);
+	} else {
+		nrfx_gppi_conn_disable(ppi_handle);
+	}
+}
+
 void capture_measure(uint32_t ms, struct capture_stats *out)
 {
 	uint32_t count = 0;

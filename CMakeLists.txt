@@ -18,6 +18,9 @@ target_sources(app PRIVATE
   src/dsp/dsp.c
   src/sys/ringbuf.c
   src/transport/usb.c
+  src/transport/stream.c
+  src/transport/command.c
+  src/proto/proto.c
   src/transport/ble.c
 )
 

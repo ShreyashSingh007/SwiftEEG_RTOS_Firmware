@@ -155,8 +155,8 @@ Every channel's negative input is tied to **SRB1** internally
 
 | Wire | Goes to | Purpose |
 |---|---|---|
-| **SRB1** | **left mastoid** | the reference every channel is measured against |
-| **BIAS** (BIASOUT) | **right mastoid** | driven right leg - cancels common-mode |
+| **SRB1** | **right mastoid** | the reference every channel is measured against |
+| **BIAS** (BIASOUT) | **left mastoid** | driven right leg - cancels common-mode |
 
 Mastoids are the conventional choice: close to the head, electrically quiet,
 and far enough from the scalp sites to carry little EEG of their own.

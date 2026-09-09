@@ -147,9 +147,15 @@ class App(tk.Tk):
         rc.bind("<<ComboboxSelected>>", lambda e: self._set_rate())
 
         self._label(row, "  format").pack(side=tk.LEFT)
-        self.enc_var = tk.StringVar(value="24-bit")
-        ec = ttk.Combobox(row, textvariable=self.enc_var, width=8,
-                          state="readonly", values=["24-bit", "32-bit"])
+        # "device filtered" is what makes the on-device DSP visible. The raw
+        # options send counts straight off the converter, before the device
+        # touches them - so with either of those selected, the on-device
+        # notch correctly appears to do nothing.
+        self.enc_var = tk.StringVar(value="raw 24-bit")
+        ec = ttk.Combobox(row, textvariable=self.enc_var, width=14,
+                          state="readonly",
+                          values=["raw 24-bit", "raw 32-bit",
+                                  "device filtered"])
         ec.pack(side=tk.LEFT, padx=6)
         ec.bind("<<ComboboxSelected>>", lambda e: self._set_encoding())
 
@@ -189,10 +195,10 @@ class App(tk.Tk):
         f = self._section(inner, "reference")
         self.bias_var = tk.BooleanVar(value=True)
         self.loff_var = tk.BooleanVar(value=False)
-        self._check(f, "Bias drive (right mastoid)", self.bias_var,
+        self._check(f, "Bias drive (left mastoid)", self.bias_var,
                     self._set_bias)
         self._check(f, "Lead-off detection", self.loff_var, self._set_leadoff)
-        self._label(f, "SRB1 reference: left mastoid", fg=DIM,
+        self._label(f, "SRB1 reference: right mastoid", fg=DIM,
                     font=("Segoe UI", 8)).pack(fill=tk.X, pady=(4, 0))
 
         # -- device notch --
@@ -401,9 +407,12 @@ class App(tk.Tk):
         self.status.config(text="link reset - press Connect", fg="#ffd866")
 
     def _set_encoding(self) -> None:
-        enc = (link.ENC_RAW_I24 if self.enc_var.get().startswith("24")
-               else link.ENC_RAW_I32)
+        pick = self.enc_var.get()
+        enc = {"raw 24-bit": link.ENC_RAW_I24,
+               "raw 32-bit": link.ENC_RAW_I32,
+               "device filtered": link.ENC_UV_F32}.get(pick, link.ENC_RAW_I24)
         self._send(link.CMD_SET_ENCODING, enc)
+        self.chain.reset()
 
     def _set_source(self) -> None:
         mux = {"Electrodes": link.MUX_NORMAL,
@@ -535,7 +544,10 @@ class App(tk.Tk):
             self.rate = sps
             self.chain.set_rate(sps)
 
-        self.enc_var.set("24-bit" if p[3] == link.ENC_RAW_I24 else "32-bit")
+        self.enc_var.set({link.ENC_RAW_I24: "raw 24-bit",
+                          link.ENC_RAW_I32: "raw 32-bit",
+                          link.ENC_UV_F32: "device filtered"}.get(
+                              p[3], "raw 24-bit"))
         self.dev_notch.set({0: "off", 50: "50 Hz", 60: "60 Hz"}.get(p[6], "off"))
 
         if len(p) >= 15:
@@ -552,8 +564,13 @@ class App(tk.Tk):
                            fg="#5ed18b")
 
     def _consume(self, blocks) -> None:
-        scale = link.lsb_uv(self.gain)
         counts = np.vstack([v for _, _, v in blocks])
+
+        # "device filtered" arrives already in microvolts, having been
+        # through the device's own chain. Scaling it by the LSB again would
+        # divide it by 45 million.
+        already_uv = self.enc_var.get() == "device filtered"
+        scale = 1.0 if already_uv else link.lsb_uv(self.gain)
 
         self.samples += len(counts)
 
@@ -566,10 +583,12 @@ class App(tk.Tk):
         # Saturation is judged on raw counts, before any filter. A railed
         # channel is flat at full scale, and after a high-pass it looks like
         # a quiet channel rather than a broken one.
+        # Only meaningful on raw counts; the filtered form has had its DC
+        # removed on the device and can no longer show saturation.
         full_scale = (1 << 23) * 0.98
         peak = np.max(np.abs(counts), axis=0)
         for ch in range(link.CHANNELS):
-            self.saturated[ch] = bool(peak[ch] >= full_scale)
+            self.saturated[ch] = (not already_uv) and bool(peak[ch] >= full_scale)
             self.dc_mv[ch] = float(np.mean(counts[:, ch])) * scale / 1000.0
 
         uv = counts.astype(np.float64) * scale

@@ -57,6 +57,7 @@ static k_tid_t dsp_tid;
 
 static volatile bool running;
 static uint8_t current_rate_code;
+static float notch_hz = NOTCH_HZ;
 static struct k_sem frame_ready;
 
 /* Statistics. Written by the DSP thread, read by whoever asks. */
@@ -187,7 +188,7 @@ static void dsp_entry(void *a, void *b, void *c)
 static int build_chain(void)
 {
 	/* VREF is the part's internal 4.5 V; gain 24 is what configure() sets. */
-	const int err = chain_init(&chain, sample_rate_hz, DC_SHIFT, NOTCH_HZ,
+	const int err = chain_init(&chain, sample_rate_hz, DC_SHIFT, notch_hz,
 				   NOTCH_Q, 4.5f, 24);
 
 	if (err) {
@@ -311,6 +312,33 @@ static uint8_t rate_code_for(uint16_t sps)
 	case 16000: return ADS1299_DR_16KSPS;
 	default:    return 0xFFu;
 	}
+}
+
+int pipeline_set_notch(uint8_t hz)
+{
+	if (hz != 0 && hz != 50 && hz != 60) {
+		return -EINVAL;
+	}
+
+	notch_hz = (float)hz;
+
+	if (!running) {
+		return 0; /* takes effect at the next start */
+	}
+
+	/*
+	 * Rebuilt in place rather than by restarting acquisition: a notch
+	 * change is a filter change, not a hardware one, and there is no
+	 * reason to drop samples for it.
+	 */
+	const int err = chain_set_notch(&chain, sample_rate_hz, notch_hz,
+					NOTCH_Q);
+
+	if (err == 0) {
+		LOG_INF("notch now %u Hz", hz);
+	}
+
+	return err;
 }
 
 uint16_t pipeline_rate(void)

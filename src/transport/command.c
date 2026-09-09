@@ -18,8 +18,14 @@ LOG_MODULE_REGISTER(command, CONFIG_LOG_DEFAULT_LEVEL);
 #define CMD_STACK_SIZE 1536
 #define CMD_PRIORITY   6 /* below the DSP thread: commands can wait */
 
-/* How often to look for host input when none is arriving. */
-#define CMD_POLL_MS 20
+/*
+ * The thread sleeps on this and is woken by whichever link received bytes,
+ * so a command is picked up as soon as it lands rather than at the next
+ * poll. The timeout is only a backstop in case a wake-up is ever missed.
+ */
+#define CMD_IDLE_MS 200
+
+static struct k_sem cmd_ready;
 
 static K_THREAD_STACK_DEFINE(cmd_stack, CMD_STACK_SIZE);
 static struct k_thread cmd_thread;
@@ -173,6 +179,43 @@ static void handle(const proto_frame_t *f)
 		return;
 	}
 
+	case CMD_SET_CHANNEL:
+		if (f->len < 4) {
+			status = CMD_EBADARG;
+		} else {
+			const bool pd = (f->len >= 5) && f->payload[4];
+			const bool srb2 = (f->len >= 6) && f->payload[5];
+
+			status = (ads1299_set_channel(f->payload[1],
+						      f->payload[2],
+						      f->payload[3], pd,
+						      srb2) == 0)
+					 ? CMD_OK : CMD_EFAILED;
+		}
+		break;
+
+	case CMD_SET_BIAS:
+		if (f->len < 2) {
+			status = CMD_EBADARG;
+		} else {
+			const uint8_t sensp = (f->len >= 3) ? f->payload[2] : 0xFFu;
+			const uint8_t sensn = (f->len >= 4) ? f->payload[3] : 0x00u;
+
+			status = (ads1299_set_bias(f->payload[1] != 0, sensp,
+						   sensn) == 0)
+					 ? CMD_OK : CMD_EFAILED;
+		}
+		break;
+
+	case CMD_SET_NOTCH:
+		if (f->len < 2) {
+			status = CMD_EBADARG;
+		} else {
+			status = (pipeline_set_notch(f->payload[1]) == 0)
+					 ? CMD_OK : CMD_EBADARG;
+		}
+		break;
+
 	case CMD_READ_REG: {
 		if (f->len < 2) {
 			status = CMD_EBADARG;
@@ -221,6 +264,14 @@ static void on_ble_control(const uint8_t *data, uint16_t len)
 	if (put < len) {
 		LOG_WRN("BLE command buffer full, %u bytes dropped", len - put);
 	}
+
+	k_sem_give(&cmd_ready);
+}
+
+/* Runs in the USB receive interrupt. */
+static void on_usb_rx(void)
+{
+	k_sem_give(&cmd_ready);
 }
 
 static void cmd_entry(void *a, void *b, void *c)
@@ -280,13 +331,15 @@ static void cmd_entry(void *a, void *b, void *c)
 		}
 
 		if (!did_work) {
-			k_msleep(CMD_POLL_MS);
+			(void)k_sem_take(&cmd_ready, K_MSEC(CMD_IDLE_MS));
 		}
 	}
 }
 
 int command_init(void)
 {
+	k_sem_init(&cmd_ready, 0, K_SEM_MAX_LIMIT);
+
 	k_tid_t tid = k_thread_create(&cmd_thread, cmd_stack, CMD_STACK_SIZE,
 				      cmd_entry, NULL, NULL, NULL,
 				      CMD_PRIORITY, 0, K_NO_WAIT);
@@ -296,6 +349,7 @@ int command_init(void)
 	proto_stream_reset(&ble_stream);
 	ring_buf_init(&ble_rx_rb, sizeof(ble_rx_storage), ble_rx_storage);
 	ble_transport_set_control_handler(on_ble_control);
+	usb_transport_set_rx_notify(on_usb_rx);
 
 	LOG_INF("command handler up (USB and BLE)");
 	return 0;

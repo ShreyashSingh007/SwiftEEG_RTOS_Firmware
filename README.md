@@ -150,16 +150,28 @@ LEDs are **active high** — the MCU drives the anode.
 
 ### 1.3 Montage (SRB1 referential)
 
-`INxP` is the scalp electrode; `INxN` is switched to SRB1 internally.
+Every channel's negative input is tied to **SRB1** internally
+(`MISC1.SRB1 = 1`), so all eight are measured against one reference.
 
-| Ch | Site | | Ch | Site |
-|---|---|---|---|---|
-| 1 | C4 | | 5 | AFz |
-| 2 | P4 | | 6 | F3 |
-| 3 | F4 | | 7 | C3 |
-| 4 | Oz | | 8 | P3 |
+| Wire | Goes to | Purpose |
+|---|---|---|
+| **SRB1** | **left mastoid** | the reference every channel is measured against |
+| **BIAS** (BIASOUT) | **right mastoid** | driven right leg - cancels common-mode |
 
----
+Mastoids are the conventional choice: close to the head, electrically quiet,
+and far enough from the scalp sites to carry little EEG of their own.
+
+Putting the reference on one side and the bias on the other is deliberate.
+The bias amplifier drives a correction signal into the body, and keeping it
+off the reference electrode avoids feeding that correction straight back into
+what every channel is measured against.
+
+| Ch | Site | Use | Ch | Site | Use |
+|---|---|---|---|---|---|
+| 1 | C4 | motor imagery, right | 5 | AFz | frontal / EOG |
+| 2 | P4 | P300 | 6 | F3 | frontal |
+| 3 | F4 | frontal | 7 | C3 | motor imagery, left |
+| 4 | Oz | SSVEP | 8 | P3 | P300 |
 
 ## 2. Repo layout
 
@@ -396,6 +408,31 @@ Still to do here:
 - Per-channel gain, mux, enable and lead-off, rather than all-or-nothing
 - SRB2 routing, notch frequency 50/60, packed int24 encoding
 - 30-minute soak with the USB cable out
+
+### The device stays responsive while streaming
+
+Measured over BLE at 1 kSPS, commands issued while data was flowing:
+
+```
+ping           18 ms      set channels   13-30 ms
+read register  23 ms      set bias       22 ms
+set notch      18 ms      set rate       restarts acquisition
+7 of 7 answered.  Streaming through it: 1033 SPS, 0 bad, 0 sequence gaps
+```
+
+Nothing was dropped while the AFE was reconfigured mid-stream. Three things
+make that true:
+
+- **Commands never run on a thread that cannot afford to block.** The GATT
+  write callback only queues bytes; a low-priority thread does the work.
+- **The command thread sleeps on a semaphore**, woken by whichever link
+  received bytes, rather than polling. Polling every 20 ms was costing
+  90 ms round trips on its own.
+- **The DSP thread outranks the command thread**, so reconfiguration can
+  never delay a sample.
+
+A short connection interval is requested on connect (7.5-15 ms). It is
+advisory - the central decides - and iOS will refuse anything under 15 ms.
 
 ### Three mistakes worth keeping
 

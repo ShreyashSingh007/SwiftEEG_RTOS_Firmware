@@ -40,4 +40,11 @@ uint32_t usb_transport_dropped(void);
  */
 size_t usb_transport_read(uint8_t *buf, size_t len);
 
+/*
+ * Called from the receive interrupt when bytes arrive, so a waiting reader
+ * can be woken instead of polling for them. Keep it to a semaphore give.
+ */
+typedef void (*usb_rx_notify_t)(void);
+void usb_transport_set_rx_notify(usb_rx_notify_t cb);
+
 #endif /* SWIFTEEG_TRANSPORT_USB_H */

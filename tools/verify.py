@@ -73,7 +73,8 @@ LSB_UV = pipeline_ref.lsb_uv()
 EXPECTED_REGS = [
     (0x00, 0x3E, "ID       (ADS1299, 8 channels)"),
     (0x01, 0x96, "CONFIG1  (250 SPS)"),
-    (0x03, 0xE0, "CONFIG3  (internal reference on)"),
+    (0x03, 0xE4, "CONFIG3  (reference + bias drive on)"),
+    (0x0D, 0xFF, "BIAS_SENSP (all 8 electrodes sensed)"),
     (0x15, 0x20, "MISC1    (SRB1 referential)"),
 ]
 

@@ -52,4 +52,13 @@ int chain_init(chain_t *c, float fs_hz, uint8_t dc_shift, float notch_hz,
 bool chain_process(chain_t *c, const uint8_t *frame, int32_t *raw_out,
 		   float *uv_out);
 
+/*
+ * Redesign the notch without disturbing the DC estimate.
+ *
+ * `notch_hz` of 0 removes the section entirely, leaving the cascade as a
+ * pass-through. The biquad state is cleared because it belongs to the old
+ * filter; the DC state is kept, since the offset has not changed.
+ */
+int chain_set_notch(chain_t *c, float fs_hz, float notch_hz, float notch_q);
+
 #endif /* SWIFTEEG_CHAIN_H */

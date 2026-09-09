@@ -276,6 +276,23 @@ int ads1299_configure(uint8_t rate)
 	}
 
 	/*
+	 * Bias drive on, sensing all eight scalp electrodes. Without it the
+	 * mains common-mode is only as small as the front end's own rejection
+	 * makes it, and no filter afterwards recovers what was lost.
+	 */
+	err = afe_write_reg(ADS1299_REG_BIAS_SENSP, 0xFFu);
+	if (err) {
+		return err;
+	}
+
+	err = afe_write_reg(ADS1299_REG_CONFIG3,
+			    ADS1299_CONFIG3_BASE | ADS1299_CONFIG3_PD_REFBUF |
+			    ADS1299_CONFIG3_PD_BIAS);
+	if (err) {
+		return err;
+	}
+
+	/*
 	 * Read back the two registers that decide whether the data is valid at
 	 * all. A silent SPI failure here would otherwise look like real EEG.
 	 */
@@ -285,7 +302,8 @@ int ads1299_configure(uint8_t rate)
 	(void)afe_read_reg(ADS1299_REG_CONFIG3, &cfg3);
 
 	const uint8_t want1 = ADS1299_CONFIG1_BASE | (rate & 0x07);
-	const uint8_t want3 = ADS1299_CONFIG3_BASE | ADS1299_CONFIG3_PD_REFBUF;
+	const uint8_t want3 = ADS1299_CONFIG3_BASE | ADS1299_CONFIG3_PD_REFBUF |
+			      ADS1299_CONFIG3_PD_BIAS;
 
 	if (cfg1 != want1 || cfg3 != want3) {
 		LOG_ERR("AFE config readback wrong: CONFIG1 %02x (want %02x), "
@@ -473,6 +491,95 @@ int ads1299_test_signal(bool on, uint8_t cal_freq)
 {
 	return ads1299_set_input(on ? ADS1299_MUX_TEST : ADS1299_MUX_NORMAL,
 				 cal_freq);
+}
+
+int ads1299_set_bias(bool enable, uint8_t sensp, uint8_t sensn)
+{
+	bool was_streaming = false;
+
+	int err = afe_enter_command_mode(&was_streaming);
+
+	if (err) {
+		return err;
+	}
+
+	/* Which channels the amplifier averages to find the common-mode. */
+	err = afe_write_reg(ADS1299_REG_BIAS_SENSP, enable ? sensp : 0x00u);
+
+	if (err == 0) {
+		err = afe_write_reg(ADS1299_REG_BIAS_SENSN,
+				    enable ? sensn : 0x00u);
+	}
+
+	if (err == 0) {
+		uint8_t cfg3 = ADS1299_CONFIG3_BASE | ADS1299_CONFIG3_PD_REFBUF;
+
+		if (enable) {
+			cfg3 |= ADS1299_CONFIG3_PD_BIAS;
+		}
+
+		err = afe_write_reg(ADS1299_REG_CONFIG3, cfg3);
+	}
+
+	uint8_t back = 0;
+
+	if (err == 0) {
+		err = afe_read_reg(ADS1299_REG_CONFIG3, &back);
+	}
+
+	const int resume_err = afe_resume_streaming(was_streaming);
+
+	if (err) {
+		return err;
+	}
+	if (resume_err) {
+		return resume_err;
+	}
+
+	LOG_INF("AFE bias drive %s (CONFIG3 %02x, SENSP %02x)",
+		enable ? "ON" : "off", back, enable ? sensp : 0);
+	return 0;
+}
+
+int ads1299_set_channel(uint8_t ch, uint8_t gain, uint8_t mux, bool power_down,
+			bool srb2)
+{
+	if (ch != 0xFFu && ch >= ADS1299_CHANNELS) {
+		return -EINVAL;
+	}
+
+	bool was_streaming = false;
+
+	int err = afe_enter_command_mode(&was_streaming);
+
+	if (err) {
+		return err;
+	}
+
+	const uint8_t val = (uint8_t)((power_down ? 0x80u : 0x00u) |
+				      ((gain & 0x07u) << 4) |
+				      (srb2 ? 0x08u : 0x00u) |
+				      (mux & 0x07u));
+
+	if (ch == 0xFFu) {
+		for (uint8_t i = 0; i < ADS1299_CHANNELS && err == 0; i++) {
+			err = afe_write_reg(ADS1299_REG_CH1SET + i, val);
+		}
+	} else {
+		err = afe_write_reg(ADS1299_REG_CH1SET + ch, val);
+	}
+
+	const int resume_err = afe_resume_streaming(was_streaming);
+
+	if (err) {
+		return err;
+	}
+	if (resume_err) {
+		return resume_err;
+	}
+
+	LOG_INF("AFE ch %u set to %02x", ch, val);
+	return 0;
 }
 
 int ads1299_set_channels(uint8_t gain, uint8_t mux)

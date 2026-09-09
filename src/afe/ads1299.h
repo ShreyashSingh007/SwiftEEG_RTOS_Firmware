@@ -36,6 +36,8 @@
 #define ADS1299_REG_CONFIG2 0x02
 #define ADS1299_REG_CONFIG3 0x03
 #define ADS1299_REG_CH1SET  0x05
+#define ADS1299_REG_BIAS_SENSP 0x0D
+#define ADS1299_REG_BIAS_SENSN 0x0E
 #define ADS1299_REG_MISC1   0x15
 
 /*
@@ -103,6 +105,20 @@
  * The square wave swings either side of zero, so peak-to-peak is twice this.
  */
 #define ADS1299_CAL_AMPLITUDE_NV 1875000
+
+/*
+ * CONFIG3 bit 2, PD_BIAS: powers the bias amplifier - the driven right leg.
+ *
+ * On this board BIASOUT goes to the right mastoid and SRB1 to the left, so
+ * the amplifier senses the common-mode across the scalp electrodes and
+ * drives its inverse into the head. That is what keeps mains out of the
+ * signal; a notch afterwards only removes what is still separable, and
+ * whatever the front end could not reject as common-mode is already gone.
+ *
+ * BIASREF is grounded on this board, which is correct - mid-supply is 0 V
+ * between the +/-2.5 V rails - so BIASREF_INT (bit 3) stays 0.
+ */
+#define ADS1299_CONFIG3_PD_BIAS 0x04
 
 /* MISC1 bit 5 ties every channel's negative input to SRB1. */
 #define ADS1299_MISC1_SRB1 0x20
@@ -186,6 +202,25 @@ int ads1299_test_signal(bool on, uint8_t cal_freq);
  * nothing from the electrodes.
  */
 int ads1299_set_input(uint8_t mux, uint8_t cal_freq);
+
+/*
+ * Configure the bias drive.
+ *
+ * `sensp` and `sensn` are bitmasks choosing which channels the amplifier
+ * derives the common-mode from. The default senses all eight positive
+ * inputs, the scalp electrodes, and none of the negative ones - those are
+ * all tied to SRB1, so including them would just weight the reference
+ * electrode eight times over.
+ */
+int ads1299_set_bias(bool enable, uint8_t sensp, uint8_t sensn);
+
+/*
+ * Configure one channel, or every channel when `ch` is 0xFF.
+ * `power_down` parks an unused channel; `srb2` routes its negative input to
+ * SRB2 instead of SRB1.
+ */
+int ads1299_set_channel(uint8_t ch, uint8_t gain, uint8_t mux, bool power_down,
+			bool srb2);
 
 /* START and STOP opcodes. Conversions run between them. */
 int ads1299_start_conversions(void);

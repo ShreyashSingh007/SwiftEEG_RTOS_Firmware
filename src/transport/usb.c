@@ -52,6 +52,7 @@ static uint8_t usb_tx_storage[USB_TX_BUF_BYTES];
 static struct ring_buf usb_tx_rb;
 static atomic_t usb_tx_dropped;
 static bool usb_tx_ready;
+static usb_rx_notify_t usb_rx_notify;
 static void cdc_irq_handler(const struct device *dev, void *user_data);
 
 /* Inbound buffer. Commands are small and rare; 512 bytes is generous. */
@@ -165,6 +166,10 @@ static void cdc_irq_handler(const struct device *dev, void *user_data)
 				/* A full buffer drops commands rather than
 				 * stalling the interrupt. */
 				(void)ring_buf_put(&usb_rx_rb, rx, (uint32_t)n);
+
+				if (usb_rx_notify != NULL) {
+					usb_rx_notify();
+				}
 			}
 		}
 
@@ -220,4 +225,9 @@ size_t usb_transport_read(uint8_t *buf, size_t len)
 	}
 
 	return ring_buf_get(&usb_rx_rb, buf, (uint32_t)len);
+}
+
+void usb_transport_set_rx_notify(usb_rx_notify_t cb)
+{
+	usb_rx_notify = cb;
 }

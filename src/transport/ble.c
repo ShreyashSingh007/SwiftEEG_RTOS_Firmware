@@ -144,6 +144,25 @@ static void connected(struct bt_conn *conn, uint8_t err)
 		.pref_rx_phy = BT_GAP_LE_PHY_2M,
 	};
 	(void)bt_conn_le_phy_update(conn, &phy);
+
+	/*
+	 * Ask for a short connection interval. Everything the host sends or
+	 * receives waits for the next connection event, so the interval sets
+	 * both the command round-trip and how much stream data can be moved.
+	 *
+	 * 7.5-15 ms is the tightest a central will normally grant. Windows and
+	 * Android allow 7.5 ms; iOS refuses anything under 15 ms, which is a
+	 * platform limit and not something firmware can work around. The
+	 * request is advisory - the central decides - so nothing here depends
+	 * on it being honoured.
+	 */
+	const struct bt_le_conn_param param = {
+		.interval_min = 6,   /* units of 1.25 ms -> 7.5 ms */
+		.interval_max = 12,  /* -> 15 ms */
+		.latency = 0,        /* no skipped events: this is a live link */
+		.timeout = 400,      /* units of 10 ms -> 4 s */
+	};
+	(void)bt_conn_le_param_update(conn, &param);
 }
 
 static void disconnected(struct bt_conn *conn, uint8_t reason)

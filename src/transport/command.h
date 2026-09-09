@@ -22,6 +22,10 @@
 #define CMD_READ_REG     0x07u /* payload[1] = address; RSP carries the value */
 #define CMD_SET_INPUT    0x08u /* payload[1] = ADS1299_MUX_*, [2] = cal freq */
 #define CMD_SET_RATE     0x09u /* payload[1..2] = SPS, little-endian */
+#define CMD_SET_CHANNEL  0x0Au /* [1]=ch or 0xFF, [2]=gain, [3]=mux,
+                                *   [4]=power down, [5]=srb2 */
+#define CMD_SET_BIAS     0x0Bu /* [1]=enable, [2]=sensp mask, [3]=sensn mask */
+#define CMD_SET_NOTCH    0x0Cu /* [1]=Hz (0 disables, 50 or 60) */
 
 /* Status byte in an RSP payload. */
 #define CMD_OK        0x00u

@@ -74,6 +74,15 @@ int pipeline_set_rate(uint16_t sps);
 /* The rate currently running, in samples per second. */
 uint16_t pipeline_rate(void);
 
+/*
+ * Set the mains notch frequency: 50, 60, or 0 to remove it.
+ *
+ * Rebuilds the filter in place; acquisition keeps running. The biquad state
+ * is cleared, so there is a brief settling transient - unavoidable, since
+ * the old state belongs to a different filter.
+ */
+int pipeline_set_notch(uint8_t hz);
+
 /* Zero the counters and begin a fresh measurement window. */
 void pipeline_reset_stats(void);
 

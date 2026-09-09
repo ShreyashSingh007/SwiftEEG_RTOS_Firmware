@@ -61,3 +61,28 @@ bool chain_process(chain_t *c, const uint8_t *frame, int32_t *raw_out,
 
 	return true;
 }
+
+int chain_set_notch(chain_t *c, float fs_hz, float notch_hz, float notch_q)
+{
+	if (c == NULL) {
+		return -EINVAL;
+	}
+
+	if (notch_hz <= 0.0f) {
+		/* No sections: the cascade passes samples straight through. */
+		dsp_cascade_set(&c->cascade, NULL, 0);
+		return 0;
+	}
+
+	dsp_biquad_coeffs_t notch;
+
+	if (!dsp_design_notch(&notch, fs_hz, notch_hz, notch_q)) {
+		return -EINVAL;
+	}
+
+	if (!dsp_cascade_set(&c->cascade, &notch, 1)) {
+		return -EINVAL;
+	}
+
+	return 0;
+}

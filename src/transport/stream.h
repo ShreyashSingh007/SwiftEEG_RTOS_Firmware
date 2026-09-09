@@ -25,7 +25,9 @@
 struct stream_stats {
 	uint32_t frames_sent;
 	uint32_t samples_sent;
-	uint32_t bytes_dropped; /* transport buffer was full */
+	uint32_t bytes_dropped; /* USB buffer was full */
+	uint32_t ble_dropped;   /* notification refused, usually no buffers */
+	uint32_t ble_too_big;   /* frame exceeded the negotiated MTU */
 };
 
 /* Choose what gets sent. Takes effect on the next batch. */

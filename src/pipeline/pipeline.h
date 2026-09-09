@@ -61,6 +61,19 @@ int pipeline_start(uint8_t rate);
 /* Stop acquiring. Safe to call when already stopped. */
 void pipeline_stop(void);
 
+/*
+ * Change the sample rate, restarting acquisition around it. The filters are
+ * redesigned for the new rate - a notch is only at 50 Hz for the rate it was
+ * designed at, so carrying the old coefficients over would quietly move it.
+ *
+ * `sps` is the real rate, not a register code; 250 to 1000 are supported
+ * over BLE, higher needs USB. Returns 0, or a negative errno.
+ */
+int pipeline_set_rate(uint16_t sps);
+
+/* The rate currently running, in samples per second. */
+uint16_t pipeline_rate(void);
+
 /* Zero the counters and begin a fresh measurement window. */
 void pipeline_reset_stats(void);
 

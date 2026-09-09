@@ -49,6 +49,8 @@ static const struct bt_uuid_128 uuid_event =
 
 static struct bt_conn *current_conn;
 static bool stream_subscribed;
+static bool event_subscribed;
+static ble_control_cb_t control_cb;
 
 /* --- Control characteristic ------------------------------------------- */
 
@@ -66,11 +68,12 @@ static ssize_t control_write(struct bt_conn *conn,
 	}
 
 	/*
-	 * M1 stub: the protocol codec lands in M2. Log so the link can be
-	 * exercised end to end from a host before any of it is decoded.
+	 * The bytes are protocol frames, byte-identical to what arrives over
+	 * USB, so the same decoder handles both links.
 	 */
-	LOG_INF("control write, %u bytes (first 0x%02x)", len,
-		len ? ((const uint8_t *)buf)[0] : 0);
+	if (control_cb != NULL && len != 0) {
+		control_cb(buf, len);
+	}
 
 	return len;
 }
@@ -86,13 +89,15 @@ static void stream_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
 static void event_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
 {
 	ARG_UNUSED(attr);
+	event_subscribed = (value == BT_GATT_CCC_NOTIFY);
 	LOG_INF("event notifications %s",
 		(value == BT_GATT_CCC_NOTIFY) ? "enabled" : "disabled");
 }
 
 /*
- * Attribute layout. The stream value attribute is index 2 in this table,
- * which is what bt_gatt_notify() is pointed at below.
+ * Attribute layout. bt_gatt_notify() is handed the *declaration* attribute
+ * for each characteristic and resolves the value handle itself, so Stream is
+ * attrs[3] and Event is attrs[6].
  */
 BT_GATT_SERVICE_DEFINE(swifteeg_svc,
 	BT_GATT_PRIMARY_SERVICE(&uuid_service),
@@ -151,6 +156,7 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 		current_conn = NULL;
 	}
 	stream_subscribed = false;
+	event_subscribed = false;
 }
 
 static void le_param_updated(struct bt_conn *conn, uint16_t interval,
@@ -200,6 +206,23 @@ int ble_transport_init(void)
 	return 0;
 }
 
+void ble_transport_set_control_handler(ble_control_cb_t cb)
+{
+	control_cb = cb;
+}
+
+uint16_t ble_transport_max_payload(void)
+{
+	if (current_conn == NULL) {
+		return 0;
+	}
+
+	/* Three bytes of the ATT MTU go to the notification header. */
+	const uint16_t mtu = bt_gatt_get_mtu(current_conn);
+
+	return (mtu > 3u) ? (uint16_t)(mtu - 3u) : 0u;
+}
+
 bool ble_transport_is_streaming(void)
 {
 	return current_conn != NULL && stream_subscribed;
@@ -211,8 +234,16 @@ int ble_transport_send_stream(const void *data, uint16_t len)
 		return -ENOTCONN;
 	}
 
-	/* Attribute 2 is the stream characteristic's value. */
 	return bt_gatt_notify(current_conn, &swifteeg_svc.attrs[3], data, len);
+}
+
+int ble_transport_send_event(const void *data, uint16_t len)
+{
+	if (current_conn == NULL || !event_subscribed) {
+		return -ENOTCONN;
+	}
+
+	return bt_gatt_notify(current_conn, &swifteeg_svc.attrs[6], data, len);
 }
 
 #else /* !CONFIG_BT */
@@ -220,6 +251,16 @@ int ble_transport_send_stream(const void *data, uint16_t len)
 #include <zephyr/logging/log.h>
 
 LOG_MODULE_REGISTER(ble, CONFIG_LOG_DEFAULT_LEVEL);
+
+void ble_transport_set_control_handler(ble_control_cb_t cb)
+{
+	ARG_UNUSED(cb);
+}
+
+uint16_t ble_transport_max_payload(void)
+{
+	return 0;
+}
 
 int ble_transport_init(void)
 {
@@ -233,6 +274,13 @@ bool ble_transport_is_streaming(void)
 }
 
 int ble_transport_send_stream(const void *data, uint16_t len)
+{
+	ARG_UNUSED(data);
+	ARG_UNUSED(len);
+	return -ENOTSUP;
+}
+
+int ble_transport_send_event(const void *data, uint16_t len)
 {
 	ARG_UNUSED(data);
 	ARG_UNUSED(len);

@@ -3,11 +3,13 @@
 #include <string.h>
 
 #include <zephyr/kernel.h>
+#include <zephyr/sys/ring_buffer.h>
 #include <zephyr/logging/log.h>
 
 #include "afe/ads1299.h"
 #include "pipeline/pipeline.h"
 #include "proto/proto.h"
+#include "ble.h"
 #include "stream.h"
 #include "usb.h"
 
@@ -22,9 +24,26 @@ LOG_MODULE_REGISTER(command, CONFIG_LOG_DEFAULT_LEVEL);
 static K_THREAD_STACK_DEFINE(cmd_stack, CMD_STACK_SIZE);
 static struct k_thread cmd_thread;
 
-static proto_stream_t rx_stream;
+static proto_stream_t rx_stream;   /* USB */
+static proto_stream_t ble_stream;  /* BLE, separate so a partial frame on
+                                    * one link cannot corrupt the other */
+
+/*
+ * Bytes handed over by the Bluetooth thread, drained by the command thread.
+ * Commands are small and infrequent; this only has to absorb a burst.
+ */
+#define BLE_RX_BYTES 256
+static uint8_t ble_rx_storage[BLE_RX_BYTES];
+static struct ring_buf ble_rx_rb;
 static uint8_t rsp_buf[64];
 static uint16_t rsp_seq;
+
+/*
+ * Which link the command being handled arrived on. A reply has to go back
+ * the way the request came: a host on BLE never sees an answer sent to USB,
+ * and cannot tell that from a command that was ignored.
+ */
+static bool reply_via_ble;
 
 static void respond(uint8_t opcode, uint8_t status, const uint8_t *extra,
 		    size_t extra_len)
@@ -44,7 +63,13 @@ static void respond(uint8_t opcode, uint8_t status, const uint8_t *extra,
 	const int n = proto_encode(PROTO_TYPE_RSP, PROTO_FLAG_NONE, rsp_seq++,
 				   payload, len, rsp_buf, sizeof(rsp_buf));
 
-	if (n > 0) {
+	if (n <= 0) {
+		return;
+	}
+
+	if (reply_via_ble) {
+		(void)ble_transport_send_event(rsp_buf, (uint16_t)n);
+	} else {
 		(void)usb_transport_write(rsp_buf, (size_t)n);
 	}
 }
@@ -101,12 +126,12 @@ static void handle(const proto_frame_t *f)
 		break;
 
 	case CMD_GET_INFO: {
-		/* channels, encoding-in-use, nominal rate as a u16 */
+		const uint16_t sps = pipeline_rate();
 		const uint8_t info[4] = {
 			ADS1299_CHANNELS,
 			0,
-			250u & 0xFFu,
-			250u >> 8,
+			(uint8_t)(sps & 0xFFu),
+			(uint8_t)(sps >> 8),
 		};
 
 		respond(op, CMD_OK, info, sizeof(info));
@@ -128,6 +153,25 @@ static void handle(const proto_frame_t *f)
 			stream_enable(was_streaming);
 		}
 		break;
+
+	case CMD_SET_RATE: {
+		if (f->len < 3) {
+			status = CMD_EBADARG;
+			break;
+		}
+
+		const uint16_t sps = (uint16_t)f->payload[1] |
+				     ((uint16_t)f->payload[2] << 8);
+
+		/*
+		 * Answer before restarting. The restart tears down the DSP
+		 * thread and reconfigures the AFE, which takes long enough
+		 * that a host waiting on the reply would time out.
+		 */
+		respond(op, CMD_OK, NULL, 0);
+		(void)pipeline_set_rate(sps);
+		return;
+	}
 
 	case CMD_READ_REG: {
 		if (f->len < 2) {
@@ -160,6 +204,25 @@ static void handle(const proto_frame_t *f)
 	respond(op, status, NULL, 0);
 }
 
+/*
+ * Commands arriving over BLE.
+ *
+ * This runs on the Bluetooth thread, so it only copies the bytes and
+ * returns. Handling them here would be a mistake: some commands restart the
+ * pipeline, which stops the DSP thread and reconfigures the AFE and takes
+ * the better part of a second. Blocking the Bluetooth thread that long
+ * starves the link layer and the central drops the connection - which is
+ * exactly what a rate change did before this queue existed.
+ */
+static void on_ble_control(const uint8_t *data, uint16_t len)
+{
+	const uint32_t put = ring_buf_put(&ble_rx_rb, data, len);
+
+	if (put < len) {
+		LOG_WRN("BLE command buffer full, %u bytes dropped", len - put);
+	}
+}
+
 static void cmd_entry(void *a, void *b, void *c)
 {
 	ARG_UNUSED(a);
@@ -170,27 +233,54 @@ static void cmd_entry(void *a, void *b, void *c)
 
 	while (1) {
 		uint8_t buf[64];
-		const size_t n = usb_transport_read(buf, sizeof(buf));
-
-		if (n == 0) {
-			k_msleep(CMD_POLL_MS);
-			continue;
-		}
-
 		proto_frame_t f;
+		bool did_work = false;
 
-		for (size_t i = 0; i < n; i++) {
-			if (proto_stream_push(&rx_stream, buf[i], &f)) {
+		/* USB */
+		size_t n = usb_transport_read(buf, sizeof(buf));
+
+		if (n != 0) {
+			did_work = true;
+			reply_via_ble = false;
+
+			for (size_t i = 0; i < n; i++) {
+				if (proto_stream_push(&rx_stream, buf[i], &f)) {
+					handle(&f);
+				}
+			}
+
+			/*
+			 * push() surfaces one frame per byte at most, so a
+			 * buffer holding several complete frames leaves the
+			 * rest queued.
+			 */
+			while (proto_stream_poll(&rx_stream, &f)) {
 				handle(&f);
 			}
 		}
 
-		/*
-		 * push() surfaces one frame per byte at most, so a buffer
-		 * holding several complete frames leaves the rest queued.
-		 */
-		while (proto_stream_poll(&rx_stream, &f)) {
-			handle(&f);
+		/* BLE, queued by the Bluetooth thread. */
+		n = ring_buf_get(&ble_rx_rb, buf, sizeof(buf));
+
+		if (n != 0) {
+			did_work = true;
+			reply_via_ble = true;
+
+			for (size_t i = 0; i < n; i++) {
+				if (proto_stream_push(&ble_stream, buf[i], &f)) {
+					handle(&f);
+				}
+			}
+
+			while (proto_stream_poll(&ble_stream, &f)) {
+				handle(&f);
+			}
+
+			reply_via_ble = false;
+		}
+
+		if (!did_work) {
+			k_msleep(CMD_POLL_MS);
 		}
 	}
 }
@@ -202,6 +292,11 @@ int command_init(void)
 				      CMD_PRIORITY, 0, K_NO_WAIT);
 
 	k_thread_name_set(tid, "eeg_cmd");
-	LOG_INF("command handler up");
+
+	proto_stream_reset(&ble_stream);
+	ring_buf_init(&ble_rx_rb, sizeof(ble_rx_storage), ble_rx_storage);
+	ble_transport_set_control_handler(on_ble_control);
+
+	LOG_INF("command handler up (USB and BLE)");
 	return 0;
 }

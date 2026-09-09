@@ -371,25 +371,50 @@ they are committed to firmware.
   Python reference, injected-signal check, noise floor, timing. Outstanding:
   alpha blocking on a real head, and the impedance sweep.
 
-### M4 — full wireless control  (current, and the priority)
+### M4 — full wireless control  (current)
 
-Everything USB does today, over BLE, plus the command surface that makes the
-device configurable without a cable.
+**Streaming and rate control work over BLE.** Measured to a Windows host:
 
-- DATA notifications carrying the same protocol frames as USB, on the Stream
-  characteristic
-- Commands over the Control characteristic, same codec, same opcodes
-- Connection parameters negotiated for throughput; measure what is actually
-  achievable rather than assuming
-- **Bias drive (DRL) enabled and configurable.** Needed before electrodes on
-  a head mean anything.
-- Full command surface: sample rate, per-channel enable / gain / mux,
-  SRB1 and SRB2 routing, lead-off, notch frequency (50/60), test signal,
-  DSP configuration
-- Both transports live at once; USB stays for high rates and debugging
+```
+ 250 SPS ->  250.5 SPS actual,   8.9 kB/s, 0 bad frames, 0 sequence gaps
+ 500 SPS ->  500.1 SPS actual,  17.7 kB/s, 0 bad frames, 0 sequence gaps
+1000 SPS -> 1002.4 SPS actual,  35.6 kB/s, 0 bad frames, 0 sequence gaps
+```
 
-**Accept:** 8 ch at 250 SPS sustained over BLE with no sequence gaps for
-30 minutes, every setting reachable from the host, USB cable unplugged.
+Both links carry byte-identical frames and both are fed at once, so
+unplugging USB mid-session does not interrupt BLE. Batches are six samples,
+sized so a frame fits one notification at a 247-byte MTU - a notification
+over the MTU is dropped by the stack without complaint.
+
+1 kSPS is the ceiling worth having over BLE. 16 kSPS is 432 kB/s and stays
+USB-only.
+
+Still to do here:
+
+- **Bias drive (DRL).** Off today. Required before electrodes on a head mean
+  anything - see section 1.2.
+- Per-channel gain, mux, enable and lead-off, rather than all-or-nothing
+- SRB2 routing, notch frequency 50/60, packed int24 encoding
+- 30-minute soak with the USB cable out
+
+### Three mistakes worth keeping
+
+**Verbose logging is not free.** The USB stack logs every packet at INFO,
+and `LOG_MODE_IMMEDIATE` formats on the calling thread. Shrinking the batch
+from 16 samples to 6 tripled the write rate, and the extra logging pushed
+AFE register access past its timeout - register reads started failing with
+no change to the AFE code at all. Those modules are now at error level.
+
+**Do not do slow work on the Bluetooth thread.** Handling commands inline in
+the GATT write callback was fine until one of them restarted the pipeline,
+which stops a thread and reconfigures the AFE and takes most of a second.
+That starves the link layer and the central drops the connection. Commands
+are queued to the command thread now, both links handled the same way.
+
+**The PPI task slot is attached once, not per start.** Restarting
+acquisition re-attached the SPI start task to a channel that already had it,
+which returns `-EBUSY` and failed every rate change. The attach is now
+idempotent.
 
 ### M5 — Windows application
 

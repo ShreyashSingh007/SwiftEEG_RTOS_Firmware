@@ -56,6 +56,7 @@ static struct k_thread dsp_thread;
 static k_tid_t dsp_tid;
 
 static volatile bool running;
+static uint8_t current_rate_code;
 static struct k_sem frame_ready;
 
 /* Statistics. Written by the DSP thread, read by whoever asks. */
@@ -203,6 +204,8 @@ int pipeline_start(uint8_t rate)
 		return -EALREADY;
 	}
 
+	current_rate_code = rate;
+
 	/* Nominal, for filter design. The true rate is measured separately. */
 	switch (rate) {
 	case ADS1299_DR_250SPS:  sample_rate_hz = 250.0f; break;
@@ -293,6 +296,59 @@ void pipeline_stop(void)
 void pipeline_set_sink(pipeline_sink_t s)
 {
 	sink = s;
+}
+
+/* Real rate to the register code the AFE wants. 0xFF if unsupported. */
+static uint8_t rate_code_for(uint16_t sps)
+{
+	switch (sps) {
+	case 250:   return ADS1299_DR_250SPS;
+	case 500:   return ADS1299_DR_500SPS;
+	case 1000:  return ADS1299_DR_1KSPS;
+	case 2000:  return ADS1299_DR_2KSPS;
+	case 4000:  return ADS1299_DR_4KSPS;
+	case 8000:  return ADS1299_DR_8KSPS;
+	case 16000: return ADS1299_DR_16KSPS;
+	default:    return 0xFFu;
+	}
+}
+
+uint16_t pipeline_rate(void)
+{
+	return (uint16_t)sample_rate_hz;
+}
+
+int pipeline_set_rate(uint16_t sps)
+{
+	const uint8_t code = rate_code_for(sps);
+
+	if (code == 0xFFu) {
+		return -EINVAL;
+	}
+
+	if (running && code == current_rate_code) {
+		return 0;
+	}
+
+	const bool was_running = running;
+
+	if (was_running) {
+		pipeline_stop();
+	}
+
+	if (!was_running) {
+		return 0; /* takes effect at the next start */
+	}
+
+	const int err = pipeline_start(code);
+
+	if (err) {
+		LOG_ERR("could not restart at %u SPS (%d)", sps, err);
+	} else {
+		LOG_INF("sample rate now %u SPS", sps);
+	}
+
+	return err;
 }
 
 void pipeline_reset_stats(void)

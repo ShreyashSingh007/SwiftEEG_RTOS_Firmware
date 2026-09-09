@@ -29,4 +29,26 @@ bool ble_transport_is_streaming(void);
 /* Queues a stream notification. -ENOTCONN if nobody is subscribed. */
 int ble_transport_send_stream(const void *data, uint16_t len);
 
+/*
+ * Largest notification payload the current connection will carry, or 0 when
+ * nobody is connected. Batches are sized against this: a notification bigger
+ * than the negotiated MTU is silently dropped by the stack.
+ */
+uint16_t ble_transport_max_payload(void);
+
+/*
+ * Sends on the Event characteristic - command replies and telemetry. Kept
+ * off the Stream characteristic so a host can subscribe to replies without
+ * having to receive sample data.
+ */
+int ble_transport_send_event(const void *data, uint16_t len);
+
+/*
+ * Installed by the command layer. Called from the BLE thread whenever the
+ * host writes to the Control characteristic; the bytes are protocol frames,
+ * identical to what arrives over USB.
+ */
+typedef void (*ble_control_cb_t)(const uint8_t *data, uint16_t len);
+void ble_transport_set_control_handler(ble_control_cb_t cb);
+
 #endif /* SWIFTEEG_TRANSPORT_BLE_H */

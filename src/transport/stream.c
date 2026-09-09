@@ -6,6 +6,7 @@
 #include <zephyr/logging/log.h>
 
 #include "proto/proto.h"
+#include "ble.h"
 #include "usb.h"
 
 LOG_MODULE_REGISTER(stream, CONFIG_LOG_DEFAULT_LEVEL);
@@ -13,13 +14,17 @@ LOG_MODULE_REGISTER(stream, CONFIG_LOG_DEFAULT_LEVEL);
 /*
  * Samples per DATA frame.
  *
- * 16 samples of 8 channels at 4 bytes each is 512 bytes, plus a 16-byte
- * header, which sits inside the protocol's 1024-byte payload limit with room
- * to spare. At 250 SPS that is about 16 frames a second - frequent enough
- * that a viewer looks live, large enough that headers are not the bulk of
- * the traffic.
+ * Sized so one frame fits in a single BLE notification. A notification
+ * larger than the negotiated ATT MTU is dropped by the stack without
+ * complaint, which would look like a device that streams over USB and goes
+ * quiet over BLE.
+ *
+ * With a 247-byte MTU there are 244 bytes to spend, minus 10 of protocol
+ * overhead and 16 of data header, leaving 218 - six samples of eight
+ * channels at four bytes. USB carries the same frames; the extra header
+ * share costs it nothing it cannot afford.
  */
-#define BATCH_SAMPLES 16
+#define BATCH_SAMPLES 6
 
 /*
  * DATA payload header, little-endian, ahead of the sample block:
@@ -82,11 +87,41 @@ static void flush(void)
 				   sizeof(frame_buf));
 
 	if (n > 0) {
-		const size_t sent = usb_transport_write(frame_buf, (size_t)n);
+		bool delivered = false;
 
-		if (sent < (size_t)n) {
-			stats.bytes_dropped += (uint32_t)((size_t)n - sent);
-		} else {
+		/*
+		 * Both links carry byte-identical frames, and both are fed:
+		 * a host on either one sees the same stream, and unplugging
+		 * USB mid-session does not interrupt BLE.
+		 */
+		if (usb_transport_is_connected()) {
+			const size_t sent =
+				usb_transport_write(frame_buf, (size_t)n);
+
+			if (sent < (size_t)n) {
+				stats.bytes_dropped +=
+					(uint32_t)((size_t)n - sent);
+			} else {
+				delivered = true;
+			}
+		}
+
+		if (ble_transport_is_streaming()) {
+			const uint16_t room = ble_transport_max_payload();
+
+			if (room != 0 && (size_t)n > room) {
+				/* Would be dropped by the stack; count it
+				 * here instead of losing it silently. */
+				stats.ble_too_big++;
+			} else if (ble_transport_send_stream(frame_buf,
+							     (uint16_t)n) == 0) {
+				delivered = true;
+			} else {
+				stats.ble_dropped++;
+			}
+		}
+
+		if (delivered) {
 			stats.frames_sent++;
 			stats.samples_sent += batch_count;
 		}

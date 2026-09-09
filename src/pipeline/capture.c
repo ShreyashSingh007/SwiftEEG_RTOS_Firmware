@@ -28,6 +28,7 @@ static nrfx_gpiote_t gpiote = NRFX_GPIOTE_INSTANCE(NRF_GPIOTE);
 static uint8_t drdy_ch;
 static nrfx_gppi_handle_t ppi_handle;
 static bool capture_ready;
+static uint32_t attached_task; /* 0 = none; the PPI slot holds one */
 
 static nrfx_gpiote_pin_t drdy_pin(void)
 {
@@ -133,6 +134,21 @@ int capture_attach_task(uint32_t task_addr)
 		return -ENODEV;
 	}
 
+	/*
+	 * The attach is permanent for the life of the channel, and the
+	 * hardware has exactly one spare task slot. Re-attaching the same task
+	 * - which happens whenever acquisition restarts, for a rate change -
+	 * returns -EBUSY and would otherwise fail the restart.
+	 */
+	if (attached_task == task_addr) {
+		return 0;
+	}
+
+	if (attached_task != 0) {
+		LOG_ERR("PPI task slot already holds 0x%08x", attached_task);
+		return -EBUSY;
+	}
+
 	int err = nrfx_gppi_ep_attach(task_addr, ppi_handle);
 
 	if (err != 0) {
@@ -140,6 +156,7 @@ int capture_attach_task(uint32_t task_addr)
 		return -EIO;
 	}
 
+	attached_task = task_addr;
 	return 0;
 }
 

@@ -26,3 +26,6 @@ Thumbs.db
 
 # Local-only
 *.local
+
+# Recordings made by the app - data, not source.
+swifteeg_*.csv

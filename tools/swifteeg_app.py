@@ -322,6 +322,7 @@ class App(tk.Tk):
             for t in self.traces:
                 t.clear()
             self.samples = 0
+            self.frames = 0
             self.last_seq = None
             self.gaps = 0
             self.chain.reset()
@@ -363,6 +364,7 @@ class App(tk.Tk):
         self._resize_traces(keep=False)
         self.last_seq = None
         self.samples = 0
+        self.frames = 0
         self.started_at = time.time()
 
         self._send(link.CMD_SET_RATE, self.rate & 0xFF, self.rate >> 8)
@@ -419,8 +421,10 @@ class App(tk.Tk):
                    mux, 0, 0)
 
     def _set_bias(self) -> None:
+        # Both masks: SRB1 sits on the negative inputs and has to be inside
+        # the loop, or the bias amplifier oscillates.
         self._send(link.CMD_SET_BIAS, 1 if self.bias_var.get() else 0,
-                   0xFF, 0x00)
+                   0xFF, 0xFF)
 
     def _set_leadoff(self) -> None:
         self._send(link.CMD_SET_LEADOFF, 1 if self.loff_var.get() else 0,

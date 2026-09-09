@@ -276,11 +276,25 @@ int ads1299_configure(uint8_t rate)
 	}
 
 	/*
-	 * Bias drive on, sensing all eight scalp electrodes. Without it the
-	 * mains common-mode is only as small as the front end's own rejection
-	 * makes it, and no filter afterwards recovers what was lost.
+	 * Bias drive on, sensing both the positive and negative inputs.
+	 *
+	 * Sensing only the positive inputs makes the loop oscillate. Measured:
+	 * with SENSP=0xFF and SENSN=0x00 the common-mode ran at 124 mV and
+	 * clipped 28 % of samples; with SENSN=0xFF it settled to 2.4 mV and
+	 * clipped nothing.
+	 *
+	 * The reason is the montage. Every negative input is tied to SRB1,
+	 * which is the reference electrode on the body - the node every channel
+	 * is measured against. Leaving it out of the sensed average leaves it
+	 * outside the feedback loop, and the amplifier ends up driving the body
+	 * against a reference that is itself moving.
 	 */
 	err = afe_write_reg(ADS1299_REG_BIAS_SENSP, 0xFFu);
+	if (err) {
+		return err;
+	}
+
+	err = afe_write_reg(ADS1299_REG_BIAS_SENSN, 0xFFu);
 	if (err) {
 		return err;
 	}
@@ -503,7 +517,11 @@ int ads1299_set_bias(bool enable, uint8_t sensp, uint8_t sensn)
 		return err;
 	}
 
-	/* Which channels the amplifier averages to find the common-mode. */
+	/*
+	 * Which inputs the amplifier averages to find the common-mode. Both
+	 * masks matter: with SRB1 as the reference electrode, the negative
+	 * inputs carry it, and leaving them out makes the loop oscillate.
+	 */
 	err = afe_write_reg(ADS1299_REG_BIAS_SENSP, enable ? sensp : 0x00u);
 
 	if (err == 0) {

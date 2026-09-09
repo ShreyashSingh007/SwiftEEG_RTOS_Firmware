@@ -165,6 +165,27 @@ static void connected(struct bt_conn *conn, uint8_t err)
 	(void)bt_conn_le_param_update(conn, &param);
 }
 
+static int start_advertising(void);
+
+/*
+ * Advertising is restarted from a work item, not from the disconnect
+ * callback. That callback runs in the Bluetooth stack's own context, where
+ * the connection is still being torn down and starting an advertiser is not
+ * reliably safe.
+ */
+static void readvertise_work(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	const int err = start_advertising();
+
+	if (err) {
+		LOG_ERR("could not resume advertising (%d)", err);
+	}
+}
+
+static K_WORK_DEFINE(readvertise, readvertise_work);
+
 static void disconnected(struct bt_conn *conn, uint8_t reason)
 {
 	ARG_UNUSED(conn);
@@ -176,6 +197,14 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 	}
 	stream_subscribed = false;
 	event_subscribed = false;
+
+	/*
+	 * Connectable advertising stops when a central connects and does not
+	 * resume by itself. Without this the device disappears after the first
+	 * disconnect and stays gone until power-cycled - which on a worn
+	 * wireless device means taking the headset off.
+	 */
+	k_work_submit(&readvertise);
 }
 
 static void le_param_updated(struct bt_conn *conn, uint16_t interval,
@@ -214,8 +243,23 @@ int ble_transport_init(void)
 		return err;
 	}
 
-	err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad),
-			      sd, ARRAY_SIZE(sd));
+	err = start_advertising();
+	if (err) {
+		return err;
+	}
+
+	return 0;
+}
+
+static int start_advertising(void)
+{
+	const int err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad,
+					ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
+
+	if (err == -EALREADY) {
+		return 0; /* already advertising, nothing to do */
+	}
+
 	if (err) {
 		LOG_ERR("advertising failed to start (%d)", err);
 		return err;

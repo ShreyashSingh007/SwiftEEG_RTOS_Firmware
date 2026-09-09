@@ -18,7 +18,7 @@
         .\tools\build.ps1 -Pristine       # wipe the build dir first
 #>
 param(
-    [ValidateSet("app", "proto", "dsp", "timebase")]
+    [ValidateSet("app", "proto", "dsp", "timebase", "pipeline")]
     [string]$Target = "app",
     [switch]$Pristine,
     # Builds the app without BLE. RTT is unreliable while MPSL owns the bus,
@@ -59,6 +59,7 @@ switch ($Target) {
     "proto" { $SourceDir = Join-Path $RepoRoot "tests\proto" }
     "dsp"   { $SourceDir = Join-Path $RepoRoot "tests\dsp" }
     "timebase" { $SourceDir = Join-Path $RepoRoot "tests\timebase" }
+    "pipeline" { $SourceDir = Join-Path $RepoRoot "tests\pipeline" }
 }
 $BuildDir = Join-Path $SourceDir "build"
 

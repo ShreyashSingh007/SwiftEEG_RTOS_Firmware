@@ -113,6 +113,22 @@ static void handle(const proto_frame_t *f)
 		return;
 	}
 
+	case CMD_SET_INPUT:
+		if (f->len < 2) {
+			status = CMD_EBADARG;
+		} else {
+			const uint8_t mux = f->payload[1];
+			const uint8_t freq = (f->len >= 3) ? f->payload[2]
+							   : ADS1299_CAL_FREQ_DIV21;
+			const bool was_streaming = stream_enabled();
+
+			stream_enable(false);
+			status = (ads1299_set_input(mux, freq) == 0)
+					 ? CMD_OK : CMD_EFAILED;
+			stream_enable(was_streaming);
+		}
+		break;
+
 	case CMD_READ_REG: {
 		if (f->len < 2) {
 			status = CMD_EBADARG;

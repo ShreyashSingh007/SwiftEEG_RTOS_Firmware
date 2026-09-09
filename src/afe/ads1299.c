@@ -422,7 +422,7 @@ int ads1299_read_reg_safe(uint8_t addr, uint8_t *val)
 	return err ? err : resume_err;
 }
 
-int ads1299_test_signal(bool on, uint8_t cal_freq)
+int ads1299_set_input(uint8_t mux, uint8_t cal_freq)
 {
 	bool was_streaming = false;
 
@@ -432,18 +432,17 @@ int ads1299_test_signal(bool on, uint8_t cal_freq)
 		return mode_err;
 	}
 
-	const uint8_t cfg2 = on ? (ADS1299_CONFIG2_BASE |
-				   ADS1299_CONFIG2_INT_CAL |
-				   (cal_freq & 0x03u))
-				: ADS1299_CONFIG2_BASE;
+	const bool cal = (mux == ADS1299_MUX_TEST);
+	const uint8_t cfg2 = cal ? (ADS1299_CONFIG2_BASE |
+				    ADS1299_CONFIG2_INT_CAL |
+				    (cal_freq & 0x03u))
+				 : ADS1299_CONFIG2_BASE;
 
 	int err = afe_write_reg(ADS1299_REG_CONFIG2, cfg2);
 
 	if (err == 0) {
 		/* The mux has to be routed too, or CONFIG2 changes nothing. */
-		err = ads1299_set_channels(ADS1299_GAIN_24,
-					   on ? ADS1299_MUX_TEST
-					      : ADS1299_MUX_NORMAL);
+		err = ads1299_set_channels(ADS1299_GAIN_24, mux);
 	}
 
 	uint8_t back = 0;
@@ -466,8 +465,14 @@ int ads1299_test_signal(bool on, uint8_t cal_freq)
 		return resume_err;
 	}
 
-	LOG_INF("AFE test signal %s (CONFIG2 %02x)", on ? "ON" : "off", back);
+	LOG_INF("AFE input mux %u (CONFIG2 %02x)", mux, back);
 	return 0;
+}
+
+int ads1299_test_signal(bool on, uint8_t cal_freq)
+{
+	return ads1299_set_input(on ? ADS1299_MUX_TEST : ADS1299_MUX_NORMAL,
+				 cal_freq);
 }
 
 int ads1299_set_channels(uint8_t gain, uint8_t mux)

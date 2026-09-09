@@ -176,6 +176,17 @@ int ads1299_set_channels(uint8_t gain, uint8_t mux);
  */
 int ads1299_test_signal(bool on, uint8_t cal_freq);
 
+/*
+ * Point every channel at one of the ADS1299_MUX_* sources, handling the mode
+ * switch the part needs for a register write. Selecting the test source also
+ * enables the generator in CONFIG2; anything else disables it.
+ *
+ * MUX_SHORTED is how the noise floor is measured: the inputs are tied
+ * together internally, so what comes out is the front end's own noise and
+ * nothing from the electrodes.
+ */
+int ads1299_set_input(uint8_t mux, uint8_t cal_freq);
+
 /* START and STOP opcodes. Conversions run between them. */
 int ads1299_start_conversions(void);
 int ads1299_stop_conversions(void);

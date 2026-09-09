@@ -6,6 +6,7 @@
 #include <zephyr/logging/log.h>
 
 #include "capture.h"
+#include "chain.h"
 #include "dsp/dsp.h"
 #include "sys/ringbuf.h"
 #include "timebase/timebase.h"
@@ -47,9 +48,7 @@ struct raw_frame {
 static struct raw_frame raw_storage[RAW_RING_FRAMES];
 static spsc_ring_t raw_ring;
 
-static dsp_dc_t dc[ADS1299_CHANNELS];
-static dsp_cascade_t cascade;
-static float lsb_uv;
+static chain_t chain;
 static float sample_rate_hz;
 
 static K_THREAD_STACK_DEFINE(dsp_stack, DSP_STACK_SIZE);
@@ -96,14 +95,6 @@ static void measure_timing_overhead(void)
 	timing_overhead_us = best;
 }
 
-/* Sign-extend one 24-bit big-endian channel word. */
-static inline int32_t decode_ch(const uint8_t *p)
-{
-	const uint32_t raw = ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | p[2];
-
-	return (raw & 0x800000u) ? (int32_t)(raw | 0xFF000000u) : (int32_t)raw;
-}
-
 /*
  * Runs in the SPI transfer-complete interrupt. Copy and leave - anything
  * slower here eats into the budget before the next sample arrives, which at
@@ -131,46 +122,19 @@ static void process(const struct raw_frame *rf)
 	struct eeg_sample out = {
 		.ts_us = rf->ts_us,
 		.seq = st_seq++,
-		.status = ((uint32_t)rf->data[0] << 16) |
-			  ((uint32_t)rf->data[1] << 8) | rf->data[2],
+		.status = frame_status(rf->data),
 		.flags = 0,
 	};
 
 	/*
-	 * Top four status bits are hard-wired to 1100. Anything else means the
-	 * frame is misaligned, so it is not a signal and must not reach the
-	 * filters - a bogus sample would poison the DC estimator and the
-	 * biquad state for every sample after it.
-	 *
-	 * The first frame after entering continuous-read mode is the usual
-	 * one: its transfer is started by the first DRDY, before the part
-	 * necessarily has a complete sample on the bus.
+	 * chain_process() rejects a frame whose status marker is wrong. That
+	 * is not a sample: letting it through would corrupt the DC estimate
+	 * and the biquad state for everything after it.
 	 */
-	if ((rf->data[0] & 0xF0u) != 0xC0u) {
+	if (!chain_process(&chain, rf->data, out.ch_raw, out.ch_uv)) {
 		st_bad_status++;
+		st_seq--; /* it never became a sample */
 		return;
-	}
-
-	for (uint8_t ch = 0; ch < ADS1299_CHANNELS; ch++) {
-		const int32_t raw =
-			decode_ch(&rf->data[ADS1299_STATUS_BYTES + ch * 3]);
-
-		/*
-		 * Strip DC in the integer domain, before the float conversion.
-		 * Full scale at gain 24 is +/-187.5 mV against a 22.35 nV LSB,
-		 * a ratio of 8.4e6, and float32 carries only ~1.7e7 of
-		 * mantissa - so converting a DC-laden sample first would leave
-		 * almost no resolution for the microvolt signal riding on top.
-		 */
-		out.ch_raw[ch] = raw;
-
-		const int32_t ac = dsp_dc_apply(&dc[ch], raw);
-
-		float uv = (float)ac * lsb_uv;
-
-		uv = dsp_cascade_apply(&cascade, ch, uv);
-
-		out.ch_uv[ch] = uv;
 	}
 
 	if (out.ch_uv[0] < st_ch1_min) {
@@ -221,28 +185,16 @@ static void dsp_entry(void *a, void *b, void *c)
 
 static int build_chain(void)
 {
-	dsp_cascade_init(&cascade, ADS1299_CHANNELS);
-
-	dsp_biquad_coeffs_t notch;
-
-	if (!dsp_design_notch(&notch, sample_rate_hz, NOTCH_HZ, NOTCH_Q)) {
-		LOG_ERR("notch design failed for fs %d Hz", (int)sample_rate_hz);
-		return -EINVAL;
-	}
-
-	if (!dsp_cascade_set(&cascade, &notch, 1)) {
-		LOG_ERR("cascade rejected the notch section");
-		return -EINVAL;
-	}
-
-	for (uint8_t ch = 0; ch < ADS1299_CHANNELS; ch++) {
-		dsp_dc_init(&dc[ch], DC_SHIFT);
-	}
-
 	/* VREF is the part's internal 4.5 V; gain 24 is what configure() sets. */
-	lsb_uv = dsp_lsb_uv(4.5f, 24);
+	const int err = chain_init(&chain, sample_rate_hz, DC_SHIFT, NOTCH_HZ,
+				   NOTCH_Q, 4.5f, 24);
 
-	return 0;
+	if (err) {
+		LOG_ERR("filter design failed for fs %d Hz (%d)",
+			(int)sample_rate_hz, err);
+	}
+
+	return err;
 }
 
 int pipeline_start(uint8_t rate)
@@ -313,7 +265,7 @@ int pipeline_start(uint8_t rate)
 
 	LOG_INF("pipeline running: %d SPS, LSB %d nV, notch %d Hz "
 		"(timing overhead %u us)",
-		(int)sample_rate_hz, (int)(lsb_uv * 1000.0f), (int)NOTCH_HZ,
+		(int)sample_rate_hz, (int)(chain.lsb_uv * 1000.0f), (int)NOTCH_HZ,
 		timing_overhead_us);
 
 	return 0;

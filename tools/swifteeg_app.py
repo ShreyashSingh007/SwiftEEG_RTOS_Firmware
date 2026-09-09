@@ -77,6 +77,13 @@ class App(tk.Tk):
         self.saturated = [False] * link.CHANNELS
         self.dc_mv = [0.0] * link.CHANNELS
 
+        # Recent unfiltered samples, kept only so the mains frequency can be
+        # measured. Grid frequency is never exactly 50 or 60 Hz - measured
+        # 49.6 here - and a notch narrow enough to spare the EEG is too
+        # narrow to hit by guesswork.
+        self.mains_buf: collections.deque = collections.deque(maxlen=4000)
+        self.mains_next = 0.0
+
         self.samples = 0
         self.frames = 0
         self.last_seq: int | None = None
@@ -107,12 +114,42 @@ class App(tk.Tk):
         return f
 
     def _build(self) -> None:
-        side = tk.Frame(self, bg=PANEL, width=330)
+        """
+        The control column scrolls.
+
+        There are more controls than fit a laptop screen, and a fixed frame
+        silently clips whatever falls off the bottom - which is how the
+        statistics line and the scale controls became invisible.
+        """
+        side = tk.Frame(self, bg=PANEL, width=348)
         side.pack(side=tk.LEFT, fill=tk.Y)
         side.pack_propagate(False)
 
-        inner = tk.Frame(side, bg=PANEL, padx=14, pady=12)
-        inner.pack(fill=tk.BOTH, expand=True)
+        canvas = tk.Canvas(side, bg=PANEL, highlightthickness=0, width=330)
+        bar = ttk.Scrollbar(side, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=bar.set)
+
+        bar.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        inner = tk.Frame(canvas, bg=PANEL, padx=14, pady=12)
+        window = canvas.create_window((0, 0), window=inner, anchor="nw",
+                                      width=326)
+
+        def on_resize(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        inner.bind("<Configure>", on_resize)
+
+        def on_wheel(event):
+            canvas.yview_scroll(int(-event.delta / 120), "units")
+
+        # Bind to the whole window: the pointer is usually over a child
+        # widget, not the canvas, and children do not forward the event.
+        self.bind_all("<MouseWheel>", lambda e: on_wheel(e)
+                      if self._pointer_over(side) else None)
+
+        self._side = side
 
         # -- connection --
         f = self._section(inner, "connection")
@@ -226,12 +263,24 @@ class App(tk.Tk):
         self._combo_row(f, "mains notch", self.hnotch_var,
                         ["off", "50 Hz", "60 Hz"], self._rebuild_chain, "")
 
+        self.q_var = tk.StringVar(value="12")
+        self._combo_row(f, "notch width", self.q_var,
+                        ["30 (narrow)", "12", "6 (wide)"],
+                        self._rebuild_chain, "")
+
         self.car_var = tk.BooleanVar(value=True)
         self.harm_var = tk.BooleanVar(value=True)
+        self.track_var = tk.BooleanVar(value=True)
         self._check(f, "Common average (shared zero)", self.car_var,
                     self._rebuild_chain)
         self._check(f, "Also notch the harmonic", self.harm_var,
                     self._rebuild_chain)
+        self._check(f, "Track real mains frequency", self.track_var,
+                    self._rebuild_chain)
+
+        self.mains_label = self._label(f, "", fg="#ffd866",
+                                       font=("Consolas", 8))
+        self.mains_label.pack(fill=tk.X, pady=(2, 0))
 
         # -- channels --
         f = self._section(inner, "channels")
@@ -273,6 +322,14 @@ class App(tk.Tk):
 
         self.canvas = tk.Canvas(self, bg=PLOT_BG, highlightthickness=0)
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+    def _pointer_over(self, widget) -> bool:
+        try:
+            x, y = self.winfo_pointerxy()
+            wx = widget.winfo_rootx()
+            return wx <= x < wx + widget.winfo_width()
+        except tk.TclError:
+            return False
 
     def _check(self, parent, text, var, cb):
         c = tk.Checkbutton(parent, text=text, variable=var, bg=PANEL, fg=FG,
@@ -453,6 +510,8 @@ class App(tk.Tk):
         self.chain.notch_hz = {"off": 0.0, "50 Hz": 50.0, "60 Hz": 60.0}[nz]
         self.chain.notch_harmonic = self.harm_var.get()
         self.chain.car = self.car_var.get()
+        self.chain.notch_q = float(self.q_var.get().split()[0])
+        self.chain.notch_track = self.track_var.get()
         self.chain.rebuild()
 
     # ---------------------------------------------------------- recording --
@@ -592,6 +651,19 @@ class App(tk.Tk):
             self.dc_mv[ch] = float(np.mean(counts[:, ch])) * scale / 1000.0
 
         uv = counts.astype(np.float64) * scale
+
+        # Re-aim the notch from what the mains is actually doing, using
+        # unfiltered samples - the notch has already removed the evidence
+        # from anything downstream of it.
+        if not already_uv:
+            self.mains_buf.extend(uv.mean(axis=1))
+            now = time.time()
+            if now >= self.mains_next and len(self.mains_buf) >= self.rate * 4:
+                self.mains_next = now + 5.0
+                block = np.array(self.mains_buf)
+                if self.chain.update_mains(block):
+                    self.chain.reset()
+
         out = self.chain.process(uv)
 
         for ch in range(link.CHANNELS):
@@ -688,6 +760,15 @@ class App(tk.Tk):
             c.create_text(w // 2, 16, fill="#ffd866", font=("Segoe UI", 10),
                           text=f"filters settling "
                                f"({self.chain.settling_seconds:.0f} s)")
+
+        m = self.chain.measured_mains
+        if m and self.chain.notch_track:
+            self.mains_label.config(
+                text=f"mains measured at {m:.2f} Hz")
+        elif self.chain.notch_hz:
+            self.mains_label.config(text="mains: using nominal")
+        else:
+            self.mains_label.config(text="")
 
         n_rail = sum(1 for ch in shown if self.saturated[ch])
         if n_rail:

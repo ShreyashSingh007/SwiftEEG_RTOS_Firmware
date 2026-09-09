@@ -44,7 +44,11 @@ F32 = np.float32
 DEFAULT_HIGHPASS_HZ = 0.5
 DEFAULT_LOWPASS_HZ = 45.0
 DEFAULT_NOTCH_HZ = 50.0
-DEFAULT_NOTCH_Q = 30.0
+# Q sets how narrow the notch is: width in Hz is roughly f0/Q. Q=30 gives a
+# 1.7 Hz notch, which is too sharp to be aimed by hand - measured mains sits
+# at 49.6 Hz, and grid frequency wanders continuously. Q=12 is about 4 Hz
+# wide, which covers the drift and still leaves alpha and beta untouched.
+DEFAULT_NOTCH_Q = 12.0
 
 
 def butterworth_qs(order: int) -> list[float]:
@@ -93,6 +97,50 @@ def design_highpass(fs, fc, q):
     cw, alpha = math.cos(w0), math.sin(w0) / (2 * q)
     b0 = (1.0 + cw) / 2
     return _norm(b0, -(1.0 + cw), b0, 1 + alpha, -2 * cw, 1 - alpha)
+
+
+def find_mains(block, fs: float, nominal: float = 50.0) -> float | None:
+    """
+    Find the actual mains frequency near `nominal`.
+
+    Grid frequency is never exactly 50 or 60 Hz and moves around by a few
+    tenths. A notch narrow enough to spare the EEG either side is too narrow
+    to hit a moving target by guesswork, so it gets aimed instead.
+
+    Returns None when there is not enough data to be confident, in which case
+    the caller should keep whatever it had.
+    """
+    x = np.asarray(block, dtype=float)
+    if x.ndim > 1:
+        x = x.mean(axis=1)
+
+    n = len(x)
+    # Resolution is fs/n, so a 0.1 Hz answer needs about 10 seconds.
+    if n < int(fs * 4):
+        return None
+
+    w = np.hanning(n)
+    sp = np.abs(np.fft.rfft((x - x.mean()) * w))
+    fr = np.fft.rfftfreq(n, 1.0 / fs)
+
+    lo, hi = nominal - 3.0, nominal + 3.0
+    m = (fr >= lo) & (fr <= hi)
+    if not np.any(m):
+        return None
+
+    idx = np.flatnonzero(m)
+    k = idx[int(np.argmax(sp[m]))]
+
+    # Parabolic interpolation across the peak: the true frequency sits
+    # between bins, and at 4 s of data a bin is 0.25 Hz wide.
+    if 0 < k < len(sp) - 1:
+        a, b, c = sp[k - 1], sp[k], sp[k + 1]
+        denom = a - 2 * b + c
+        if denom != 0:
+            k_off = 0.5 * (a - c) / denom
+            return float(fr[k] + k_off * (fr[1] - fr[0]))
+
+    return float(fr[k])
 
 
 def response(sections, fs, freqs):
@@ -162,6 +210,11 @@ class Chain:
         self.car = True
         self.order = 4
 
+        # When set, the notch is aimed at the measured mains frequency
+        # rather than the nominal one.
+        self.notch_track = True
+        self.measured_mains: float | None = None
+
         self._hp = Biquads([], channels)
         self._notch = Biquads([], channels)
         self._lp = Biquads([], channels)
@@ -180,10 +233,18 @@ class Chain:
 
         notch = []
         if self.notch_hz and self.notch_hz > 0:
-            notch.append(design_notch(self.fs, self.notch_hz, self.notch_q))
-            # The first harmonic is often as strong as the fundamental, but
-            # only if it is actually below Nyquist.
-            second = self.notch_hz * 2.0
+            # Aim at the measured frequency when there is one. Mains is not
+            # where the nameplate says: measured 49.6 Hz against a nominal
+            # 50, which a narrow notch misses entirely.
+            f0 = self.notch_hz
+            if self.notch_track and self.measured_mains:
+                if abs(self.measured_mains - self.notch_hz) < 3.0:
+                    f0 = self.measured_mains
+
+            notch.append(design_notch(self.fs, f0, self.notch_q))
+
+            # The harmonic tracks the fundamental, so it moves with it.
+            second = f0 * 2.0
             if self.notch_harmonic and second < nyq * 0.95:
                 notch.append(design_notch(self.fs, second, self.notch_q))
 
@@ -195,6 +256,27 @@ class Chain:
         self._hp.set(hp, self.channels)
         self._notch.set(notch, self.channels)
         self._lp.set(lp, self.channels)
+
+    def update_mains(self, block) -> bool:
+        """
+        Re-aim the notch from a recent block of data. Returns True if the
+        filters were redesigned.
+        """
+        if not (self.notch_track and self.notch_hz):
+            return False
+
+        found = find_mains(block, self.fs, self.notch_hz)
+        if found is None:
+            return False
+
+        # Only redesign when it has actually moved, so the filter state is
+        # not being reset constantly.
+        if self.measured_mains and abs(found - self.measured_mains) < 0.05:
+            return False
+
+        self.measured_mains = found
+        self.rebuild()
+        return True
 
     def set_rate(self, fs: float) -> None:
         if abs(fs - self.fs) < 1e-6:

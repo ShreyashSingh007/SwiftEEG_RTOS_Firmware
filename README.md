@@ -453,21 +453,60 @@ acquisition re-attached the SPI start task to a channel that already had it,
 which returns `-EBUSY` and failed every rate change. The attach is now
 idempotent.
 
-### M5 — Windows application
+### M5 — Windows application  (built)
 
-The instrument for finding the right DSP settings, and the thing that gets
-worn-headset data on screen.
+```bash
+python tools/swifteeg_app.py
+```
 
-- Controls for every device setting M4 exposes
-- Host-side DSP chain, adjustable live: mains notch (50/60), drift removal,
-  a re-referencing stage so channels sit on a common zero rather than
-  wandering, and a configurable band-pass
-- Live plot with real units and a stable Y axis
-- Records raw to disk, so a session can be re-analysed with different
-  settings afterwards
+Connects over Bluetooth or USB, exposes every device setting, runs the filter
+chain on the host, plots the result and records raw to CSV.
 
-**Accept:** headset on, USB unplugged, clean traces on screen with alpha
-visible on eyes-closed.
+Three files:
+
+- `tools/swifteeg_link.py` - USB and BLE behind one interface. bleak is
+  async and tkinter is not, so BLE runs its event loop on its own thread and
+  the two sides talk over queues; nothing in the UI awaits anything.
+- `tools/eeg_dsp.py` - the filter chain, self-tested by property.
+- `tools/swifteeg_app.py` - the window.
+
+**30-minute wireless soak passed** before the app was built: 1,802,484
+samples at 1001.0 SPS over BLE, 0 sequence gaps, 0 CRC failures, 0
+disconnects. `python tools/soak.py --minutes 30 --sps 1000`.
+
+#### Why the app reads the device's configuration on connect
+
+It asks `CMD_GET_CONFIG` the moment the link comes up and moves its own
+controls to match, rather than assuming its defaults are what the device is
+doing.
+
+That is not tidiness. The first version asked on a 1.2-second timer, which
+expires long before a Bluetooth scan finishes, so the request was lost and
+the app kept its defaults. It believed 250 SPS while the device ran at 1000,
+designed every filter for the wrong sample rate, and produced 3390 uV of
+peak-to-peak noise on a channel that should have been quiet. With the
+configuration actually read, the same channel sits at 0.07 uV mean and
+7.4 uV peak to peak.
+
+A filter designed for the wrong sample rate does not fail loudly. It just
+does not work.
+
+#### What the host chain does
+
+High-pass, notch (with its harmonic), common average reference, low-pass -
+in that order. The high-pass first so nothing downstream works on a drifting
+signal; the re-reference after it so per-channel offsets do not contaminate
+the average.
+
+The common average is what pulls the traces onto a shared zero. It subtracts
+what every channel has in common, which is where mains and body potential
+live - and those are not reachable by any per-channel filter, because they
+are not per channel.
+
+Defaults are 0.5 Hz, 45 Hz, 50 Hz notch, CAR on. The 0.5 Hz high-pass is a
+viewing choice: it makes a trace look clean and it distorts slow ERP
+components. The device still records at 0.08 Hz, so the recording keeps what
+the display throws away.
 
 ### M6 — push the validated chain into the firmware
 

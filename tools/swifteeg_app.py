@@ -70,6 +70,13 @@ class App(tk.Tk):
                        for _ in range(link.CHANNELS)]
         self.enabled = [tk.BooleanVar(value=True) for _ in range(link.CHANNELS)]
 
+        # Raw counts sit at +/-2^23 when an input saturates. Tracked per
+        # channel because a railed channel is not a small problem: at gain 24
+        # the input range is only +/-187.5 mV, and an electrode offset larger
+        # than that pins the converter with no signal left to filter.
+        self.saturated = [False] * link.CHANNELS
+        self.dc_mv = [0.0] * link.CHANNELS
+
         self.samples = 0
         self.frames = 0
         self.last_seq: int | None = None
@@ -118,6 +125,12 @@ class App(tk.Tk):
         self.btn_conn = tk.Button(row, text="Connect", width=10,
                                   command=self._toggle_conn)
         self.btn_conn.pack(side=tk.LEFT, padx=6)
+
+        # Always available, even when the app thinks it is streaming: if the
+        # link wedges there has to be a way back that does not involve
+        # restarting the application.
+        tk.Button(row, text="Reset", width=6,
+                  command=self._reset_link).pack(side=tk.LEFT)
 
         self.status = self._label(f, "not connected", fg=DIM)
         self.status.pack(fill=tk.X, pady=(6, 0))
@@ -231,11 +244,22 @@ class App(tk.Tk):
 
         # -- display --
         f = self._section(inner, "display")
-        self.auto_var = tk.BooleanVar(value=True)
-        self._check(f, "Auto scale", self.auto_var, None)
-        self.scale_var = tk.StringVar(value="100")
+
+        # "auto" is a value in the same list rather than a separate
+        # checkbox. The two-control version was ambiguous: picking a range
+        # while auto was still ticked did nothing visible, which reads as a
+        # broken control.
+        self.scale_var = tk.StringVar(value="auto")
         self._combo_row(f, "range +/-", self.scale_var,
-                        ["20", "50", "100", "200", "500", "2000"], None, "uV")
+                        ["auto", "10", "25", "50", "100", "200", "500",
+                         "2000", "200000"], None, "uV")
+
+        self.window_var = tk.StringVar(value="5")
+        self._combo_row(f, "time window", self.window_var,
+                        ["1", "2", "3", "5", "10"], self._set_window, "s")
+
+        self.perch_var = tk.BooleanVar(value=True)
+        self._check(f, "Scale each channel separately", self.perch_var, None)
 
         self.stats = self._label(inner, "", fg=DIM, font=("Consolas", 8),
                                  justify=tk.LEFT)
@@ -308,13 +332,71 @@ class App(tk.Tk):
             self._send(link.CMD_STREAM_STOP)
             self.btn_stream.config(text="Start streaming")
 
+    def _trace_depth(self) -> int:
+        return max(2, int(float(self.window_var.get()) * self.rate))
+
+    def _resize_traces(self, keep: bool = True) -> None:
+        depth = self._trace_depth()
+        self.traces = [
+            collections.deque(list(t)[-depth:] if keep else [], maxlen=depth)
+            for t in self.traces]
+
+    def _set_window(self) -> None:
+        self._resize_traces(keep=True)
+
     def _set_rate(self) -> None:
+        """
+        Changing rate restarts acquisition on the device, which takes about a
+        second. Everything held here belongs to the old rate: the filter
+        coefficients, the samples already plotted, and the sequence counter.
+        Carrying any of it across is what made a rate change look like the
+        stream had died.
+        """
+        was_streaming = self.btn_stream["text"].startswith("Stop")
+
+        if was_streaming:
+            self._send(link.CMD_STREAM_STOP)
+
         self.rate = int(self.rate_var.get())
-        depth = int(WINDOW_SECONDS * self.rate)
-        self.traces = [collections.deque(list(t)[-depth:], maxlen=depth)
-                       for t in self.traces]
         self.chain.set_rate(self.rate)
+        self.chain.reset()
+        self._resize_traces(keep=False)
+        self.last_seq = None
+        self.samples = 0
+        self.started_at = time.time()
+
         self._send(link.CMD_SET_RATE, self.rate & 0xFF, self.rate >> 8)
+        self.status.config(text=f"switching to {self.rate} SPS...",
+                           fg="#ffd866")
+
+        if was_streaming:
+            # The device is stopping a thread and reconfiguring the AFE.
+            # Asking it to stream again before that finishes is ignored.
+            self.after(2000, self._resume_after_rate)
+
+    def _resume_after_rate(self) -> None:
+        self._send(link.CMD_STREAM_START)
+        self._send(link.CMD_GET_CONFIG)
+        self.started_at = time.time()
+        self.status.config(text=f"streaming at {self.rate} SPS", fg="#5ed18b")
+
+    def _reset_link(self) -> None:
+        """Stop everything and reconnect, without restarting the app."""
+        if self.link:
+            try:
+                self.link.send(link.CMD_STREAM_STOP)
+            except Exception:  # noqa: BLE001
+                pass
+            self.link.close()
+            self.link = None
+
+        self.btn_conn.config(text="Connect")
+        self.btn_stream.config(text="Start streaming")
+        self._was_connected = False
+        self.chain.reset()
+        self._resize_traces(keep=False)
+        self.last_seq = None
+        self.status.config(text="link reset - press Connect", fg="#ffd866")
 
     def _set_encoding(self) -> None:
         enc = (link.ENC_RAW_I24 if self.enc_var.get().startswith("24")
@@ -477,6 +559,15 @@ class App(tk.Tk):
                 self.recorder.writerow([ts0 + i, seq0 + i, *row.tolist()])
             self.rec_rows += len(counts)
 
+        # Saturation is judged on raw counts, before any filter. A railed
+        # channel is flat at full scale, and after a high-pass it looks like
+        # a quiet channel rather than a broken one.
+        full_scale = (1 << 23) * 0.98
+        peak = np.max(np.abs(counts), axis=0)
+        for ch in range(link.CHANNELS):
+            self.saturated[ch] = bool(peak[ch] >= full_scale)
+            self.dc_mv[ch] = float(np.mean(counts[:, ch])) * scale / 1000.0
+
         uv = counts.astype(np.float64) * scale
         out = self.chain.process(uv)
 
@@ -484,6 +575,33 @@ class App(tk.Tk):
             self.traces[ch].extend(out[:, ch])
 
     # -------------------------------------------------------------- draw --
+
+    def _span_for(self, ch: int, shown) -> float:
+        """
+        Vertical range for one lane.
+
+        Per-channel by default. A shared range is useless the moment one
+        electrode is off: that channel sits at 187 500 uV, and a range large
+        enough to contain it draws every real trace as a flat line - which
+        looks exactly like a device that is not working.
+        """
+        pick = self.scale_var.get()
+
+        if pick != "auto":
+            return float(pick)
+
+        if self.perch_var.get():
+            source = [ch]
+        else:
+            source = shown
+
+        peak = 0.0
+        for i in source:
+            t = self.traces[i]
+            if t:
+                peak = max(peak, max(abs(v) for v in t))
+
+        return max(5.0, peak * 1.15)
 
     def _draw(self) -> None:
         c = self.canvas
@@ -496,52 +614,80 @@ class App(tk.Tk):
         if not shown:
             return
 
-        left = 92
+        left = 118
         plot_w = w - left - 24
         lane = h / len(shown)
-
-        if self.auto_var.get():
-            peak = max((max((abs(v) for v in self.traces[i]), default=0.0)
-                        for i in shown), default=0.0)
-            span = max(10.0, peak * 1.15)
-        else:
-            span = float(self.scale_var.get())
+        window = float(self.window_var.get())
 
         settled = (time.time() - self.started_at) > self.chain.settling_seconds
 
         for row, ch in enumerate(shown):
             base = lane * (row + 0.5)
+            span = self._span_for(ch, shown)
+
             c.create_line(left, base, w - 24, base, fill="#1c2029")
-            c.create_text(left - 10, base, anchor="e", fill=COLORS[ch],
+
+            # Lane label, plus what this lane is actually showing.
+            c.create_text(left - 10, base - 7, anchor="e", fill=COLORS[ch],
                           text=f"CH{ch + 1} {SITES[ch]}",
                           font=("Consolas", 10, "bold"))
+
+            if self.saturated[ch]:
+                c.create_text(left - 10, base + 8, anchor="e", fill="#ff6b6b",
+                              text="RAILED", font=("Consolas", 8, "bold"))
+            else:
+                c.create_text(left - 10, base + 8, anchor="e", fill=DIM,
+                              text=f"+/-{span:,.0f}uV", font=("Consolas", 8))
 
             t = self.traces[ch]
             if len(t) < 2:
                 continue
 
             step = plot_w / (len(t) - 1)
-            k = (lane * 0.44) / span
+            k = (lane * 0.42) / span
+
             pts = []
             for i, v in enumerate(t):
                 y = base - max(-span, min(span, v)) * k
                 pts.extend((left + i * step, y))
-            c.create_line(*pts, fill=COLORS[ch], width=1)
 
-        c.create_text(left - 10, 14, anchor="e", fill=DIM,
-                      font=("Consolas", 9), text=f"+/-{span:,.0f} uV")
+            colour = "#4a3038" if self.saturated[ch] else COLORS[ch]
+            c.create_line(*pts, fill=colour, width=1)
+
+        # Time axis: a grid line a second, so the window is readable.
+        for sec in range(1, int(window) + 1):
+            x = left + plot_w * (sec / window)
+            c.create_line(x, 0, x, h, fill="#171a21")
+        c.create_text(w - 26, h - 10, anchor="e", fill=DIM,
+                      font=("Consolas", 8), text=f"{window:.0f} s window")
 
         if not settled and self.samples:
             c.create_text(w // 2, 16, fill="#ffd866", font=("Segoe UI", 10),
                           text=f"filters settling "
                                f"({self.chain.settling_seconds:.0f} s)")
 
+        n_rail = sum(1 for ch in shown if self.saturated[ch])
+        if n_rail:
+            # Full-scale differential input is VREF/gain, so 187.5 mV at
+            # gain 24. An electrode that is not touching skin floats well
+            # past that, which is the usual reason a channel rails.
+            fs_mv = 4500.0 / max(1, self.gain)
+            c.create_text(
+                w // 2, h - 26, fill="#ff6b6b", font=("Segoe UI", 11, "bold"),
+                text=f"{n_rail} channel(s) at full scale "
+                     f"(+/-{fs_mv:.0f} mV) - electrode not connected, "
+                     f"or contact lost")
+
         el = max(1e-3, time.time() - self.started_at)
         rec = f"  rec {self.rec_rows}" if self.recorder else ""
         bad = self.link.bad_frames if self.link else 0
+        dc = " ".join(f"{v:+.0f}" for v in self.dc_mv)
         self.stats.config(
-            text=f"{self.samples} samples  {self.samples / el:6.1f} SPS\n"
-                 f"{self.frames} frames  {bad} bad  {self.gaps} gaps{rec}")
+            text=(f"{self.samples} samples  {self.samples / el:6.1f} SPS"
+                  + chr(10) +
+                  f"{self.frames} frames  {bad} bad  {self.gaps} gaps{rec}"
+                  + chr(10) +
+                  f"DC mV: {dc}"))
 
     def _close(self) -> None:
         if self.recorder is not None:

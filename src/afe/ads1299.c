@@ -541,6 +541,70 @@ int ads1299_set_bias(bool enable, uint8_t sensp, uint8_t sensn)
 	return 0;
 }
 
+int ads1299_set_leadoff(bool enable, uint8_t sensp, uint8_t sensn)
+{
+	bool was_streaming = false;
+
+	int err = afe_enter_command_mode(&was_streaming);
+
+	if (err) {
+		return err;
+	}
+
+	/* Lowest current and the default threshold; DC detection. */
+	err = afe_write_reg(ADS1299_REG_LOFF, ADS1299_LOFF_DC_6NA);
+
+	if (err == 0) {
+		err = afe_write_reg(ADS1299_REG_LOFF_SENSP,
+				    enable ? sensp : 0x00u);
+	}
+	if (err == 0) {
+		err = afe_write_reg(ADS1299_REG_LOFF_SENSN,
+				    enable ? sensn : 0x00u);
+	}
+	if (err == 0) {
+		/* The comparator itself, which is powered down by default. */
+		err = afe_write_reg(ADS1299_REG_CONFIG4,
+				    enable ? ADS1299_CONFIG4_PD_LOFF_COMP : 0x00u);
+	}
+
+	const int resume_err = afe_resume_streaming(was_streaming);
+
+	if (err) {
+		return err;
+	}
+	if (resume_err) {
+		return resume_err;
+	}
+
+	LOG_INF("AFE lead-off %s (SENSP %02x)", enable ? "ON" : "off",
+		enable ? sensp : 0);
+	return 0;
+}
+
+int ads1299_get_channels(uint8_t *out, uint8_t count)
+{
+	if (out == NULL || count > ADS1299_CHANNELS) {
+		return -EINVAL;
+	}
+
+	bool was_streaming = false;
+
+	int err = afe_enter_command_mode(&was_streaming);
+
+	if (err) {
+		return err;
+	}
+
+	for (uint8_t i = 0; i < count && err == 0; i++) {
+		err = afe_read_reg(ADS1299_REG_CH1SET + i, &out[i]);
+	}
+
+	const int resume_err = afe_resume_streaming(was_streaming);
+
+	return err ? err : resume_err;
+}
+
 int ads1299_set_channel(uint8_t ch, uint8_t gain, uint8_t mux, bool power_down,
 			bool srb2)
 {

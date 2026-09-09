@@ -36,9 +36,13 @@
 #define ADS1299_REG_CONFIG2 0x02
 #define ADS1299_REG_CONFIG3 0x03
 #define ADS1299_REG_CH1SET  0x05
+#define ADS1299_REG_LOFF    0x04
 #define ADS1299_REG_BIAS_SENSP 0x0D
 #define ADS1299_REG_BIAS_SENSN 0x0E
+#define ADS1299_REG_LOFF_SENSP 0x0F
+#define ADS1299_REG_LOFF_SENSN 0x10
 #define ADS1299_REG_MISC1   0x15
+#define ADS1299_REG_CONFIG4 0x17
 
 /*
  * CONFIG1 data rate, the low three bits. The part divides its own internal
@@ -119,6 +123,33 @@
  * between the +/-2.5 V rails - so BIASREF_INT (bit 3) stays 0.
  */
 #define ADS1299_CONFIG3_PD_BIAS 0x04
+
+/*
+ * Lead-off detection.
+ *
+ * A small current is pushed into each selected electrode and the resulting
+ * voltage compared against a threshold. An electrode that has lifted reads
+ * far outside it, and the result appears in the status word of every frame -
+ * so the host learns an electrode has fallen off from the data stream
+ * itself, with no polling.
+ *
+ * DC detection (FLEAD_OFF = 00) at the lowest current, 6 nA: enough to spot
+ * a lifted electrode, small enough not to disturb the measurement.
+ */
+#define ADS1299_LOFF_DC_6NA 0x00
+#define ADS1299_CONFIG4_PD_LOFF_COMP 0x02
+
+/*
+ * Frame status word, 24 bits:
+ *   [23:20] 1100, fixed
+ *   [19:12] LOFF_STATP, one bit per positive input
+ *   [11:4]  LOFF_STATN, one bit per negative input
+ *   [3:0]   GPIO
+ * A set bit means that electrode is off.
+ */
+#define ADS1299_STATUS_LOFFP_SHIFT 12
+#define ADS1299_STATUS_LOFFN_SHIFT 4
+#define ADS1299_STATUS_LOFF_MASK   0xFFu
 
 /* MISC1 bit 5 ties every channel's negative input to SRB1. */
 #define ADS1299_MISC1_SRB1 0x20
@@ -213,6 +244,15 @@ int ads1299_set_input(uint8_t mux, uint8_t cal_freq);
  * electrode eight times over.
  */
 int ads1299_set_bias(bool enable, uint8_t sensp, uint8_t sensn);
+
+/*
+ * Enable or disable lead-off detection on the selected channels. Results
+ * arrive in the status word of every frame - see ADS1299_STATUS_LOFFP_SHIFT.
+ */
+int ads1299_set_leadoff(bool enable, uint8_t sensp, uint8_t sensn);
+
+/* Current CHnSET contents, for reporting configuration to a host. */
+int ads1299_get_channels(uint8_t *out, uint8_t count);
 
 /*
  * Configure one channel, or every channel when `ch` is 0xFF.

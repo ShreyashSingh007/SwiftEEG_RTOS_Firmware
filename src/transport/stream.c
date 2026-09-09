@@ -26,6 +26,12 @@ LOG_MODULE_REGISTER(stream, CONFIG_LOG_DEFAULT_LEVEL);
  */
 #define BATCH_SAMPLES 6
 
+/* Bytes per channel for each encoding. */
+static inline uint8_t enc_width(uint8_t enc)
+{
+	return (enc == STREAM_ENC_RAW_I24) ? 3u : 4u;
+}
+
 /*
  * DATA payload header, little-endian, ahead of the sample block:
  *
@@ -38,6 +44,7 @@ LOG_MODULE_REGISTER(stream, CONFIG_LOG_DEFAULT_LEVEL);
 #define DATA_HDR_LEN 16
 
 static uint8_t batch[DATA_HDR_LEN + BATCH_SAMPLES * ADS1299_CHANNELS * 4];
+static uint16_t batch_stride; /* bytes per sample, fixed when a batch opens */
 static uint16_t batch_count;
 static uint64_t batch_ts;
 static uint32_t batch_seq;
@@ -80,7 +87,7 @@ static void flush(void)
 	put_u16(&batch[14], batch_count);
 
 	const size_t payload_len =
-		DATA_HDR_LEN + (size_t)batch_count * ADS1299_CHANNELS * 4u;
+		DATA_HDR_LEN + (size_t)batch_count * batch_stride;
 
 	const int n = proto_encode(PROTO_TYPE_DATA, batch_flags, frame_seq++,
 				   batch, payload_len, frame_buf,
@@ -140,13 +147,15 @@ void stream_on_sample(const struct eeg_sample *s)
 	if (batch_count == 0) {
 		batch_ts = s->ts_us;
 		batch_seq = s->seq;
+		/* Fixed for the batch: the header declares one encoding. */
+		batch_stride = (uint16_t)(ADS1299_CHANNELS * enc_width(encoding));
 	}
 
-	uint8_t *p = &batch[DATA_HDR_LEN +
-			    (size_t)batch_count * ADS1299_CHANNELS * 4u];
+	uint8_t *p = &batch[DATA_HDR_LEN + (size_t)batch_count * batch_stride];
 
 	for (uint8_t ch = 0; ch < ADS1299_CHANNELS; ch++) {
-		if (encoding == STREAM_ENC_UV_F32) {
+		switch (encoding) {
+		case STREAM_ENC_UV_F32: {
 			/*
 			 * Copy the float's bytes rather than casting through
 			 * a pointer: the destination is unaligned inside the
@@ -157,10 +166,30 @@ void stream_on_sample(const struct eeg_sample *s)
 
 			memcpy(&bits, &v, sizeof(bits));
 			put_u32(p, bits);
-		} else {
-			put_u32(p, (uint32_t)s->ch_raw[ch]);
+			p += 4;
+			break;
 		}
-		p += 4;
+
+		case STREAM_ENC_RAW_I24: {
+			/*
+			 * The converter is 24-bit, so the low three bytes are
+			 * the whole sample; the fourth carried only sign
+			 * extension the host can rebuild.
+			 */
+			const uint32_t v = (uint32_t)s->ch_raw[ch];
+
+			p[0] = (uint8_t)(v & 0xFFu);
+			p[1] = (uint8_t)((v >> 8) & 0xFFu);
+			p[2] = (uint8_t)((v >> 16) & 0xFFu);
+			p += 3;
+			break;
+		}
+
+		default:
+			put_u32(p, (uint32_t)s->ch_raw[ch]);
+			p += 4;
+			break;
+		}
 	}
 
 	batch_flags |= s->flags;
@@ -173,8 +202,21 @@ void stream_on_sample(const struct eeg_sample *s)
 
 void stream_set_encoding(uint8_t enc)
 {
-	encoding = (enc == STREAM_ENC_UV_F32) ? STREAM_ENC_UV_F32
-					      : STREAM_ENC_RAW_I32;
+	if (enc > STREAM_ENC_RAW_I24) {
+		return;
+	}
+
+	/* Flush first: the header declares one encoding for the whole batch. */
+	if (enc != encoding) {
+		flush();
+	}
+
+	encoding = enc;
+}
+
+uint8_t stream_encoding(void)
+{
+	return encoding;
 }
 
 void stream_enable(bool on)

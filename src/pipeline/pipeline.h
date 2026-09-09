@@ -83,6 +83,9 @@ uint16_t pipeline_rate(void);
  */
 int pipeline_set_notch(uint8_t hz);
 
+/* The notch frequency in use, or 0 when it is disabled. */
+uint8_t pipeline_notch(void);
+
 /* Zero the counters and begin a fresh measurement window. */
 void pipeline_reset_stats(void);
 

@@ -21,6 +21,7 @@
 /* What the samples in a DATA frame look like. */
 #define STREAM_ENC_RAW_I32 0u /* ADC counts, before the DSP chain */
 #define STREAM_ENC_UV_F32  1u /* microvolts, after the DSP chain */
+#define STREAM_ENC_RAW_I24 2u /* ADC counts packed to three bytes */
 
 struct stream_stats {
 	uint32_t frames_sent;
@@ -30,8 +31,17 @@ struct stream_stats {
 	uint32_t ble_too_big;   /* frame exceeded the negotiated MTU */
 };
 
-/* Choose what gets sent. Takes effect on the next batch. */
+/*
+ * Choose what gets sent. Takes effect on the next batch.
+ *
+ * Packed 24-bit is the native width of the converter, so it loses nothing
+ * and costs a quarter less bandwidth than the 32-bit form - at 1 kSPS that
+ * is 24 kB/s rather than 32. Worth having on a radio link.
+ */
 void stream_set_encoding(uint8_t encoding);
+
+/* The encoding currently in use. */
+uint8_t stream_encoding(void);
 
 /* Start and stop transmitting. */
 void stream_enable(bool on);

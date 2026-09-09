@@ -54,7 +54,7 @@ static bool reply_via_ble;
 static void respond(uint8_t opcode, uint8_t status, const uint8_t *extra,
 		    size_t extra_len)
 {
-	uint8_t payload[16];
+	uint8_t payload[32];
 
 	payload[0] = opcode;
 	payload[1] = status;
@@ -215,6 +215,44 @@ static void handle(const proto_frame_t *f)
 					 ? CMD_OK : CMD_EBADARG;
 		}
 		break;
+
+	case CMD_SET_LEADOFF:
+		if (f->len < 2) {
+			status = CMD_EBADARG;
+		} else {
+			const uint8_t sensp = (f->len >= 3) ? f->payload[2] : 0xFFu;
+			const uint8_t sensn = (f->len >= 4) ? f->payload[3] : 0x00u;
+
+			status = (ads1299_set_leadoff(f->payload[1] != 0, sensp,
+						      sensn) == 0)
+					 ? CMD_OK : CMD_EFAILED;
+		}
+		break;
+
+	case CMD_GET_CONFIG: {
+		/*
+		 * Everything a host needs to draw its controls in the right
+		 * position, in one exchange. Reading it back from the AFE
+		 * rather than reporting what we believe we set means a
+		 * failed write shows up as a wrong control, not a lie.
+		 */
+		uint8_t chset[ADS1299_CHANNELS] = { 0 };
+
+		(void)ads1299_get_channels(chset, ADS1299_CHANNELS);
+
+		const uint16_t sps = pipeline_rate();
+		uint8_t cfg[13];
+
+		cfg[0] = ADS1299_CHANNELS;
+		cfg[1] = stream_encoding();
+		cfg[2] = (uint8_t)(sps & 0xFFu);
+		cfg[3] = (uint8_t)(sps >> 8);
+		cfg[4] = pipeline_notch();
+		memcpy(&cfg[5], chset, sizeof(chset));
+
+		respond(op, CMD_OK, cfg, sizeof(cfg));
+		return;
+	}
 
 	case CMD_READ_REG: {
 		if (f->len < 2) {

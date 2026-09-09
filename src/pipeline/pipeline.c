@@ -341,6 +341,11 @@ int pipeline_set_notch(uint8_t hz)
 	return err;
 }
 
+uint8_t pipeline_notch(void)
+{
+	return (uint8_t)notch_hz;
+}
+
 uint16_t pipeline_rate(void)
 {
 	return (uint16_t)sample_rate_hz;

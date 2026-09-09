@@ -26,6 +26,8 @@
                                 *   [4]=power down, [5]=srb2 */
 #define CMD_SET_BIAS     0x0Bu /* [1]=enable, [2]=sensp mask, [3]=sensn mask */
 #define CMD_SET_NOTCH    0x0Cu /* [1]=Hz (0 disables, 50 or 60) */
+#define CMD_SET_LEADOFF  0x0Du /* [1]=enable, [2]=sensp, [3]=sensn */
+#define CMD_GET_CONFIG   0x0Eu /* no args; RSP carries the whole state */
 
 /* Status byte in an RSP payload. */
 #define CMD_OK        0x00u

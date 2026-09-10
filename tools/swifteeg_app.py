@@ -184,15 +184,15 @@ class App(tk.Tk):
         rc.bind("<<ComboboxSelected>>", lambda e: self._set_rate())
 
         self._label(row, "  format").pack(side=tk.LEFT)
-        # "device filtered" is what makes the on-device DSP visible. The raw
-        # options send counts straight off the converter, before the device
-        # touches them - so with either of those selected, the on-device
-        # notch correctly appears to do nothing.
+        # "device filtered" is what makes the on-device DSP visible. "raw"
+        # sends counts straight off the converter, before the device touches
+        # them - so with it selected, the on-device notch correctly appears
+        # to do nothing. There is no 32-bit raw here: the converter is
+        # 24-bit, and a fourth byte would only repeat the sign.
         self.enc_var = tk.StringVar(value="raw 24-bit")
         ec = ttk.Combobox(row, textvariable=self.enc_var, width=14,
                           state="readonly",
-                          values=["raw 24-bit", "raw 32-bit",
-                                  "device filtered"])
+                          values=["raw 24-bit", "device filtered"])
         ec.pack(side=tk.LEFT, padx=6)
         ec.bind("<<ComboboxSelected>>", lambda e: self._set_encoding())
 
@@ -466,7 +466,6 @@ class App(tk.Tk):
     def _set_encoding(self) -> None:
         pick = self.enc_var.get()
         enc = {"raw 24-bit": link.ENC_RAW_I24,
-               "raw 32-bit": link.ENC_RAW_I32,
                "device filtered": link.ENC_UV_F32}.get(pick, link.ENC_RAW_I24)
         self._send(link.CMD_SET_ENCODING, enc)
         self.chain.reset()
@@ -603,10 +602,15 @@ class App(tk.Tk):
             self.rate = sps
             self.chain.set_rate(sps)
 
+        enc = p[3]
+        if enc == link.ENC_RAW_I32:
+            # The same samples as 24-bit plus a byte of sign extension. A
+            # board flashed before 24-bit became its default still starts here.
+            self._send(link.CMD_SET_ENCODING, link.ENC_RAW_I24)
+            enc = link.ENC_RAW_I24
         self.enc_var.set({link.ENC_RAW_I24: "raw 24-bit",
-                          link.ENC_RAW_I32: "raw 32-bit",
                           link.ENC_UV_F32: "device filtered"}.get(
-                              p[3], "raw 24-bit"))
+                              enc, "raw 24-bit"))
         self.dev_notch.set({0: "off", 50: "50 Hz", 60: "60 Hz"}.get(p[6], "off"))
 
         if len(p) >= 15:

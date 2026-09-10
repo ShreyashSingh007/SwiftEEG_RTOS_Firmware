@@ -53,7 +53,11 @@ static uint8_t batch_flags;
 static uint8_t frame_buf[PROTO_MAX_FRAME];
 static uint16_t frame_seq;
 
-static uint8_t encoding = STREAM_ENC_RAW_I32;
+/*
+ * Packed 24-bit by default. The converter is 24-bit, so a 32-bit sample adds
+ * only a byte of sign extension - a third more radio traffic for nothing.
+ */
+static uint8_t encoding = STREAM_ENC_RAW_I24;
 static bool enabled;
 
 static struct stream_stats stats;

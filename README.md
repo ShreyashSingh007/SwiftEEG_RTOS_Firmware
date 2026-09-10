@@ -4,29 +4,32 @@
 nRF Connect SDK. Designed as a raw BCI tool: full hardware control, on-chip
 DSP, precise timestamps, and a transport-agnostic binary API.
 
-> **Status: M1 and M2 complete. M3 measured and passing.**
+> **Status: M1-M4 done, M5 Windows app working. Next: IMU streaming, then
+> motion-artifact cleanup.**
 >
 > | Check | Result |
 > |---|---|
 > | Board port, flashing, RTT | pass, both board builds |
 > | ADS1299 / IMU over SPI | `ID 0x3e` / `chip id 0x70` |
 > | USB CDC ACM | COM4 |
-> | BLE advertising | pass, control not wired yet |
+> | BLE streaming + control | 250 / 500 / 1000 SPS, 0 sequence gaps |
+> | BLE soak, 30 min at 1 kSPS | 1,802,484 samples, 0 gaps, 0 disconnects |
 > | DRDY timestamp jitter | **1 us**, hardware latched |
-> | Sample rate | 250.35 SPS, 0 sequence gaps |
 > | Shorted-input noise | **130-149 nV RMS** (datasheet ~140) |
 > | Test-signal amplitude | **0.17-0.22 % error**, 0.05 % channel spread |
 > | Golden vectors vs reference | worst 3.4 nV over 512 frames x 8 ch |
 > | Unit tests on target | 42/42 |
 >
-> Streaming works over USB. BLE streaming and full device control are next.
+> Everything streams and is controllable over Bluetooth. The IMU answers on
+> SPI but is not yet read or streamed.
 
 ---
 
 ## 0. Where we are  (read this first)
 
-**M1 and M2 are done, and M3's measurable parts pass.** Samples come off the
-ADS1299 by DMA, run through the DSP chain, and stream to a PC over USB.
+**M1-M4 are done and M5 works.** Samples come off the ADS1299 by DMA, run
+through the DSP chain, and stream to a PC over Bluetooth or USB, where the
+Windows application plots and filters them.
 
 ### Verified on hardware
 
@@ -52,22 +55,25 @@ straight over a noisy front end.
 
 - DRDY drives everything in hardware: one PPI channel timestamps the sample
   and starts its SPI transfer, so the CPU wakes with 27 bytes already in RAM
-- Lock-free ring from the interrupt to a DSP thread; 0 drops at 250 SPS
+- Lock-free ring from the interrupt to a DSP thread; 0 drops up to 1 kSPS
 - Chain: 24-bit decode, integer DC removal, microvolt scaling, mains notch
-- Binary protocol out over USB CDC, 16 samples a frame
-- Commands in: stream start/stop, encoding, input mux, test signal,
-  register read
-- `tools/swifteeg_scope.py`, a live viewer with a test-signal toggle
+- Binary protocol, byte-identical over BLE and USB, 6 samples a frame,
+  packed 24-bit by default
+- Every device control over either link, answered while streaming: rate
+  250/500/1000 SPS, per-channel gain / input / enable / SRB2, bias drive,
+  lead-off, 50/60 Hz notch, test signal, register read, config readback
+- `tools/swifteeg_app.py`, the Windows application (section 6, M5)
 
 ### What does not work yet
 
-- **BLE carries no data.** It advertises and connects; the Control
-  characteristic still logs and discards. This is the current priority.
-- **The bias drive (DRL) is off.** `CONFIG3.PD_BIAS` is 0. Fine for a bench
-  test against the internal generator, not fine for electrodes on a head -
-  see the note in section 1.2.
-- Sample rate is fixed at 250 SPS; there is no command to change it.
-- Per-channel gain, mux and lead-off are all-or-nothing, not per channel.
+- **The IMU is not read or streamed.** It answers on SPI and nothing more.
+  This is next - see section 6.
+- **No motion-artifact cleanup.** It needs the IMU stream, and real
+  recordings of a moving subject to be built against.
+- **Not yet checked on a head:** blinks on the frontal channels, and alpha
+  with eyes closed at Oz/P3/P4.
+- The on-device filter chain is not yet matched to the host chain (M6).
+- No impedance measurement - lead-off detection only.
 - No SD card. Last item, may not happen.
 
 ### Scope, as it now stands
@@ -206,7 +212,11 @@ tools/build.ps1             builds app or any test suite
 tools/flash.ps1             mass-erase, write, verify, reset
 tools/rtt.py                read the log (RTT is the only log path)
 tools/verify.py             hardware acceptance checks, pass/fail
-tools/swifteeg_scope.py     live viewer with a test-signal toggle
+tools/swifteeg_app.py       the Windows application (M5)
+tools/swifteeg_link.py      USB and BLE links behind one interface
+tools/eeg_dsp.py            host filter chain
+tools/soak.py               long BLE run, counts sequence gaps
+tools/swifteeg_scope.py     early USB-only viewer, superseded by the app
 tools/proto_ref.py          protocol oracle, shared with the host tools
 tools/dsp_ref.py            DSP primitive oracle + golden vectors
 tools/pipeline_ref.py       whole-chain oracle + golden vectors
@@ -401,13 +411,12 @@ over the MTU is dropped by the stack without complaint.
 1 kSPS is the ceiling worth having over BLE. 16 kSPS is 432 kB/s and stays
 USB-only.
 
-Still to do here:
+Since done: bias drive (DRL), per-channel gain / input / enable / SRB2,
+lead-off detection, 50/60 Hz notch, packed 24-bit encoding, and the
+30-minute soak with the USB cable out (see M5).
 
-- **Bias drive (DRL).** Off today. Required before electrodes on a head mean
-  anything - see section 1.2.
-- Per-channel gain, mux, enable and lead-off, rather than all-or-nothing
-- SRB2 routing, notch frequency 50/60, packed int24 encoding
-- 30-minute soak with the USB cable out
+Left over from the original M2: **the IMU is not streamed.** It is scheduled
+below, ahead of M6.
 
 ### The device stays responsive while streaming
 
@@ -508,10 +517,36 @@ viewing choice: it makes a trace look clean and it distorts slow ERP
 components. The device still records at 0.08 Hz, so the recording keeps what
 the display throws away.
 
+### Next — IMU streaming, then motion-artifact cleanup
+
+The requirement: a signal that stays usable on a moving, walking subject.
+The original plan always had this - DSP stage 4, IMU-referenced artifact
+removal, and an R&D phase to find the method - but the revised milestones
+had no slot for it. This is the slot.
+
+1. **IMU streaming.** LSM6DSV16X accelerometer and gyroscope, each sample
+   timestamped on the same TIMER1 clock as the EEG, streamed alongside it
+   over BLE and USB. Same-clock timestamps are the point: a canceller fed a
+   motion reference at an unknown offset from the EEG cannot cancel.
+2. **In the app.** Motion shown live, and recorded with the raw EEG.
+3. **Recordings, headset on.** A still baseline, head turns and nods,
+   walking, chewing.
+4. **Cleanup built on the host** and judged on those recordings. Candidates:
+   IMU-referenced adaptive filtering, gait-locked template subtraction
+   (Gwin et al., 2010), and subspace methods such as ASR. Chosen by
+   measurement - motion-locked power removed, blinks and alpha intact.
+5. **Onto the device in M6**, as stage 4 of the chain.
+
+It will reduce motion artifact, not remove it. Dry electrodes shift on the
+skin in ways a head-mounted IMU only partly sees.
+
+**Open before step 1:** where the board sits when worn - on the head or on a
+cable - and confirmation that IMU INT2 is P0.24 with INT1 unconnected.
+
 ### M6 — push the validated chain into the firmware
 
-The settings found in M5 become the device's own, which is what the original
-plan always called for.
+The settings found in M5, and the motion cleanup, become the device's own,
+which is what the original plan always called for.
 
 The mechanism already exists in the design: the DSP chain's last stage is a
 **host-programmable biquad cascade**. The host uploads coefficients; firmware

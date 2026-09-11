@@ -4,32 +4,34 @@
 nRF Connect SDK. Designed as a raw BCI tool: full hardware control, on-chip
 DSP, precise timestamps, and a transport-agnostic binary API.
 
-> **Status: M1-M4 done, M5 Windows app working. Next: IMU streaming, then
-> motion-artifact cleanup.**
+> **Status: M1-M4 done, M5 Windows app working, motion sensor streaming on
+> the EEG's clock. Next: recordings of a moving subject, then motion-artifact
+> cleanup.**
 >
 > | Check | Result |
 > |---|---|
 > | Board port, flashing, RTT | pass, both board builds |
-> | ADS1299 / IMU over SPI | `ID 0x3e` / `chip id 0x70` |
+> | ADS1299 / IMU over SPI | `ID 0x3e` / `WHO_AM_I 0x70` |
 > | USB CDC ACM | COM4 |
 > | BLE streaming + control | 250 / 500 / 1000 SPS, 0 sequence gaps |
 > | BLE soak, 30 min at 1 kSPS | 1,802,484 samples, 0 gaps, 0 disconnects |
 > | DRDY timestamp jitter | **1 us**, hardware latched |
+> | IMU on the EEG clock | 240 / 480 / 960 Hz, 0 gaps, **sample times within 1 us** |
 > | Shorted-input noise | **130-149 nV RMS** (datasheet ~140) |
 > | Test-signal amplitude | **0.17-0.22 % error**, 0.05 % channel spread |
 > | Golden vectors vs reference | worst 3.4 nV over 512 frames x 8 ch |
 > | Unit tests on target | 42/42 |
 >
-> Everything streams and is controllable over Bluetooth. The IMU answers on
-> SPI but is not yet read or streamed.
+> Everything streams and is controllable over Bluetooth: eight EEG channels
+> and six motion axes, on one clock.
 
 ---
 
 ## 0. Where we are  (read this first)
 
 **M1-M4 are done and M5 works.** Samples come off the ADS1299 by DMA, run
-through the DSP chain, and stream to a PC over Bluetooth or USB, where the
-Windows application plots and filters them.
+through the DSP chain, and stream to a PC over Bluetooth or USB alongside the
+motion sensor's, where the Windows application plots and filters them.
 
 ### Verified on hardware
 
@@ -40,10 +42,13 @@ noise floor    CH1-8  130-149 nV RMS, inputs shorted, gain 24
 timing         250.35 SPS, 0.4 us inter-batch jitter, 0 sequence gaps
 protocol       0 CRC failures
 golden vectors worst 3.4 nV vs the Python reference, 512 frames x 8 ch
+motion         240 / 480 / 960 Hz over BLE with EEG streaming: 0 gaps, sample
+               times within 1.0 us of a straight line, gravity 0.984 g,
+               sensor clock -1.84 % measured (-1.82 % by its own estimate)
 ```
 
-`python tools/verify.py` re-runs all of it and compares each number against
-the datasheet or the protocol definition.
+`python tools/verify.py` re-runs the EEG checks and compares each number
+against the datasheet or the protocol definition.
 
 **The noise floor is the result that matters most.** TI quotes ~140 nV RMS
 input-referred at gain 24 and 250 SPS; the eight channels measure 130-149.
@@ -62,16 +67,16 @@ straight over a noisy front end.
 - Every device control over either link, answered while streaming: rate
   250/500/1000 SPS, per-channel gain / input / enable / SRB2, bias drive,
   lead-off, 50/60 Hz notch, test signal, register read, config readback
+- Motion: LSM6DSV16X accelerometer and gyroscope at 60-960 Hz, each batch
+  anchored on TIMER1 - the EEG's clock - by a PPI capture of INT2
 - `tools/swifteeg_app.py`, the Windows application (section 6, M5)
 
 ### What does not work yet
 
-- **The IMU is not read or streamed.** It answers on SPI and nothing more.
-  This is next - see section 6.
-- **No motion-artifact cleanup.** It needs the IMU stream, and real
-  recordings of a moving subject to be built against.
-- **Not yet checked on a head:** blinks on the frontal channels, and alpha
-  with eyes closed at Oz/P3/P4.
+- **No motion-artifact cleanup yet.** The motion stream is in place; the
+  method needs real recordings of a moving subject to be built against.
+- **Not yet checked on a head:** alpha with eyes closed at Oz/P3/P4. Blinks
+  have been seen on the frontal channels.
 - The on-device filter chain is not yet matched to the host chain (M6).
 - No impedance measurement - lead-off detection only.
 - No SD card. Last item, may not happen.
@@ -130,19 +135,16 @@ LEDs are **active high** — the MCU drives the anode.
 2. **`RESET` and `PWDN` are pull-ups to DVDD.** Neither can be driven; reset is
    by SPI opcode only, and the AFE cannot be power-cycled by the MCU.
 3. **`BIASIN`/`BIASOUT` are shorted and wired to J1.5/6** - the driven
-   right leg. **It is currently switched off in firmware**
-   (`CONFIG3.PD_BIAS` = 0), which is fine on a bench against the internal
-   generator and not fine on a head.
+   right leg. It is on: `CONFIG3.PD_BIAS` set, and `BIAS_SENSP` and
+   `BIAS_SENSN` both `0xFF`.
 
    The DRL amplifier drives the body to cancel common-mode, mostly mains.
-   Without it, 50 Hz appears on every channel as a large common signal that
-   the notch then has to remove, and any of it that the front end cannot
-   reject as common-mode is simply gone. `BIASREF` is grounded on this board,
-   which is correct - mid-supply is 0 V between the +/-2.5 V rails - so
-   `CONFIG3.BIASREF_INT` stays 0 and the reference comes from the pin.
+   `BIASREF` is grounded on this board, which is correct - mid-supply is 0 V
+   between the +/-2.5 V rails - so `CONFIG3.BIASREF_INT` stays 0.
 
-   Enabling it needs `PD_BIAS` set plus `BIAS_SENSP`/`BIAS_SENSN` choosing
-   which channels feed the amplifier. That is M4 work.
+   `BIAS_SENSN` has to include the negative inputs. SRB1 sits on them, and
+   with it outside the loop the amplifier oscillated: 124 mV of common-mode
+   and 28 % of samples clipped, against 2.4 mV and none with it inside.
 
 4. **`CLKSEL` is tied high** — the AFE runs its own internal oscillator, spec'd
    ±2 %. Its sample clock is therefore *asynchronous* to the MCU, so true
@@ -152,7 +154,8 @@ LEDs are **active high** — the MCU drives the anode.
    planned.
 6. **No user button.** SW1 is wired to nRESET only; all control is over BLE/USB.
 7. **SD is SPI-only** — 4-bit SDIO is not wired.
-8. **Only IMU INT2 is routed**; INT1 is not connected.
+8. **Only IMU INT2 is routed**; INT1 is not connected. Confirmed with the
+   hardware owner, 2026-09-11.
 
 ### 1.3 Montage (SRB1 referential)
 
@@ -179,6 +182,9 @@ what every channel is measured against.
 | 3 | F4 | frontal | 7 | C3 | motor imagery, left |
 | 4 | Oz | SSVEP | 8 | P3 | P300 |
 
+The board, and with it the IMU, is worn on the head, so the motion sensor
+measures head movement.
+
 ## 2. Repo layout
 
 Compiled into the application:
@@ -188,7 +194,8 @@ boards/shreyash/swifteeg/   out-of-tree board port (HWMv2)
 dts/bindings/               ti,ads1299 binding
 src/board/                  LEDs, VDD self-test
 src/afe/                    ADS1299 driver: probe, config, DMA streaming
-src/timebase/               1 MHz TIMER1, 64-bit extension, PPI capture task
+src/imu/                    LSM6DSV16X driver: FIFO, INT2 watermark on TIMER1
+src/timebase/               1 MHz TIMER1, 64-bit extension, PPI capture tasks
 src/pipeline/               capture (GPIOTE+PPI), chain (DSP), pipeline (thread)
 src/dsp/                    DC removal, biquads, filter design
 src/sys/                    lock-free SPSC ring
@@ -197,12 +204,10 @@ src/transport/              USB CDC, BLE, stream batching, command handling
 openocd/                    ST-Link runner config
 ```
 
-Still empty placeholders:
+Still an empty placeholder:
 
 ```
 src/storage/                M4-era: SD block layer. Last, may not happen.
-src/imu/                    no SwiftEEG driver - the IMU uses Zephyr's
-                            in-tree LSM6DSV16X, bound in devicetree
 ```
 
 Host tools:
@@ -256,6 +261,10 @@ repartitioning and re-flashing every unit over SWD.
 .\tools\build.ps1 -Target proto   # protocol test suite
 .\tools\build.ps1 -Pristine       # wipe the build dir first
 ```
+
+`build.ps1` puts the NCS toolchain first on `PATH` for the session it runs
+in, and that toolchain brings its own Python - one without `bleak`. Run the
+host tools from a fresh shell, not the one that just built.
 
 ### 4.1 Do not build via the nrfutil toolchain launcher
 
@@ -393,7 +402,7 @@ they are committed to firmware.
   Python reference, injected-signal check, noise floor, timing. Outstanding:
   alpha blocking on a real head, and the impedance sweep.
 
-### M4 — full wireless control  (current)
+### M4 — full wireless control  (done)
 
 **Streaming and rate control work over BLE.** Measured to a Windows host:
 
@@ -411,12 +420,10 @@ over the MTU is dropped by the stack without complaint.
 1 kSPS is the ceiling worth having over BLE. 16 kSPS is 432 kB/s and stays
 USB-only.
 
-Since done: bias drive (DRL), per-channel gain / input / enable / SRB2,
+Also done: bias drive (DRL), per-channel gain / input / enable / SRB2,
 lead-off detection, 50/60 Hz notch, packed 24-bit encoding, and the
-30-minute soak with the USB cable out (see M5).
-
-Left over from the original M2: **the IMU is not streamed.** It is scheduled
-below, ahead of M6.
+30-minute soak with the USB cable out (see M5). The IMU, left over from the
+original M2, now streams too - see the motion section below.
 
 ### The device stays responsive while streaming
 
@@ -443,7 +450,7 @@ make that true:
 A short connection interval is requested on connect (7.5-15 ms). It is
 advisory - the central decides - and iOS will refuse anything under 15 ms.
 
-### Three mistakes worth keeping
+### Mistakes worth keeping
 
 **Verbose logging is not free.** The USB stack logs every packet at INFO,
 and `LOG_MODE_IMMEDIATE` formats on the calling thread. Shrinking the batch
@@ -462,6 +469,18 @@ acquisition re-attached the SPI start task to a channel that already had it,
 which returns `-EBUSY` and failed every rate change. The attach is now
 idempotent.
 
+**The Bluetooth receive stack was too small, intermittently.** "BT RX WQ"
+runs every connection, subscription and command-write callback on a
+1024-byte default stack. Immediate-mode logging formats on it, and with FPU
+sharing an interrupt landing mid-callback stacks the FPU registers there
+too. It worked for weeks, then faulted with a stack overflow the moment a
+central connected. `CONFIG_BT_RX_STACK_SIZE` is now 4096.
+
+**More than one thread writes to USB.** The DSP thread's samples, the IMU
+thread's motion frames and the command thread's replies all go into one
+ring buffer that is only safe for a single writer. Writers now take a lock,
+and a frame goes in whole or not at all.
+
 ### M5 — Windows application  (built)
 
 ```bash
@@ -469,7 +488,8 @@ python tools/swifteeg_app.py
 ```
 
 Connects over Bluetooth or USB, exposes every device setting, runs the filter
-chain on the host, plots the result and records raw to CSV.
+chain on the host, plots EEG and motion, and records raw EEG and motion to
+CSV.
 
 Three files:
 
@@ -517,18 +537,45 @@ viewing choice: it makes a trace look clean and it distorts slow ERP
 components. The device still records at 0.08 Hz, so the recording keeps what
 the display throws away.
 
-### Next — IMU streaming, then motion-artifact cleanup
+#### Three things that made a low drift cut look unusable
+
+- **The chain restarted itself every few seconds.** Re-aiming the notch at
+  the measured mains frequency rebuilt and reset every stage, and each reset
+  put every electrode's DC offset back through the high-pass. In simulation:
+  13.8 mV RMS of error at a 0.1 Hz corner, 4.6 mV at 1 Hz. The notch now
+  retunes in place, keeping its state.
+- **Filters started from zero.** The first sample was a step the size of the
+  electrode offset, which a 0.1 Hz high-pass takes most of a minute to
+  forget. Every stage now primes on its first sample.
+- **A bad electrode was part of everyone's reference.** One floating
+  electrode put 32 uV RMS on every other channel through the common average,
+  in simulation. Each channel now has an "in average" tick, and a channel
+  pinned near the converter limit for 2 s leaves the average on its own -
+  still drawn in colour, labelled "near limit" or "CLIPPING".
+
+Recordings also had wrong timestamps: every row of a delivery was stamped
+from its first batch, a microsecond apart, tens of milliseconds out. Each
+row now takes its own batch's hardware timestamp plus its place in it.
+
+#### The plot is paced by the monitor
+
+It redraws once per screen refresh - measured 142-144 fps on a 144 Hz
+monitor - by blocking in `DwmFlush` with the Windows timer at 1 ms. Canvas
+items are made once and moved, samples are reduced to about a point per
+pixel with min/max bins pinned to sample numbers, and the display trails the
+newest sample by 50-300 ms so Bluetooth's bursts become steady scrolling.
+The stats panel shows the frame rate it is actually getting.
+
+### Motion: IMU streaming, then motion-artifact cleanup  (current)
 
 The requirement: a signal that stays usable on a moving, walking subject.
 The original plan always had this - DSP stage 4, IMU-referenced artifact
-removal, and an R&D phase to find the method - but the revised milestones
-had no slot for it. This is the slot.
+removal, and an R&D phase to find the method.
 
-1. **IMU streaming.** LSM6DSV16X accelerometer and gyroscope, each sample
-   timestamped on the same TIMER1 clock as the EEG, streamed alongside it
-   over BLE and USB. Same-clock timestamps are the point: a canceller fed a
-   motion reference at an unknown offset from the EEG cannot cancel.
-2. **In the app.** Motion shown live, and recorded with the raw EEG.
+1. **IMU streaming. DONE**, tested on the board over BLE (below).
+2. **In the app. DONE.** Motion lanes under the EEG, placed by device time;
+   rate and range controls; motion recorded to `<name>_motion.csv` beside
+   the EEG file, on the same clock.
 3. **Recordings, headset on.** A still baseline, head turns and nods,
    walking, chewing.
 4. **Cleanup built on the host** and judged on those recordings. Candidates:
@@ -540,8 +587,57 @@ had no slot for it. This is the slot.
 It will reduce motion artifact, not remove it. Dry electrodes shift on the
 skin in ways a head-mounted IMU only partly sees.
 
-**Open before step 1:** where the board sits when worn - on the head or on a
-cable - and confirmation that IMU INT2 is P0.24 with INT1 unconnected.
+#### How a motion sample gets its time
+
+A canceller fed a motion reference at an unknown offset from the EEG cannot
+cancel, so motion is timed on TIMER1, the clock DRDY is latched on:
+
+- the sensor batches samples in its FIFO and raises INT2 at a watermark;
+- PPI latches that edge into TIMER1 capture channel 3, in hardware;
+- the watermark falls on a known sample of the batch, so each sample is
+  placed relative to it at the sensor's sample period;
+- that period is measured edge to edge against the crystal. The sensor's own
+  clock is not trusted: on this board it runs 1.84 % slow, which at a
+  nominal 240 Hz would put the stream 74 ms adrift every 4 seconds.
+
+Measured with EEG streaming at 250 SPS:
+
+```
+240 Hz  +/-8 g    0 gaps, times within 0.9 us of a straight line
+480 Hz  +/-4 g    0 gaps, within 1.0 us
+960 Hz  +/-16 g   0 gaps, within 1.0 us
+EEG               0 gaps at every IMU rate; board still: 0.984 g
+```
+
+The first build read the FIFO one word per SPI transfer. At 480 Hz that was
+slow enough for new words to push the FIFO back over the watermark while it
+was being emptied, and that edge was then taken for the next batch's own:
+samples up to 25 ms out. The FIFO is now read in one transfer, an edge that
+lands during a read is discarded, and a batch without an edge of its own is
+placed from the last good one at the measured period.
+
+#### On the wire
+
+A new frame type, `0x05`, device to host. Little-endian payload:
+
+```
+u64 ts_us         TIMER1 time of the first sample
+u32 seq           sensor sample index of the first sample
+u32 period_us_q8  sample period, 1/256 us
+u16 accel_g       full scale; one count = accel_g / 32768 g
+u16 gyro_dps      full scale; one count = gyro_dps / 32768 deg/s
+u8  axes          6: accel x y z, then gyro x y z, int16 each
+u8  flags         0x01 timed from the poll (no edge yet), 0x02 FIFO overrun
+u16 count         samples that follow, at most 17 - one BLE notification
+```
+
+`CMD_SET_IMU` (`0x0F`): enable, rate in Hz (60-960), accel range in g (2-16),
+gyro range in deg/s (125-4000). `CMD_GET_CONFIG` appends the sensor's state
+after the channel settings: flags (bit 0 on, bit 1 fitted), rate and ranges.
+Motion frames flow while the stream is enabled, like the EEG's.
+
+Zephyr's own LSM6DSV16X driver is switched off in `prj.conf`; `src/imu` owns
+the chip.
 
 ### M6 — push the validated chain into the firmware
 

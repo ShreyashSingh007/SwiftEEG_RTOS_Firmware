@@ -67,6 +67,18 @@ MAX_WINDOW_SECONDS = 10.0
 LATENCY_MIN_S = 0.05
 LATENCY_MAX_S = 0.30
 
+# Converter limits. Output codes stop at +/-2^23, so a clipped sample sits
+# right on them.
+CLIP_COUNTS = (1 << 23) - 64
+# Within 5 % of the limit - about 9 mV of room at gain 24. Still real data,
+# but not much electrode drift away from clipping.
+NEAR_COUNTS = int((1 << 23) * 0.95)
+# How long a warning stays up after the sample that raised it, so it can be
+# read instead of flickering with each Bluetooth burst.
+LIMIT_HOLD_S = 1.0
+# How long a channel sits near its limit before it leaves the average.
+AUTO_OUT_S = 2.0
+
 
 class FramePacer:
     """
@@ -150,12 +162,18 @@ class App(tk.Tk):
 
         self._reset_traces()
         self.enabled = [tk.BooleanVar(value=True) for _ in range(link.CHANNELS)]
+        # Whether each channel helps make the common average - see
+        # Chain.car_mask for why a bad electrode must not.
+        self.in_avg = [tk.BooleanVar(value=True) for _ in range(link.CHANNELS)]
 
-        # Raw counts sit at +/-2^23 when an input saturates. Tracked per
-        # channel because a railed channel is not a small problem: at gain 24
-        # the input range is only +/-187.5 mV, and an electrode offset larger
-        # than that pins the converter with no signal left to filter.
-        self.saturated = [False] * link.CHANNELS
+        # Input limits, per channel. At gain 24 the input range is only
+        # +/-187.5 mV, and an electrode offset near that leaves no room.
+        # Kept as times rather than flags, so a warning holds long enough to
+        # be read.
+        self.clip_t = np.full(link.CHANNELS, -np.inf)
+        self.near_t = np.full(link.CHANNELS, -np.inf)
+        self.near_since = np.full(link.CHANNELS, np.nan)
+        self.auto_out = [False] * link.CHANNELS
         self.dc_mv = [0.0] * link.CHANNELS
 
         # Recent unfiltered samples, kept only so the mains frequency can be
@@ -384,6 +402,9 @@ class App(tk.Tk):
 
         # -- channels --
         f = self._section(inner, "channels")
+        # Two ticks per channel: whether it is drawn, and whether it helps
+        # make the common average. A bad electrode can stay on screen while
+        # being kept out of every other channel's reference.
         for i in range(link.CHANNELS):
             row = tk.Frame(f, bg=PANEL)
             row.pack(fill=tk.X)
@@ -393,6 +414,11 @@ class App(tk.Tk):
                                 text=f"CH{i + 1}  {SITES[i]}",
                                 font=("Consolas", 9), anchor="w", width=14)
             cb.pack(side=tk.LEFT)
+            tk.Checkbutton(row, variable=self.in_avg[i], bg=PANEL, fg=DIM,
+                           selectcolor="#2a2f3a", activebackground=PANEL,
+                           activeforeground=FG, highlightthickness=0,
+                           text="in average", font=("Segoe UI", 8),
+                           command=self._set_car_mask).pack(side=tk.LEFT)
             self.__dict__[f"loff{i}"] = self._label(
                 row, "", fg=DIM, font=("Consolas", 8))
             self.__dict__[f"loff{i}"].pack(side=tk.LEFT)
@@ -635,6 +661,10 @@ class App(tk.Tk):
         self.chain.notch_track = self.track_var.get()
         self.chain.rebuild()
 
+    def _set_car_mask(self) -> None:
+        self.chain.car_mask = np.array([v.get() for v in self.in_avg],
+                                       dtype=bool)
+
     # ---------------------------------------------------------- recording --
 
     def _toggle_record(self) -> None:
@@ -652,8 +682,10 @@ class App(tk.Tk):
 
         # Raw counts, not microvolts: the scale depends on the gain, and a
         # recording that has already been filtered cannot be un-filtered.
+        what = ("device filtered uV" if self.enc_var.get() == "device filtered"
+                else "raw counts")
         self.recorder.writerow(
-            ["# SwiftEEG raw counts", f"rate={self.rate}", f"gain={self.gain}",
+            [f"# SwiftEEG {what}", f"rate={self.rate}", f"gain={self.gain}",
              f"lsb_uv={link.lsb_uv(self.gain):.9f}"])
         self.recorder.writerow(
             ["ts_us", "seq"] + [f"ch{i + 1}_{SITES[i]}"
@@ -824,38 +856,76 @@ class App(tk.Tk):
         self.samples += len(counts)
 
         if self.recorder is not None:
-            ts0, seq0, _ = blocks[0]
-            for i, row in enumerate(counts):
-                self.recorder.writerow([ts0 + i, seq0 + i, *row.tolist()])
+            # Each batch carries the hardware timestamp of its own first
+            # sample, and the rest follow at the sample period. Stamping every
+            # row from the first batch of a delivery, a microsecond apart,
+            # put samples tens of milliseconds from where they belong -
+            # enough to smear an ERP.
+            period_us = 1e6 / self.rate
+            for ts0, seq0, vals in blocks:
+                for i, row in enumerate(vals):
+                    self.recorder.writerow(
+                        [round(ts0 + i * period_us), seq0 + i, *row.tolist()])
             self.rec_rows += len(counts)
 
-        # Saturation is judged on raw counts, before any filter. A railed
-        # channel is flat at full scale, and after a high-pass it looks like
-        # a quiet channel rather than a broken one.
         # Only meaningful on raw counts; the filtered form has had its DC
-        # removed on the device and can no longer show saturation.
-        full_scale = (1 << 23) * 0.98
-        peak = np.max(np.abs(counts), axis=0)
+        # removed on the device and can no longer show the input limit.
+        if not already_uv:
+            self._check_limits(counts)
         for ch in range(link.CHANNELS):
-            self.saturated[ch] = (not already_uv) and bool(peak[ch] >= full_scale)
             self.dc_mv[ch] = float(np.mean(counts[:, ch])) * scale / 1000.0
 
         uv = counts.astype(np.float64) * scale
 
         # Re-aim the notch from what the mains is actually doing, using
         # unfiltered samples - the notch has already removed the evidence
-        # from anything downstream of it.
+        # from anything downstream of it. The chain keeps its state through
+        # a re-aim; restarting it here was putting each electrode's whole
+        # offset back through the high-pass every few seconds.
         if not already_uv:
             self.mains_buf.extend(uv.mean(axis=1))
             now = time.time()
             if now >= self.mains_next and len(self.mains_buf) >= self.rate * 4:
                 self.mains_next = now + 5.0
-                block = np.array(self.mains_buf)
-                if self.chain.update_mains(block):
-                    self.chain.reset()
+                self.chain.update_mains(np.array(self.mains_buf))
 
         out = self.chain.process(uv)
         self._ring_write(out.T)
+
+    def _check_limits(self, counts: np.ndarray) -> None:
+        """
+        Note which inputs are clipping, or close to it.
+
+        Nothing here hides a channel. Near the limit the data is still real -
+        blinks show through an electrode offset of 180 mV - so it is drawn as
+        normal and labelled. Only clipped samples are lost, and the label
+        says so.
+        """
+        now = time.perf_counter()
+        peak = np.max(np.abs(counts), axis=0)
+        near = peak >= NEAR_COUNTS
+
+        self.clip_t[peak >= CLIP_COUNTS] = now
+        self.near_t[near] = now
+        self.near_since[near & np.isnan(self.near_since)] = now
+        self.near_since[~near] = np.nan
+
+        for ch in range(link.CHANNELS):
+            if (self.auto_out[ch] or not self.in_avg[ch].get()
+                    or np.isnan(self.near_since[ch])
+                    or now - self.near_since[ch] < AUTO_OUT_S):
+                continue
+
+            # Pinned near its limit: an electrode that is off or barely
+            # touching. Its drift and mains would reach every other channel
+            # through the average, so it leaves the average - once. Ticked
+            # back in by hand, it stays in.
+            self.auto_out[ch] = True
+            self.in_avg[ch].set(False)
+            self._set_car_mask()
+            self.status.config(
+                text=f"CH{ch + 1} {SITES[ch]} left out of the common average"
+                     f" - input near its limit", fg="#ffd866")
 
     # -------------------------------------------------------------- draw --
 
@@ -885,22 +955,22 @@ class App(tk.Tk):
             self._lay = self._layout(key)
         lay = self._lay
 
-        self._draw_traces(lay, window)
+        self._draw_traces(lay, window, now)
 
         settled = (time.time() - self.started_at) > self.chain.settling_seconds
         self._cfg(lay["settle"], text=(
             f"filters settling ({self.chain.settling_seconds:.0f} s)"
             if not settled and self.samples else ""))
 
-        n_rail = sum(1 for ch in shown if self.saturated[ch])
-        if n_rail:
+        clipping = sum(1 for ch in shown
+                       if now - self.clip_t[ch] < LIMIT_HOLD_S)
+        if clipping:
             # Full-scale differential input is VREF/gain, so 187.5 mV at
             # gain 24. An electrode that is not touching skin floats well
-            # past that, which is the usual reason a channel rails.
+            # past that, which is the usual reason a channel clips.
             fs_mv = 4500.0 / max(1, self.gain)
-            text = (f"{n_rail} channel(s) at full scale "
-                    f"(+/-{fs_mv:.0f} mV) - electrode not connected, "
-                    f"or contact lost")
+            text = (f"{clipping} channel(s) clipping at +/-{fs_mv:.0f} mV - "
+                    f"those samples are lost; check the electrode")
         else:
             text = ""
         self._cfg(lay["rail"], text=text)
@@ -926,7 +996,7 @@ class App(tk.Tk):
             x = left + plot_w * (sec / window)
             c.create_line(x, 0, x, h, fill="#171a21")
 
-        bases, subs, traces = [], [], []
+        bases, subs, warns, traces = [], [], [], []
         for row, ch in enumerate(shown):
             base = lane * (row + 0.5)
             bases.append(base)
@@ -937,6 +1007,9 @@ class App(tk.Tk):
             subs.append(c.create_text(left - 10, base + 8, anchor="e",
                                       fill=DIM, text="",
                                       font=("Consolas", 8)))
+            warns.append(c.create_text(left - 10, base + 21, anchor="e",
+                                       fill=DIM, text="",
+                                       font=("Consolas", 8, "bold")))
             traces.append(c.create_line(0, 0, 0, 0, fill=COLORS[ch],
                                         width=1))
 
@@ -946,7 +1019,7 @@ class App(tk.Tk):
         return {
             "key": key, "left": left, "plot_w": plot_w, "lane": lane,
             "rows": list(shown), "bases": np.array(bases), "subs": subs,
-            "traces": traces,
+            "warns": warns, "traces": traces,
             "settle": c.create_text(w // 2, 16, fill="#ffd866",
                                     font=("Segoe UI", 10), text=""),
             "rail": c.create_text(w // 2, h - 26, fill="#ff6b6b",
@@ -979,7 +1052,7 @@ class App(tk.Tk):
             self.disp += err * min(1.0, dt * 3.0)
         self.disp = max(0.0, min(self.disp, float(self.n_total)))
 
-    def _draw_traces(self, lay: dict, window: float) -> None:
+    def _draw_traces(self, lay: dict, window: float, now: float) -> None:
         """
         Put the visible stretch of the stream on the canvas.
 
@@ -1038,15 +1111,20 @@ class App(tk.Tk):
             for r, item in enumerate(lay["traces"]):
                 call(name, "coords", item, pts[r].tolist())
 
+        # Every channel keeps its colour whatever its state - a trace near
+        # the limit is still data, and blinks show through it. The warning
+        # goes underneath the label instead.
         for r, ch in enumerate(rows):
-            if self.saturated[ch]:
-                self._cfg(lay["subs"][r], text="RAILED", fill="#ff6b6b",
-                          font=("Consolas", 8, "bold"))
-                self._cfg(lay["traces"][r], fill="#4a3038")
+            self._cfg(lay["subs"][r], text=f"+/-{spans[r]:,.0f}uV")
+            if now - self.clip_t[ch] < LIMIT_HOLD_S:
+                warn, colour = "CLIPPING", "#ff6b6b"
+            elif now - self.near_t[ch] < LIMIT_HOLD_S:
+                warn, colour = "near limit", "#ffd866"
+            elif not self.chain.car_mask[ch]:
+                warn, colour = "not in average", DIM
             else:
-                self._cfg(lay["subs"][r], text=f"+/-{spans[r]:,.0f}uV",
-                          fill=DIM, font=("Consolas", 8))
-                self._cfg(lay["traces"][r], fill=COLORS[ch])
+                warn, colour = "", DIM
+            self._cfg(lay["warns"][r], text=warn, fill=colour)
 
     def _spans(self, rows: list[int], vals) -> np.ndarray:
         """

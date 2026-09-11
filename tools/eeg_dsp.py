@@ -159,17 +159,56 @@ class Biquads:
     """A cascade with per-channel state, filtering sample by sample."""
 
     def __init__(self, sections, channels: int):
+        self.sections: list[tuple] = []
+        self.channels = 0
         self.set(sections, channels)
 
-    def set(self, sections, channels: int) -> None:
-        self.sections = [tuple(float(v) for v in s) for s in sections]
+    def set(self, sections, channels: int, keep_state: bool = False) -> bool:
+        """
+        Load coefficients. Returns True if the filter was restarted.
+
+        Unchanged coefficients leave the filter exactly as it was. Changed
+        ones restart it from rest - unless keep_state is set, for a small
+        retune such as a notch following the mains a tenth of a hertz: the
+        old state is nearly right for the new filter, and a restart would put
+        a transient into the signal every time.
+        """
+        new = [tuple(float(v) for v in s) for s in sections]
+        same_shape = (channels == self.channels
+                      and len(new) == len(self.sections))
+
+        if same_shape and new == self.sections:
+            return False
+
+        self.sections = new
+        if keep_state and same_shape:
+            return False
+
         self.channels = channels
         self.reset()
+        return True
 
     def reset(self) -> None:
         n = max(1, len(self.sections))
         self.s1 = np.zeros((self.channels, n), dtype=np.float64)
         self.s2 = np.zeros((self.channels, n), dtype=np.float64)
+
+    def prime(self, x0: np.ndarray) -> np.ndarray:
+        """
+        Set every section's state as if x0 had always been its input.
+
+        A filter started from rest sees the first sample as a step up from
+        zero, and a 100 mV electrode offset through a 0.1 Hz high-pass is a
+        transient lasting most of a minute. Primed, it starts settled.
+        Returns the cascade's output for that steady input.
+        """
+        x = np.array(x0, dtype=np.float64, copy=True)
+        for si, (b0, b1, b2, a1, a2) in enumerate(self.sections):
+            y = x * ((b0 + b1 + b2) / (1.0 - a1 - a2))  # DC gain
+            self.s2[:, si] = b2 * x + a2 * y
+            self.s1[:, si] = b1 * x + a1 * y + self.s2[:, si]
+            x = y
+        return x
 
     def apply(self, block: np.ndarray) -> np.ndarray:
         """block is (samples, channels). Returns the same shape."""
@@ -210,6 +249,14 @@ class Chain:
         self.car = True
         self.order = 4
 
+        # Channels that make the common average. An electrode that is off or
+        # barely touching carries drift and mains many times the size of the
+        # EEG, and averaged in, a share of it lands on every other channel:
+        # simulating one floating electrode, 34 uV RMS reached each of the
+        # others at a 0.1 Hz high-pass. Left out, a channel is still
+        # re-referenced and still shown.
+        self.car_mask = np.ones(channels, dtype=bool)
+
         # When set, the notch is aimed at the measured mains frequency
         # rather than the nominal one.
         self.notch_track = True
@@ -218,12 +265,19 @@ class Chain:
         self._hp = Biquads([], channels)
         self._notch = Biquads([], channels)
         self._lp = Biquads([], channels)
+        self._primed = False
         self.rebuild()
 
     # -- configuration ----------------------------------------------------
 
     def rebuild(self) -> None:
-        """Redesign every stage for the current settings and sample rate."""
+        """
+        Redesign every stage for the current settings and sample rate.
+
+        A stage whose coefficients come out unchanged keeps its state, so
+        changing one setting does not restart the others. Any stage that
+        does restart is primed again on the next sample.
+        """
         nyq = self.fs / 2.0
 
         hp = []
@@ -231,36 +285,47 @@ class Chain:
             for q in butterworth_qs(self.order):
                 hp.append(design_highpass(self.fs, self.highpass_hz, q))
 
-        notch = []
-        if self.notch_hz and self.notch_hz > 0:
-            # Aim at the measured frequency when there is one. Mains is not
-            # where the nameplate says: measured 49.6 Hz against a nominal
-            # 50, which a narrow notch misses entirely.
-            f0 = self.notch_hz
-            if self.notch_track and self.measured_mains:
-                if abs(self.measured_mains - self.notch_hz) < 3.0:
-                    f0 = self.measured_mains
-
-            notch.append(design_notch(self.fs, f0, self.notch_q))
-
-            # The harmonic tracks the fundamental, so it moves with it.
-            second = f0 * 2.0
-            if self.notch_harmonic and second < nyq * 0.95:
-                notch.append(design_notch(self.fs, second, self.notch_q))
-
         lp = []
         if self.lowpass_hz and 0 < self.lowpass_hz < nyq * 0.95:
             for q in butterworth_qs(self.order):
                 lp.append(design_lowpass(self.fs, self.lowpass_hz, q))
 
-        self._hp.set(hp, self.channels)
-        self._notch.set(notch, self.channels)
-        self._lp.set(lp, self.channels)
+        restarted = self._hp.set(hp, self.channels)
+        restarted |= self._notch.set(self._notch_sections(), self.channels)
+        restarted |= self._lp.set(lp, self.channels)
+        if restarted:
+            self._primed = False
+
+    def _notch_sections(self) -> list:
+        if not (self.notch_hz and self.notch_hz > 0):
+            return []
+
+        # Aim at the measured frequency when there is one. Mains is not
+        # where the nameplate says: measured 49.6 Hz against a nominal
+        # 50, which a narrow notch misses entirely.
+        f0 = self.notch_hz
+        if self.notch_track and self.measured_mains:
+            if abs(self.measured_mains - self.notch_hz) < 3.0:
+                f0 = self.measured_mains
+
+        sections = [design_notch(self.fs, f0, self.notch_q)]
+
+        # The harmonic tracks the fundamental, so it moves with it.
+        second = f0 * 2.0
+        if self.notch_harmonic and second < self.fs / 2.0 * 0.95:
+            sections.append(design_notch(self.fs, second, self.notch_q))
+
+        return sections
 
     def update_mains(self, block) -> bool:
         """
-        Re-aim the notch from a recent block of data. Returns True if the
-        filters were redesigned.
+        Re-aim the notch from a recent block of data. Returns True if it moved.
+
+        Only the notch changes, and it keeps its state. This used to rebuild
+        and restart the whole chain - several times a minute as the grid
+        wandered - and every restart put each electrode's whole DC offset
+        back through the high-pass, fading over seconds at a 1 Hz corner and
+        over most of a minute at 0.1 Hz.
         """
         if not (self.notch_track and self.notch_hz):
             return False
@@ -269,13 +334,13 @@ class Chain:
         if found is None:
             return False
 
-        # Only redesign when it has actually moved, so the filter state is
-        # not being reset constantly.
+        # Only redesign when it has actually moved.
         if self.measured_mains and abs(found - self.measured_mains) < 0.05:
             return False
 
         self.measured_mains = found
-        self.rebuild()
+        self._notch.set(self._notch_sections(), self.channels,
+                        keep_state=True)
         return True
 
     def set_rate(self, fs: float) -> None:
@@ -283,11 +348,14 @@ class Chain:
             return
         self.fs = float(fs)
         self.rebuild()
+        self.reset()
 
     def reset(self) -> None:
+        """Start again from the next sample, primed on it."""
         self._hp.reset()
         self._notch.reset()
         self._lp.reset()
+        self._primed = False
 
     @property
     def settling_seconds(self) -> float:
@@ -308,6 +376,9 @@ class Chain:
         """
         block is (samples, channels) in microvolts. Returns the same shape.
         """
+        if not self._primed and len(block):
+            self._prime(np.asarray(block[0], dtype=np.float64))
+
         out = self._hp.apply(block)
         out = self._notch.apply(out)
 
@@ -316,10 +387,27 @@ class Chain:
             # sample by sample. This is what pulls every trace onto a shared
             # zero, and it removes whatever is common to all of them -
             # usually mains and body potential, which no per-channel filter
-            # can reach.
-            out = out - out.mean(axis=1, keepdims=True)
+            # can reach. Only channels in car_mask make the average; every
+            # channel has it subtracted.
+            m = self.car_mask
+            if np.count_nonzero(m) >= 2:
+                out = out - out[:, m].mean(axis=1, keepdims=True)
 
         return self._lp.apply(out)
+
+    def _prime(self, x0: np.ndarray) -> None:
+        """
+        Start every stage settled on the first sample instead of from zero.
+
+        From zero, the first sample is a step the size of each electrode's
+        whole DC offset, and a 0.1 Hz high-pass takes most of a minute to
+        recover from it.
+        """
+        y = self._notch.prime(self._hp.prime(x0))
+        if self.car and np.count_nonzero(self.car_mask) >= 2:
+            y = y - y[self.car_mask].mean()
+        self._lp.prime(y)
+        self._primed = True
 
 
 # --- self-test ------------------------------------------------------------
@@ -383,6 +471,46 @@ def _self_test() -> None:
 
     assert np.abs(o2[:, 0]).max() < 3.0, "CAR left a common signal behind"
     assert np.abs(o2[:, 3]).max() > 6.0, "CAR removed a real per-channel signal"
+
+    # A channel left out of the average stays out of everyone's reference,
+    # and is still re-referenced and kept itself.
+    bad = common.copy()
+    bad[:, 5] += 5000.0 * np.sin(2 * np.pi * 7.0 * t)
+    c3 = Chain(fs, 8)
+    c3.car_mask[5] = False
+    o3 = c3.process(bad)[int(fs * 8):]
+    assert np.abs(o3[:, 0]).max() < 3.0, "a masked channel leaked into the average"
+    assert np.abs(o3[:, 5]).max() > 1000.0, "the masked channel itself was lost"
+
+    # Primed on its first sample, a 0.1 Hz high-pass starts settled instead
+    # of spending most of a minute recovering from each electrode's offset.
+    t2 = np.arange(int(fs * 30)) / fs
+    sig2 = np.zeros((len(t2), 8))
+    for ch in range(8):
+        sig2[:, ch] = (10.0 * np.sin(2 * np.pi * 10.0 * t2)
+                       + 20.0 * np.sin(2 * np.pi * 49.9 * t2)
+                       + (ch - 4) * 15000.0)
+
+    slow = Chain(fs, 8)
+    slow.highpass_hz = 0.1
+    slow.rebuild()
+    start = np.abs(slow.process(sig2[:int(fs * 2)])).max()
+    assert start < 50.0, f"start-up transient of {start:.0f} uV"
+
+    # Re-aiming the notch mid-stream must leave the rest of the chain alone.
+    steady = Chain(fs, 8)
+    steady.highpass_hz = 0.1
+    steady.rebuild()
+    moved = Chain(fs, 8)
+    moved.highpass_hz = 0.1
+    moved.rebuild()
+    half = len(t2) // 2
+    ref = steady.process(sig2)
+    first = moved.process(sig2[:half])
+    assert moved.update_mains(sig2[:half]), "the notch did not re-aim"
+    second = moved.process(sig2[half:])
+    jump = np.abs(np.vstack((first, second))[half:] - ref[half:]).max()
+    assert jump < 5.0, f"re-aiming the notch disturbed the output by {jump:.0f} uV"
 
     print("eeg_dsp self-test: OK")
     print(f"  settling at {DEFAULT_HIGHPASS_HZ} Hz high-pass: "

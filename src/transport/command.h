@@ -28,6 +28,8 @@
 #define CMD_SET_NOTCH    0x0Cu /* [1]=Hz (0 disables, 50 or 60) */
 #define CMD_SET_LEADOFF  0x0Du /* [1]=enable, [2]=sensp, [3]=sensn */
 #define CMD_GET_CONFIG   0x0Eu /* no args; RSP carries the whole state */
+#define CMD_SET_IMU      0x0Fu /* [1]=enable, [2..3]=rate Hz, [4]=accel g,
+                                *   [5..6]=gyro dps */
 
 /* Status byte in an RSP payload. */
 #define CMD_OK        0x00u

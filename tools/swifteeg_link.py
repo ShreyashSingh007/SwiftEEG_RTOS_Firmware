@@ -27,7 +27,7 @@ import proto_ref  # noqa: E402
 
 # --- protocol -------------------------------------------------------------
 
-TYPE_CMD, TYPE_RSP, TYPE_EVT, TYPE_DATA = 0x01, 0x02, 0x03, 0x04
+TYPE_CMD, TYPE_RSP, TYPE_EVT, TYPE_DATA, TYPE_IMU = 0x01, 0x02, 0x03, 0x04, 0x05
 
 CMD_PING = 0x01
 CMD_STREAM_START = 0x02
@@ -43,6 +43,7 @@ CMD_SET_BIAS = 0x0B
 CMD_SET_NOTCH = 0x0C
 CMD_SET_LEADOFF = 0x0D
 CMD_GET_CONFIG = 0x0E
+CMD_SET_IMU = 0x0F
 
 ENC_RAW_I32, ENC_UV_F32, ENC_RAW_I24 = 0, 1, 2
 
@@ -53,6 +54,36 @@ GAIN_FROM_CODE = {v: k for k, v in GAIN_CODES.items()}
 
 CHANNELS = 8
 DATA_HDR = struct.Struct("<QIBBH")
+
+# Motion sensor: ts, seq, period in 1/256 us, accel g, gyro dps, axes,
+# flags, count. Rates and ranges are the ones the LSM6DSV16X offers.
+IMU_HDR = struct.Struct("<QIIHHBBH")
+IMU_RATES = (60, 120, 240, 480, 960)
+IMU_ACCEL_G = (2, 4, 8, 16)
+IMU_GYRO_DPS = (125, 250, 500, 1000, 2000, 4000)
+IMU_FLAG_TIME_ESTIMATED, IMU_FLAG_OVERRUN = 0x01, 0x02
+
+
+def decode_imu(payload: bytes):
+    """
+    An IMU payload to (ts_us, seq, period_us, counts, accel_g, gyro_dps, flags).
+
+    counts is the raw (samples, 6) int16 block - accel x y z, then gyro x y
+    z. One count is accel_g / 32768 g, or gyro_dps / 32768 degrees a second.
+    """
+    if len(payload) < IMU_HDR.size:
+        return None
+
+    ts, seq, period_q8, accel_g, gyro_dps, axes, flags, count = \
+        IMU_HDR.unpack_from(payload)
+    need = count * axes * 2
+    body = payload[IMU_HDR.size:IMU_HDR.size + need]
+
+    if axes != 6 or len(body) < need:
+        return None
+
+    counts = np.frombuffer(body, dtype="<i2").reshape(count, 6)
+    return ts, seq, period_q8 / 256.0, counts, accel_g, gyro_dps, flags
 
 # VREF 4.5 V over a 24-bit converter. Gain is divided out per channel.
 def lsb_uv(gain: int = 24) -> float:

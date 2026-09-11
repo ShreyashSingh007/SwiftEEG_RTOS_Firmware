@@ -17,6 +17,7 @@
 #include "afe/ads1299.h"
 #include "board/leds.h"
 #include "board/supply.h"
+#include "imu/imu.h"
 #include "pipeline/capture.h"
 #include "pipeline/pipeline.h"
 #include "transport/command.h"
@@ -227,6 +228,21 @@ static void report_capture(void)
 }
 
 /*
+ * The motion sensor. Needs the timebase running first: its samples are
+ * timestamped on TIMER1, like the EEG's.
+ */
+static void report_imu(void)
+{
+	const int err = imu_init();
+
+	if (err == -ENODEV) {
+		LOG_INF("IMU: not fitted on this board");
+	} else if (err != 0) {
+		LOG_ERR("IMU init failed (%d)", err);
+	}
+}
+
+/*
  * Start acquisition and leave it running.
  *
  * Samples go out over USB as protocol DATA frames, in raw ADC counts by
@@ -261,17 +277,32 @@ static void start_acquisition(void)
 /* Periodic health line, so a long run leaves some evidence in the log. */
 static void report_health(void)
 {
-	struct pipeline_stats ps;
-	struct stream_stats ss;
+	if (afe_present) {
+		struct pipeline_stats ps;
+		struct stream_stats ss;
 
-	pipeline_get_stats(&ps);
-	stream_get_stats(&ss);
+		pipeline_get_stats(&ps);
+		stream_get_stats(&ss);
 
-	LOG_INF("health: %u samples, %u dropped, %u bad; stream %u frames, "
-		"%u samples, %u bytes lost; DSP %u us",
-		ps.processed, ps.ring_drops, ps.bad_status,
-		ss.frames_sent, ss.samples_sent, ss.bytes_dropped,
-		ps.dsp_mean_us);
+		LOG_INF("health: %u samples, %u dropped, %u bad; stream %u frames, "
+			"%u samples, %u bytes lost; DSP %u us",
+			ps.processed, ps.ring_drops, ps.bad_status,
+			ss.frames_sent, ss.samples_sent, ss.bytes_dropped,
+			ps.dsp_mean_us);
+	}
+
+	if (imu_present()) {
+		struct imu_stats is;
+
+		imu_get_stats(&is);
+
+		/* The period in microseconds, to three decimals. */
+		LOG_INF("imu: %u samples, %u frames, %u overruns, %u unpaired, "
+			"%u timed by poll; period %u.%03u us",
+			is.samples, is.frames, is.overruns, is.unpaired,
+			is.estimated, is.period_us_q8 >> 8,
+			((is.period_us_q8 & 0xFFu) * 1000u) >> 8);
+	}
 }
 
 int main(void)
@@ -288,6 +319,7 @@ int main(void)
 	report_afe();
 	report_timebase();
 	report_capture();
+	report_imu();
 
 	/*
 	 * Transports are brought up but carry no protocol yet - the codec
@@ -327,7 +359,7 @@ int main(void)
 		k_msleep(BLINK_PERIOD_MS);
 
 		/* Roughly every 10 s at a 500 ms blink. */
-		if (afe_present && (++ticks % 20u) == 0u) {
+		if ((afe_present || imu_present()) && (++ticks % 20u) == 0u) {
 			report_health();
 		}
 	}

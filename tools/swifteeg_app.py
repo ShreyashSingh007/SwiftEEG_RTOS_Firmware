@@ -50,6 +50,7 @@ import swifteeg_link as link  # noqa: E402
 SITES = ["C4", "P4", "F4", "Oz", "AFz", "F3", "C3", "P3"]
 COLORS = ["#4ea1ff", "#ffb454", "#5ed18b", "#ff6b6b",
           "#c792ea", "#ffd866", "#78dce8", "#ff9ec4"]
+AXIS_COLORS = ["#ff6b6b", "#5ed18b", "#4ea1ff"]  # x, y, z
 
 BG = "#12141a"
 PANEL = "#1a1d25"
@@ -176,6 +177,24 @@ class App(tk.Tk):
         self.auto_out = [False] * link.CHANNELS
         self.dc_mv = [0.0] * link.CHANNELS
 
+        # Motion sensor. Every sample carries a timestamp from the device's
+        # TIMER1 - the clock the EEG is stamped on - so motion is kept by
+        # time rather than by index, and drawn on the EEG's time axis.
+        self.imu_cap = int((MAX_WINDOW_SECONDS + 1.0) * max(link.IMU_RATES))
+        self.imu_ring = np.zeros((6, self.imu_cap), dtype=np.float32)
+        self.imu_ts = np.zeros(self.imu_cap)
+        self.imu_n = 0
+        self.imu_last_seq: int | None = None
+        self.imu_gaps = 0
+        self.imu_flags_seen = 0
+        self.imu_period_us = 0.0
+        self.imu_present = False
+        self.imu_recorder: csv.writer | None = None
+        self._imu_file = None
+        self.imu_rows = 0
+        # (sample number in the EEG stream, device time of that sample)
+        self.eeg_anchor: tuple[int, float] | None = None
+
         # Recent unfiltered samples, kept only so the mains frequency can be
         # measured. Grid frequency is never exactly 50 or 60 Hz - measured
         # 49.6 here - and a notch narrow enough to spare the EEG is too
@@ -198,6 +217,7 @@ class App(tk.Tk):
         self._lay: dict | None = None
         self._item_cfg: dict = {}
         self._span = np.full(link.CHANNELS, 50.0)
+        self._motion_span = [0.1, 10.0]
         self._active = False
         self._clock_t = time.perf_counter()
         self._frame_dt = 0.0
@@ -367,6 +387,23 @@ class App(tk.Tk):
         nc.pack(side=tk.LEFT, padx=6)
         nc.bind("<<ComboboxSelected>>", lambda e: self._set_dev_notch())
 
+        # -- motion sensor --
+        f = self._section(inner, "motion sensor")
+        self.imu_rate_var = tk.StringVar(value="240")
+        self.imu_acc_var = tk.StringVar(value="8")
+        self.imu_gyro_var = tk.StringVar(value="2000")
+        self._combo_row(f, "rate", self.imu_rate_var,
+                        ["off"] + [str(r) for r in link.IMU_RATES],
+                        self._set_imu, "Hz")
+        self._combo_row(f, "accel range", self.imu_acc_var,
+                        [str(g) for g in link.IMU_ACCEL_G], self._set_imu,
+                        "+/- g")
+        self._combo_row(f, "gyro range", self.imu_gyro_var,
+                        [str(d) for d in link.IMU_GYRO_DPS], self._set_imu,
+                        "+/- deg/s")
+        self.motion_var = tk.BooleanVar(value=True)
+        self._check(f, "Show motion under the EEG", self.motion_var, None)
+
         # -- host filters --
         f = self._section(inner, "host filters (display)")
         self.hp_var = tk.StringVar(value="0.5")
@@ -509,6 +546,7 @@ class App(tk.Tk):
     def _toggle_stream(self) -> None:
         if self.btn_stream["text"].startswith("Start"):
             self._reset_traces()
+            self._reset_imu()
             self.samples = 0
             self.frames = 0
             self.last_seq = None
@@ -531,6 +569,7 @@ class App(tk.Tk):
         self.ring = np.zeros((link.CHANNELS, self.cap))
         self.n_total = 0
         self.disp = 0.0
+        self.eeg_anchor = None
 
     def _ring_write(self, block: np.ndarray) -> None:
         """block is (channels, samples)."""
@@ -573,6 +612,7 @@ class App(tk.Tk):
         self.chain.set_rate(self.rate)
         self.chain.reset()
         self._reset_traces()
+        self._reset_imu()
         self.last_seq = None
         self.samples = 0
         self.frames = 0
@@ -608,6 +648,7 @@ class App(tk.Tk):
         self._was_connected = False
         self.chain.reset()
         self._reset_traces()
+        self._reset_imu()
         self.last_seq = None
         self.status.config(text="link reset - press Connect", fg="#ffd866")
 
@@ -647,6 +688,16 @@ class App(tk.Tk):
         hz = {"off": 0, "50 Hz": 50, "60 Hz": 60}[self.dev_notch.get()]
         self._send(link.CMD_SET_NOTCH, hz)
 
+    def _set_imu(self) -> None:
+        rate = self.imu_rate_var.get()
+        on = rate != "off"
+        hz = int(rate) if on else 240
+        g = int(self.imu_acc_var.get())
+        dps = int(self.imu_gyro_var.get())
+        self._send(link.CMD_SET_IMU, 1 if on else 0, hz & 0xFF, hz >> 8,
+                   g, dps & 0xFF, dps >> 8)
+        self._reset_imu()
+
     def _rebuild_chain(self) -> None:
         hp = self.hp_var.get()
         lp = self.lp_var.get()
@@ -670,14 +721,18 @@ class App(tk.Tk):
     def _toggle_record(self) -> None:
         if self.recorder is not None:
             self._rec_file.close()
+            self._imu_file.close()
             self.recorder = None
+            self.imu_recorder = None
             self._rec_file = None
+            self._imu_file = None
             self.btn_rec.config(text="Record")
             return
 
-        name = time.strftime("swifteeg_%Y%m%d_%H%M%S.csv")
-        path = pathlib.Path.cwd() / name
-        self._rec_file = open(path, "w", newline="", encoding="utf-8")
+        stamp = time.strftime("swifteeg_%Y%m%d_%H%M%S")
+        name = stamp + ".csv"
+        self._rec_file = open(pathlib.Path.cwd() / name, "w", newline="",
+                              encoding="utf-8")
         self.recorder = csv.writer(self._rec_file)
 
         # Raw counts, not microvolts: the scale depends on the gain, and a
@@ -691,6 +746,20 @@ class App(tk.Tk):
             ["ts_us", "seq"] + [f"ch{i + 1}_{SITES[i]}"
                                 for i in range(link.CHANNELS)])
         self.rec_rows = 0
+
+        # Motion in a file of its own. ts_us in both files is the device's
+        # TIMER1, so the two line up sample for sample.
+        self._imu_file = open(pathlib.Path.cwd() / (stamp + "_motion.csv"),
+                              "w", newline="", encoding="utf-8")
+        self.imu_recorder = csv.writer(self._imu_file)
+        self.imu_recorder.writerow(
+            ["# SwiftEEG motion", "accel in g, gyro in degrees/s",
+             "ts_us on the same clock as the EEG file"])
+        self.imu_recorder.writerow(
+            ["ts_us", "seq", "ax_g", "ay_g", "az_g", "gx_dps", "gy_dps",
+             "gz_dps"])
+        self.imu_rows = 0
+
         self.btn_rec.config(text="Stop rec")
         self.status.config(text=f"recording {name}", fg="#5ed18b")
 
@@ -767,6 +836,7 @@ class App(tk.Tk):
             self.status.config(text=msg, fg=colour)
 
         block_raw = []
+        imu_raw = []
         while True:
             try:
                 f = self.link.frames.get_nowait()
@@ -785,12 +855,18 @@ class App(tk.Tk):
                 self.last_seq = seq + len(vals)
 
                 block_raw.append((ts, seq, vals))
+            elif f.type == link.TYPE_IMU:
+                got = link.decode_imu(f.payload)
+                if got is not None:
+                    imu_raw.append(got)
             elif f.type == link.TYPE_RSP:
                 self._on_response(bytes(f.payload))
 
         if block_raw:
             self._consume(block_raw)
             self._note_arrival(now)
+        if imu_raw:
+            self._consume_imu(imu_raw)
 
     def _note_arrival(self, now: float) -> None:
         """
@@ -841,6 +917,16 @@ class App(tk.Tk):
                               link.MUX_SHORTED: "Shorted (noise)",
                               link.MUX_TEST: "Test signal"}.get(mux,
                                                                 "Electrodes"))
+
+        # Motion sensor, from firmware that has one: flags (bit 0 on, bit 1
+        # fitted), rate, ranges. Older firmware sends none of it.
+        if len(p) >= 21:
+            self.imu_present = bool(p[15] & 0x02)
+            hz = p[16] | (p[17] << 8)
+            self.imu_rate_var.set(str(hz) if p[15] & 0x01 else "off")
+            self.imu_acc_var.set(str(p[18]))
+            self.imu_gyro_var.set(str(p[19] | (p[20] << 8)))
+
         self.status.config(text=f"connected - {sps} SPS, gain {self.gain}",
                            fg="#5ed18b")
 
@@ -890,6 +976,12 @@ class App(tk.Tk):
                 self.chain.update_mains(np.array(self.mains_buf))
 
         out = self.chain.process(uv)
+
+        # Where the newest batch sits on the device clock. The motion lanes
+        # are placed by time, and this is what gives them the EEG's axis.
+        last_ts, _, last_vals = blocks[-1]
+        self.eeg_anchor = (self.n_total + len(counts) - len(last_vals),
+                           float(last_ts))
         self._ring_write(out.T)
 
     def _check_limits(self, counts: np.ndarray) -> None:
@@ -927,6 +1019,68 @@ class App(tk.Tk):
                 text=f"CH{ch + 1} {SITES[ch]} left out of the common average"
                      f" - input near its limit", fg="#ffd866")
 
+    # ------------------------------------------------------------ motion --
+
+    def _reset_imu(self) -> None:
+        self.imu_n = 0
+        self.imu_last_seq = None
+        self.imu_gaps = 0
+        self.imu_flags_seen = 0
+
+    def _consume_imu(self, frames) -> None:
+        for ts, seq, period_us, counts, accel_g, gyro_dps, flags in frames:
+            n = len(counts)
+            if self.imu_last_seq is not None and seq != self.imu_last_seq:
+                self.imu_gaps += 1
+            self.imu_last_seq = seq + n
+            self.imu_period_us = period_us
+            self.imu_flags_seen |= flags
+
+            # Counts to units: one count is the full scale over 32768.
+            scaled = counts.astype(np.float64)
+            scaled[:, :3] *= accel_g / 32768.0
+            scaled[:, 3:] *= gyro_dps / 32768.0
+            times = ts + np.arange(n) * period_us
+
+            if self.imu_recorder is not None:
+                for i in range(n):
+                    a = scaled[i]
+                    self.imu_recorder.writerow(
+                        [round(times[i]), seq + i,
+                         f"{a[0]:.5f}", f"{a[1]:.5f}", f"{a[2]:.5f}",
+                         f"{a[3]:.3f}", f"{a[4]:.3f}", f"{a[5]:.3f}"])
+                self.imu_rows += n
+
+            self._imu_write(scaled.T, times)
+
+    def _imu_write(self, block: np.ndarray, times: np.ndarray) -> None:
+        """block is (6, samples); times are device microseconds."""
+        n = block.shape[1]
+        cap = self.imu_cap
+        if n >= cap:
+            self.imu_n += n - cap
+            block, times, n = block[:, n - cap:], times[n - cap:], cap
+
+        i = self.imu_n % cap
+        first = min(n, cap - i)
+        self.imu_ring[:, i:i + first] = block[:, :first]
+        self.imu_ts[i:i + first] = times[:first]
+        if first < n:
+            self.imu_ring[:, :n - first] = block[:, first:]
+            self.imu_ts[:n - first] = times[first:]
+        self.imu_n += n
+
+    def _imu_recent(self, k: int):
+        """The newest k motion samples, oldest first, and their times."""
+        k = min(k, self.imu_n, self.imu_cap)
+        i = (self.imu_n - k) % self.imu_cap
+        if i + k <= self.imu_cap:
+            return self.imu_ring[:, i:i + k], self.imu_ts[i:i + k]
+        j = k - (self.imu_cap - i)
+        return (np.concatenate((self.imu_ring[:, i:], self.imu_ring[:, :j]),
+                               axis=1),
+                np.concatenate((self.imu_ts[i:], self.imu_ts[:j])))
+
     # -------------------------------------------------------------- draw --
 
     def _cfg(self, item: int, **kw) -> None:
@@ -950,12 +1104,15 @@ class App(tk.Tk):
             return
 
         window = float(self.window_var.get())
-        key = (w, h, tuple(shown), window)
+        motion = bool(self.motion_var.get()) and (self.imu_present
+                                                  or self.imu_n > 0)
+        key = (w, h, tuple(shown), window, motion)
         if self._lay is None or self._lay["key"] != key:
             self._lay = self._layout(key)
         lay = self._lay
 
         self._draw_traces(lay, window, now)
+        self._draw_motion(lay, window)
 
         settled = (time.time() - self.started_at) > self.chain.settling_seconds
         self._cfg(lay["settle"], text=(
@@ -982,14 +1139,14 @@ class App(tk.Tk):
         Items are made once and then moved. Deleting and recreating every
         line and label each frame cost more than the whole redraw does now.
         """
-        w, h, shown, window = key
+        w, h, shown, window, motion = key
         c = self.canvas
         c.delete("all")
         self._item_cfg.clear()
 
         left = 118
         plot_w = w - left - 24
-        lane = h / len(shown)
+        lane = h / (len(shown) + (2 if motion else 0))
 
         # A grid line a second, drawn first so the traces sit on top of it.
         for sec in range(1, int(window) + 1):
@@ -1013,13 +1170,35 @@ class App(tk.Tk):
             traces.append(c.create_line(0, 0, 0, 0, fill=COLORS[ch],
                                         width=1))
 
+        m_bases, m_subs, m_lines = [], [], []
+        if motion:
+            top = lane * len(shown)
+            c.create_line(0, top, w, top, fill="#2a2f3a")
+            for i, name in enumerate(("ACCEL", "GYRO")):
+                base = lane * (len(shown) + i + 0.5)
+                m_bases.append(base)
+                c.create_line(left, base, w - 24, base, fill="#1c2029")
+                c.create_text(left - 10, base - 7, anchor="e", fill=FG,
+                              text=name, font=("Consolas", 10, "bold"))
+                m_subs.append(c.create_text(left - 10, base + 8, anchor="e",
+                                            fill=DIM, text="",
+                                            font=("Consolas", 8)))
+                for j, axis in enumerate("xyz"):
+                    c.create_text(left - 34 + j * 12, base + 21, anchor="e",
+                                  fill=AXIS_COLORS[j], text=axis,
+                                  font=("Consolas", 8, "bold"))
+                for colour in AXIS_COLORS:
+                    m_lines.append(c.create_line(0, 0, 0, 0, fill=colour,
+                                                 width=1))
+
         c.create_text(w - 26, h - 10, anchor="e", fill=DIM,
                       font=("Consolas", 8), text=f"{window:.0f} s window")
 
         return {
             "key": key, "left": left, "plot_w": plot_w, "lane": lane,
             "rows": list(shown), "bases": np.array(bases), "subs": subs,
-            "warns": warns, "traces": traces,
+            "warns": warns, "traces": traces, "motion": motion,
+            "m_bases": m_bases, "m_subs": m_subs, "m_lines": m_lines,
             "settle": c.create_text(w // 2, 16, fill="#ffd866",
                                     font=("Segoe UI", 10), text=""),
             "rail": c.create_text(w // 2, h - 26, fill="#ff6b6b",
@@ -1126,6 +1305,75 @@ class App(tk.Tk):
                 warn, colour = "", DIM
             self._cfg(lay["warns"][r], text=warn, fill=colour)
 
+    def _draw_motion(self, lay: dict, window: float) -> None:
+        """
+        The motion lanes, on the EEG's time axis.
+
+        Motion samples are placed by their device timestamp - the clock the
+        EEG is stamped on - so a head movement lines up with the stretch of
+        EEG it disturbed.
+        """
+        if not lay["motion"]:
+            return
+
+        c = self.canvas
+        lines = lay["m_lines"]
+
+        def blank():
+            for item in lines:
+                c.coords(item, 0, 0, 0, 0)
+
+        if self.imu_n < 2 or self.eeg_anchor is None:
+            blank()
+            return
+
+        idx, ts = self.eeg_anchor
+        window_us = window * 1e6
+        t_right = ts + (self.disp - idx) * 1e6 / self.rate
+        t_left = t_right - window_us
+
+        hz = 1e6 / self.imu_period_us if self.imu_period_us > 0 \
+            else max(link.IMU_RATES)
+        vals, times = self._imu_recent(int(window * hz * 1.2) + 32)
+        keep = (times >= t_left) & (times <= t_right)
+        if np.count_nonzero(keep) < 2:
+            blank()
+            return
+
+        vals, times = vals[:, keep], times[keep]
+        stride = max(1, math.ceil(times.size / lay["plot_w"]))
+        vals, times = vals[:, ::stride], times[::stride]
+        xs = lay["left"] + (times - t_left) * (lay["plot_w"] / window_us)
+
+        call, name = c.tk.call, c._w
+        for lane in range(2):
+            part = vals[3 * lane:3 * lane + 3].astype(np.float64)
+            if lane == 0:
+                # Gravity sits on the accelerometer as a steady 1 g spread
+                # over the axes by head angle. Taking each axis's mean out
+                # shows movement rather than orientation.
+                part = part - part.mean(axis=1, keepdims=True)
+
+            floor = 0.02 if lane == 0 else 2.0
+            target = max(floor, float(np.abs(part).max()) * 1.15)
+            current = self._motion_span[lane]
+            span = target if target > current else \
+                current + (target - current) * min(1.0, self._frame_dt * 2.0)
+            self._motion_span[lane] = span
+
+            k = (lay["lane"] * 0.42) / span
+            ys = lay["m_bases"][lane] - np.clip(part, -span, span) * k
+            pts = np.empty((3, 2 * xs.size))
+            pts[:, 0::2] = xs
+            pts[:, 1::2] = ys
+            for axis in range(3):
+                call(name, "coords", lines[3 * lane + axis],
+                     pts[axis].tolist())
+
+            label = (f"+/-{span:.2f} g" if lane == 0
+                     else f"+/-{span:,.0f} deg/s")
+            self._cfg(lay["m_subs"][lane], text=label)
+
     def _spans(self, rows: list[int], vals) -> np.ndarray:
         """
         Vertical range for each lane.
@@ -1187,15 +1435,30 @@ class App(tk.Tk):
                        f"{self._latency * 1000:.0f} ms behind")
         else:
             display = "plot idle - no data arriving"
+
+        if self.imu_n:
+            hz = 1e6 / self.imu_period_us if self.imu_period_us else 0.0
+            polled = ("  timed by poll"
+                      if self.imu_flags_seen & link.IMU_FLAG_TIME_ESTIMATED
+                      else "")
+            motion = (f"motion {self.imu_n} samples  {hz:.2f} Hz  "
+                      f"{self.imu_gaps} gaps{polled}")
+        elif self.imu_present:
+            motion = "motion sensor fitted, no samples yet"
+        else:
+            motion = "motion sensor not reported"
+
         self.stats.config(text="\n".join([
             f"{self.samples} samples  {self.samples / el:6.1f} SPS",
             f"{self.frames} frames  {bad} bad  {self.gaps} gaps{rec}",
             f"DC mV: {dc}",
+            motion,
             display]))
 
     def _close(self) -> None:
         if self.recorder is not None:
             self._rec_file.close()
+            self._imu_file.close()
         if self.link:
             try:
                 self.link.send(link.CMD_STREAM_STOP)

@@ -223,3 +223,71 @@ uint64_t capture_last_us(void)
 {
 	return timebase_stamp_us(timebase_capture_get());
 }
+
+int capture_edge_init(uint32_t pin, bool rising, uint32_t task_addr)
+{
+	if (!nrfx_gpiote_init_check(&gpiote)) {
+		const int err = nrfx_gpiote_init(&gpiote, 0);
+
+		if (err != 0) {
+			LOG_ERR("GPIOTE init failed (%d)", err);
+			return -EIO;
+		}
+	}
+
+	nrf_gpio_cfg_input(pin, NRF_GPIO_PIN_NOPULL);
+
+	uint8_t ch;
+	int err = nrfx_gpiote_channel_alloc(&gpiote, &ch);
+
+	if (err != 0) {
+		LOG_ERR("no free GPIOTE channel (%d)", err);
+		return -ENOMEM;
+	}
+
+	const nrfx_gpiote_trigger_config_t trigger = {
+		.trigger = rising ? NRFX_GPIOTE_TRIGGER_LOTOHI
+				  : NRFX_GPIOTE_TRIGGER_HITOLO,
+		.p_in_channel = &ch,
+	};
+	const nrfx_gpiote_input_pin_config_t pin_cfg = {
+		.p_trigger_config = &trigger,
+	};
+
+	err = nrfx_gpiote_input_configure(&gpiote, pin, &pin_cfg);
+	if (err != 0) {
+		LOG_ERR("edge input configure failed (%d)", err);
+		return -EIO;
+	}
+
+	nrfx_gppi_handle_t handle;
+	const uint32_t domain = nrfx_gppi_domain_id_get((uint32_t)NRF_TIMER1);
+
+	err = nrfx_gppi_domain_conn_alloc(domain, domain, &handle);
+	if (err != 0) {
+		LOG_ERR("no free PPI channel (%d)", err);
+		return -ENOMEM;
+	}
+
+	err = nrfx_gppi_ep_attach(nrfx_gpiote_in_event_address_get(&gpiote, pin),
+				  handle);
+	if (err != 0) {
+		LOG_ERR("edge event attach failed (%d)", err);
+		return -EIO;
+	}
+
+	err = nrfx_gppi_ep_attach(task_addr, handle);
+	if (err != 0) {
+		LOG_ERR("edge capture task attach failed (%d)", err);
+		return -EIO;
+	}
+
+	nrfx_gppi_conn_enable(handle);
+
+	/* Raise the event for PPI, but do not interrupt the CPU for it. */
+	nrfx_gpiote_trigger_enable(&gpiote, pin, false);
+
+	LOG_INF("edge capture wired: pin %u -> TIMER1 (GPIOTE ch %u)", pin, ch);
+
+	return 0;
+}

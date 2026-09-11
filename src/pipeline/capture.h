@@ -65,4 +65,11 @@ void capture_set_trigger(bool on);
 /* Timestamp of the most recent DRDY, in microseconds. */
 uint64_t capture_last_us(void);
 
+/*
+ * Wire another pin's edge to a timebase capture task, by the same hardware
+ * path as DRDY: GPIOTE event, PPI, TASKS_CAPTURE, no CPU. Used for the IMU's
+ * interrupt line. Allocates one GPIOTE and one PPI channel.
+ */
+int capture_edge_init(uint32_t pin, bool rising, uint32_t task_addr);
+
 #endif /* SWIFTEEG_CAPTURE_H */

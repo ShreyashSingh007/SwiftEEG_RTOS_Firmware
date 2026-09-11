@@ -194,13 +194,27 @@ static void cdc_irq_handler(const struct device *dev, void *user_data)
 	}
 }
 
+/*
+ * Several threads write: the DSP thread's samples, the IMU thread's motion
+ * frames and the command thread's replies. The ring buffer is only safe for
+ * one writer at a time, so writers take turns. And a frame goes in whole or
+ * not at all - half a frame corrupts the byte stream for whatever follows.
+ */
+static K_MUTEX_DEFINE(usb_tx_lock);
+
 size_t usb_transport_write(const uint8_t *buf, size_t len)
 {
 	if (!usb_tx_ready || !usb_transport_is_connected()) {
 		return 0;
 	}
 
-	const uint32_t put = ring_buf_put(&usb_tx_rb, buf, len);
+	uint32_t put = 0;
+
+	k_mutex_lock(&usb_tx_lock, K_FOREVER);
+	if (ring_buf_space_get(&usb_tx_rb) >= len) {
+		put = ring_buf_put(&usb_tx_rb, buf, (uint32_t)len);
+	}
+	k_mutex_unlock(&usb_tx_lock);
 
 	if (put < len) {
 		atomic_add(&usb_tx_dropped, (atomic_val_t)(len - put));

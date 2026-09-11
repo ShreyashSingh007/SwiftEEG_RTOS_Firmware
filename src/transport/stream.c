@@ -4,6 +4,7 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/sys/atomic.h>
 
 #include "proto/proto.h"
 #include "ble.h"
@@ -60,7 +61,14 @@ static uint16_t frame_seq;
 static uint8_t encoding = STREAM_ENC_RAW_I24;
 static bool enabled;
 
+/*
+ * Frame and sample counts belong to the DSP thread. Link drops are counted
+ * by whichever thread is sending - the IMU thread shares the links - so
+ * those are atomic.
+ */
 static struct stream_stats stats;
+static atomic_t ble_dropped;
+static atomic_t ble_too_big;
 
 static inline void put_u16(uint8_t *p, uint16_t v)
 {
@@ -74,6 +82,37 @@ static inline void put_u32(uint8_t *p, uint32_t v)
 	p[1] = (uint8_t)((v >> 8) & 0xFFu);
 	p[2] = (uint8_t)((v >> 16) & 0xFFu);
 	p[3] = (uint8_t)((v >> 24) & 0xFFu);
+}
+
+bool stream_send(const uint8_t *frame, size_t len)
+{
+	bool delivered = false;
+
+	/*
+	 * Both links carry byte-identical frames, and both are fed: a host on
+	 * either one sees the same stream, and unplugging USB mid-session does
+	 * not interrupt BLE. The USB transport counts its own drops.
+	 */
+	if (usb_transport_is_connected() &&
+	    usb_transport_write(frame, len) == len) {
+		delivered = true;
+	}
+
+	if (ble_transport_is_streaming()) {
+		const uint16_t room = ble_transport_max_payload();
+
+		if (room != 0 && len > room) {
+			/* Would be dropped by the stack; count it here instead
+			 * of losing it silently. */
+			atomic_inc(&ble_too_big);
+		} else if (ble_transport_send_stream(frame, (uint16_t)len) == 0) {
+			delivered = true;
+		} else {
+			atomic_inc(&ble_dropped);
+		}
+	}
+
+	return delivered;
 }
 
 static void flush(void)
@@ -97,45 +136,9 @@ static void flush(void)
 				   batch, payload_len, frame_buf,
 				   sizeof(frame_buf));
 
-	if (n > 0) {
-		bool delivered = false;
-
-		/*
-		 * Both links carry byte-identical frames, and both are fed:
-		 * a host on either one sees the same stream, and unplugging
-		 * USB mid-session does not interrupt BLE.
-		 */
-		if (usb_transport_is_connected()) {
-			const size_t sent =
-				usb_transport_write(frame_buf, (size_t)n);
-
-			if (sent < (size_t)n) {
-				stats.bytes_dropped +=
-					(uint32_t)((size_t)n - sent);
-			} else {
-				delivered = true;
-			}
-		}
-
-		if (ble_transport_is_streaming()) {
-			const uint16_t room = ble_transport_max_payload();
-
-			if (room != 0 && (size_t)n > room) {
-				/* Would be dropped by the stack; count it
-				 * here instead of losing it silently. */
-				stats.ble_too_big++;
-			} else if (ble_transport_send_stream(frame_buf,
-							     (uint16_t)n) == 0) {
-				delivered = true;
-			} else {
-				stats.ble_dropped++;
-			}
-		}
-
-		if (delivered) {
-			stats.frames_sent++;
-			stats.samples_sent += batch_count;
-		}
+	if (n > 0 && stream_send(frame_buf, (size_t)n)) {
+		stats.frames_sent++;
+		stats.samples_sent += batch_count;
 	}
 
 	batch_count = 0;
@@ -240,10 +243,14 @@ bool stream_enabled(void)
 void stream_get_stats(struct stream_stats *out)
 {
 	*out = stats;
-	out->bytes_dropped += usb_transport_dropped();
+	out->bytes_dropped = usb_transport_dropped();
+	out->ble_dropped = (uint32_t)atomic_get(&ble_dropped);
+	out->ble_too_big = (uint32_t)atomic_get(&ble_too_big);
 }
 
 void stream_reset_stats(void)
 {
 	memset(&stats, 0, sizeof(stats));
+	atomic_set(&ble_dropped, 0);
+	atomic_set(&ble_too_big, 0);
 }

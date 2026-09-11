@@ -12,6 +12,7 @@ target_sources(app PRIVATE
   src/board/leds.c
   src/board/supply.c
   src/afe/ads1299.c
+  src/imu/imu.c
   src/timebase/timebase.c
   src/pipeline/capture.c
   src/pipeline/pipeline.c

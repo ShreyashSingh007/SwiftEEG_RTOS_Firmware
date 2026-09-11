@@ -14,6 +14,7 @@
 #define SWIFTEEG_TRANSPORT_STREAM_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "pipeline/pipeline.h"
@@ -46,6 +47,13 @@ uint8_t stream_encoding(void);
 /* Start and stop transmitting. */
 void stream_enable(bool on);
 bool stream_enabled(void);
+
+/*
+ * Send one encoded protocol frame on every connected link. Safe from any
+ * thread: the IMU sends its motion frames through here too. Returns true if
+ * at least one link took the frame.
+ */
+bool stream_send(const uint8_t *frame, size_t len);
 
 /* Install as the pipeline's sink. Runs in the DSP thread. */
 void stream_on_sample(const struct eeg_sample *s);

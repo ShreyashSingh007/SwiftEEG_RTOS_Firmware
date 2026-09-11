@@ -49,6 +49,7 @@ typedef enum {
 	PROTO_TYPE_RSP  = 0x02, /* device -> host, answers a CMD */
 	PROTO_TYPE_EVT  = 0x03, /* device -> host, unsolicited */
 	PROTO_TYPE_DATA = 0x04, /* device -> host, sample stream */
+	PROTO_TYPE_IMU  = 0x05, /* device -> host, motion samples */
 } proto_type_t;
 
 /* Frame flags. */

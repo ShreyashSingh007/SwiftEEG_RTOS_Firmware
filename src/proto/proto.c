@@ -40,6 +40,7 @@ static bool type_is_valid(uint8_t type)
 	case PROTO_TYPE_RSP:
 	case PROTO_TYPE_EVT:
 	case PROTO_TYPE_DATA:
+	case PROTO_TYPE_IMU:
 		return true;
 	default:
 		return false;

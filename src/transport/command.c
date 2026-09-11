@@ -7,6 +7,7 @@
 #include <zephyr/logging/log.h>
 
 #include "afe/ads1299.h"
+#include "imu/imu.h"
 #include "pipeline/pipeline.h"
 #include "proto/proto.h"
 #include "ble.h"
@@ -229,6 +230,25 @@ static void handle(const proto_frame_t *f)
 		}
 		break;
 
+	case CMD_SET_IMU:
+		if (f->len < 7) {
+			status = CMD_EBADARG;
+		} else {
+			const struct imu_config cfg = {
+				.enabled = f->payload[1] != 0,
+				.rate_hz = (uint16_t)(f->payload[2] |
+						      (f->payload[3] << 8)),
+				.accel_g = f->payload[4],
+				.gyro_dps = (uint16_t)(f->payload[5] |
+						       (f->payload[6] << 8)),
+			};
+			const int err = imu_configure(&cfg);
+
+			status = (err == 0) ? CMD_OK
+				 : (err == -EINVAL) ? CMD_EBADARG : CMD_EFAILED;
+		}
+		break;
+
 	case CMD_GET_CONFIG: {
 		/*
 		 * Everything a host needs to draw its controls in the right
@@ -237,11 +257,13 @@ static void handle(const proto_frame_t *f)
 		 * failed write shows up as a wrong control, not a lie.
 		 */
 		uint8_t chset[ADS1299_CHANNELS] = { 0 };
+		struct imu_config imu;
 
 		(void)ads1299_get_channels(chset, ADS1299_CHANNELS);
+		imu_get_config(&imu);
 
 		const uint16_t sps = pipeline_rate();
-		uint8_t cfg[13];
+		uint8_t cfg[19];
 
 		cfg[0] = ADS1299_CHANNELS;
 		cfg[1] = stream_encoding();
@@ -249,6 +271,15 @@ static void handle(const proto_frame_t *f)
 		cfg[3] = (uint8_t)(sps >> 8);
 		cfg[4] = pipeline_notch();
 		memcpy(&cfg[5], chset, sizeof(chset));
+
+		/* Motion sensor: bit 0 on, bit 1 fitted; then rate and ranges. */
+		cfg[13] = (uint8_t)((imu.enabled ? 0x01u : 0u) |
+				    (imu_present() ? 0x02u : 0u));
+		cfg[14] = (uint8_t)(imu.rate_hz & 0xFFu);
+		cfg[15] = (uint8_t)(imu.rate_hz >> 8);
+		cfg[16] = imu.accel_g;
+		cfg[17] = (uint8_t)(imu.gyro_dps & 0xFFu);
+		cfg[18] = (uint8_t)(imu.gyro_dps >> 8);
 
 		respond(op, CMD_OK, cfg, sizeof(cfg));
 		return;

@@ -16,13 +16,15 @@ LOG_MODULE_REGISTER(timebase, CONFIG_LOG_DEFAULT_LEVEL);
 
 /*
  * Compare/capture channel roles:
- *   0  latched from DRDY by PPI - the sample timestamp
+ *   0  latched from DRDY by PPI - the EEG sample timestamp
  *   1  wrap detector, fires when the counter rolls over to 0
  *   2  scratch for timebase_now_us()
+ *   3  latched from the IMU's INT2 by PPI - motion sample timestamps
  */
 #define CC_CAPTURE 0
 #define CC_WRAP    1
 #define CC_NOW     2
+#define CC_IMU     3
 
 #define WRAP_EVENT NRF_TIMER_EVENT_COMPARE1
 #define WRAP_INT   NRF_TIMER_INT_COMPARE1_MASK
@@ -130,6 +132,19 @@ uint64_t timebase_stamp_us(uint32_t capture)
 	return tb_stamp(capture);
 }
 
+uint64_t timebase_stamp_past_us(uint32_t capture)
+{
+	const uint64_t now = timebase_now_us();
+	uint64_t t = (now & ~(uint64_t)UINT32_MAX) | capture;
+
+	/* Later than now means the capture came before the most recent wrap. */
+	if (t > now) {
+		t -= (uint64_t)1 << 32;
+	}
+
+	return t;
+}
+
 uint32_t timebase_capture_get(void)
 {
 	return nrf_timer_cc_get(TB_TIMER, CC_CAPTURE);
@@ -139,6 +154,17 @@ uint32_t timebase_capture_task_addr(void)
 {
 	return nrf_timer_task_address_get(TB_TIMER,
 					  nrf_timer_capture_task_get(CC_CAPTURE));
+}
+
+uint32_t timebase_imu_capture_get(void)
+{
+	return nrf_timer_cc_get(TB_TIMER, CC_IMU);
+}
+
+uint32_t timebase_imu_capture_task_addr(void)
+{
+	return nrf_timer_task_address_get(TB_TIMER,
+					  nrf_timer_capture_task_get(CC_IMU));
 }
 
 bool timebase_hfxo_running(void)

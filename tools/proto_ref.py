@@ -13,6 +13,7 @@ loudly.
 
 from __future__ import annotations
 
+import binascii
 import struct
 from dataclasses import dataclass
 
@@ -36,6 +37,14 @@ FLAG_OVERRUN = 0x02
 
 def crc16(data: bytes) -> int:
     """CRC-16/CCITT-FALSE: poly 0x1021, init 0xFFFF, no reflection, no xorout."""
+    # binascii's CRC-CCITT is exactly this CRC, in C. The bit-by-bit loop
+    # below ran on the thread that receives Bluetooth, and at 1 kSPS it was
+    # competing with the plot for the interpreter.
+    return binascii.crc_hqx(data, 0xFFFF)
+
+
+def _crc16_bitwise(data: bytes) -> int:
+    """The same CRC spelled out bit by bit - the reference crc16 is checked against."""
     crc = 0xFFFF
     for byte in data:
         crc ^= byte << 8
@@ -92,6 +101,9 @@ def decode(buf: bytes) -> Frame:
 def _self_test() -> None:
     # Standard check value for CRC-16/CCITT-FALSE.
     assert crc16(b"123456789") == 0x29B1, f"got 0x{crc16(b'123456789'):04x}"
+    for n in (0, 1, 2, 7, 64, 255, 300):
+        data = bytes((i * 37 + n) & 0xFF for i in range(n))
+        assert crc16(data) == _crc16_bitwise(data), f"fast CRC differs at {n} bytes"
 
     # Round trip, including an empty payload and a maximum-size one.
     for payload in (b"", b"\x00", b"hello", bytes(range(256)) * 4):

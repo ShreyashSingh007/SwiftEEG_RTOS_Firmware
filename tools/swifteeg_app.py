@@ -9,7 +9,7 @@ filter chain on the host, plots the result, and records raw data to disk.
 Needs pyserial for USB and bleak for Bluetooth. The window is tkinter, which
 ships with Python and is native on Windows.
 
-Two decisions worth knowing:
+Three decisions worth knowing:
 
   * The device streams raw counts. Filtering happens here, where a setting
     can be changed and judged in a second. Recordings are raw for the same
@@ -20,17 +20,25 @@ Two decisions worth knowing:
     chain that works here transfers to the device as coefficients rather than
     as a rewrite. That is what makes moving the DSP on-chip a configuration
     step and not a second implementation.
+
+  * The plot is paced by the monitor, not by the data. Bluetooth delivers
+    samples in bursts, and drawing each burst as it lands makes the trace
+    jump. Instead the display trails the newest sample by a few tens of
+    milliseconds and scrolls at a steady speed, one redraw per refresh.
 """
 
 from __future__ import annotations
 
 import collections
 import csv
+import ctypes
+import math
 import pathlib
 import queue
 import sys
 import time
 import tkinter as tk
+import traceback
 from tkinter import ttk
 
 import numpy as np
@@ -49,7 +57,82 @@ FG = "#e6e6e6"
 DIM = "#8a94a6"
 PLOT_BG = "#0e1014"
 
-WINDOW_SECONDS = 5.0
+# History kept for the plot whatever window is showing, so widening the
+# window reveals data already received rather than starting empty.
+MAX_WINDOW_SECONDS = 10.0
+
+# How far the display may trail the newest sample. It has to trail by more
+# than the longest gap between Bluetooth deliveries, or the trace stalls
+# waiting for the next one.
+LATENCY_MIN_S = 0.05
+LATENCY_MAX_S = 0.30
+
+
+class FramePacer:
+    """
+    Paces redraws to the monitor's refresh.
+
+    tkinter has no vsync, and on Windows `after(7)` does not give 144 Hz:
+    timers round up to the 15.6 ms system tick, which caps a plot near 64
+    fps, and the frames that do land drift against the monitor and stutter.
+    So the timer resolution is raised to 1 ms, and each frame starts by
+    blocking in DwmFlush, which returns when the compositor presents - one
+    redraw per refresh, in step with the screen.
+    """
+
+    VREFRESH = 116  # GetDeviceCaps index
+
+    def __init__(self) -> None:
+        self.hz = 60.0
+        self._dwm = None
+        self._gdi = None
+        self._winmm = None
+        self._last = time.perf_counter()
+
+        if sys.platform != "win32":
+            return
+
+        try:
+            self._winmm = ctypes.windll.winmm
+            self._winmm.timeBeginPeriod(1)
+        except (OSError, AttributeError):
+            self._winmm = None
+
+        try:
+            user32 = ctypes.windll.user32
+            self._gdi = ctypes.windll.gdi32
+            self._dwm = ctypes.windll.dwmapi
+            hdc = user32.GetDC(0)
+            hz = self._gdi.GetDeviceCaps(hdc, self.VREFRESH)
+            user32.ReleaseDC(0, hdc)
+            if hz > 1:
+                self.hz = float(hz)
+        except (OSError, AttributeError):
+            self._gdi = None
+            self._dwm = None
+
+    def wait_for_refresh(self) -> None:
+        """Block until the next screen refresh. Call before drawing."""
+        period = 1.0 / self.hz
+        if self._dwm is not None:
+            self._dwm.DwmFlush()
+
+        # DwmFlush returns at once when nothing is being composed - a locked
+        # screen, say. A timed wait stands in then, rather than a busy loop.
+        since = time.perf_counter() - self._last
+        if since < period * 0.6:
+            time.sleep(period - since)
+        self._last = time.perf_counter()
+
+    def flush(self) -> None:
+        """Push batched GDI drawing out now, so it makes this refresh."""
+        if self._gdi is not None:
+            self._gdi.GdiFlush()
+
+    def close(self) -> None:
+        if self._winmm is not None:
+            self._winmm.timeEndPeriod(1)
+            self._winmm = None
 
 
 class App(tk.Tk):
@@ -65,9 +148,7 @@ class App(tk.Tk):
         self.chain = eeg_dsp.Chain(self.rate, link.CHANNELS)
         self.gain = 24
 
-        depth = int(WINDOW_SECONDS * 1000)      # resized when the rate changes
-        self.traces = [collections.deque(maxlen=depth)
-                       for _ in range(link.CHANNELS)]
+        self._reset_traces()
         self.enabled = [tk.BooleanVar(value=True) for _ in range(link.CHANNELS)]
 
         # Raw counts sit at +/-2^23 when an input saturates. Tracked per
@@ -94,8 +175,27 @@ class App(tk.Tk):
         self._rec_file = None
         self.rec_rows = 0
 
+        # Display state.
+        self.pacer = FramePacer()
+        self._lay: dict | None = None
+        self._item_cfg: dict = {}
+        self._span = np.full(link.CHANNELS, 50.0)
+        self._active = False
+        self._clock_t = time.perf_counter()
+        self._frame_dt = 0.0
+        self._last_data_t = 0.0
+        self._gap_peak = 0.0
+        self._latency = 0.1
+        self._work = 0.0
+        self._pix_per_pt = 1.0
+        self._stats_next = 0.0
+        self._fps = 0.0
+        self._fps_count = 0
+        self._fps_t = time.perf_counter()
+        self._error_next = 0.0
+
         self._build()
-        self.after(40, self._tick)
+        self.after(1, self._frame)
         self.protocol("WM_DELETE_WINDOW", self._close)
 
     # ---------------------------------------------------------------- UI --
@@ -311,7 +411,7 @@ class App(tk.Tk):
 
         self.window_var = tk.StringVar(value="5")
         self._combo_row(f, "time window", self.window_var,
-                        ["1", "2", "3", "5", "10"], self._set_window, "s")
+                        ["1", "2", "3", "5", "10"], None, "s")
 
         self.perch_var = tk.BooleanVar(value=True)
         self._check(f, "Scale each channel separately", self.perch_var, None)
@@ -382,8 +482,7 @@ class App(tk.Tk):
 
     def _toggle_stream(self) -> None:
         if self.btn_stream["text"].startswith("Start"):
-            for t in self.traces:
-                t.clear()
+            self._reset_traces()
             self.samples = 0
             self.frames = 0
             self.last_seq = None
@@ -396,17 +495,40 @@ class App(tk.Tk):
             self._send(link.CMD_STREAM_STOP)
             self.btn_stream.config(text="Start streaming")
 
-    def _trace_depth(self) -> int:
-        return max(2, int(float(self.window_var.get()) * self.rate))
+    def _reset_traces(self) -> None:
+        """
+        Processed samples for the plot, in a ring. Sample n of the stream
+        lives at n % cap, so the display addresses samples by their number
+        in the stream and can scroll smoothly between them.
+        """
+        self.cap = int((MAX_WINDOW_SECONDS + 1.0) * self.rate)
+        self.ring = np.zeros((link.CHANNELS, self.cap))
+        self.n_total = 0
+        self.disp = 0.0
 
-    def _resize_traces(self, keep: bool = True) -> None:
-        depth = self._trace_depth()
-        self.traces = [
-            collections.deque(list(t)[-depth:] if keep else [], maxlen=depth)
-            for t in self.traces]
+    def _ring_write(self, block: np.ndarray) -> None:
+        """block is (channels, samples)."""
+        n = block.shape[1]
+        if n >= self.cap:
+            self.n_total += n - self.cap
+            block = block[:, n - self.cap:]
+            n = self.cap
 
-    def _set_window(self) -> None:
-        self._resize_traces(keep=True)
+        i = self.n_total % self.cap
+        first = min(n, self.cap - i)
+        self.ring[:, i:i + first] = block[:, :first]
+        if first < n:
+            self.ring[:, :n - first] = block[:, first:]
+        self.n_total += n
+
+    def _ring_read(self, a: int, b: int) -> np.ndarray:
+        """Samples a to b-1 of the stream, as (channels, b - a)."""
+        n = b - a
+        i = a % self.cap
+        if i + n <= self.cap:
+            return self.ring[:, i:i + n]
+        return np.concatenate(
+            (self.ring[:, i:], self.ring[:, :n - (self.cap - i)]), axis=1)
 
     def _set_rate(self) -> None:
         """
@@ -424,7 +546,7 @@ class App(tk.Tk):
         self.rate = int(self.rate_var.get())
         self.chain.set_rate(self.rate)
         self.chain.reset()
-        self._resize_traces(keep=False)
+        self._reset_traces()
         self.last_seq = None
         self.samples = 0
         self.frames = 0
@@ -459,7 +581,7 @@ class App(tk.Tk):
         self.btn_stream.config(text="Start streaming")
         self._was_connected = False
         self.chain.reset()
-        self._resize_traces(keep=False)
+        self._reset_traces()
         self.last_seq = None
         self.status.config(text="link reset - press Connect", fg="#ffd866")
 
@@ -542,53 +664,115 @@ class App(tk.Tk):
 
     # -------------------------------------------------------------- loop --
 
-    def _tick(self) -> None:
-        if self.link:
-            # Ask what the device is actually set to the moment the link comes
-            # up, not on a timer: a Bluetooth scan takes longer than any fixed
-            # delay worth waiting, and a request sent early is simply lost.
-            if self.link.connected and not self._was_connected:
-                self._was_connected = True
-                self._send(link.CMD_GET_CONFIG)
-            elif not self.link.connected:
-                self._was_connected = False
+    def _frame(self) -> None:
+        """
+        One redraw. While samples are arriving this runs once per screen
+        refresh; with nothing arriving it idles at 20 a second.
+        """
+        now = time.perf_counter()
+        self._active = now - self._last_data_t < 0.6
 
-            while True:
-                try:
-                    msg = self.link.status.get_nowait()
-                except queue.Empty:
-                    break
-                colour = "#ff6b6b" if "fail" in msg or "not found" in msg \
-                    else "#5ed18b"
-                self.status.config(text=msg, fg=colour)
+        try:
+            if self._active:
+                self.pacer.wait_for_refresh()
+                now = time.perf_counter()
 
-            block_raw = []
-            while True:
-                try:
-                    f = self.link.frames.get_nowait()
-                except queue.Empty:
-                    break
+            self._pump(now)
+            self._render(now)
+            self.update_idletasks()
+            self.pacer.flush()
 
-                if f.type == link.TYPE_DATA:
-                    got = link.decode_data(f.payload)
-                    if got is None:
-                        continue
-                    ts, seq, enc, vals = got
-                    self.frames += 1
+            if self._active:
+                self._adapt_detail(time.perf_counter() - now)
+        except Exception:  # noqa: BLE001 - one bad frame must not stop the plot
+            if now >= self._error_next:
+                self._error_next = now + 2.0
+                traceback.print_exc()
+        finally:
+            # 0, not 1: a 1 ms timer really waits 1-2 ms, a fifth of a 144 Hz
+            # frame, and frames were missing their refresh for it. Tk still
+            # handles pending input between frames, and the wait for the
+            # refresh is at the top of the next one.
+            self.after(0 if self._active else 50, self._frame)
 
-                    if self.last_seq is not None and seq != self.last_seq:
-                        self.gaps += 1
-                    self.last_seq = seq + len(vals)
+    def _adapt_detail(self, work: float) -> None:
+        """
+        Trade plotted points for time when frames get close to a refresh.
 
-                    block_raw.append((ts, seq, vals))
-                elif f.type == link.TYPE_RSP:
-                    self._on_response(bytes(f.payload))
+        A frame that overruns misses its refresh and the previous one shows
+        twice - the stutter all of this exists to remove. A wide window on a
+        big screen costs more, so detail backs off until frames fit, and
+        comes back when they do.
+        """
+        self._work = 0.9 * self._work + 0.1 * work
+        period = 1.0 / self.pacer.hz
+        if self._work > 0.8 * period:
+            self._pix_per_pt = min(4.0, self._pix_per_pt * 1.1)
+        elif self._work < 0.6 * period:
+            self._pix_per_pt = max(1.0, self._pix_per_pt / 1.02)
 
-            if block_raw:
-                self._consume(block_raw)
+    def _pump(self, now: float) -> None:
+        """Take whatever the link has delivered since the last frame."""
+        if not self.link:
+            return
 
-        self._draw()
-        self.after(40, self._tick)
+        # Ask what the device is actually set to the moment the link comes
+        # up, not on a timer: a Bluetooth scan takes longer than any fixed
+        # delay worth waiting, and a request sent early is simply lost.
+        if self.link.connected and not self._was_connected:
+            self._was_connected = True
+            self._send(link.CMD_GET_CONFIG)
+        elif not self.link.connected:
+            self._was_connected = False
+
+        while True:
+            try:
+                msg = self.link.status.get_nowait()
+            except queue.Empty:
+                break
+            colour = "#ff6b6b" if "fail" in msg or "not found" in msg \
+                else "#5ed18b"
+            self.status.config(text=msg, fg=colour)
+
+        block_raw = []
+        while True:
+            try:
+                f = self.link.frames.get_nowait()
+            except queue.Empty:
+                break
+
+            if f.type == link.TYPE_DATA:
+                got = link.decode_data(f.payload)
+                if got is None:
+                    continue
+                ts, seq, enc, vals = got
+                self.frames += 1
+
+                if self.last_seq is not None and seq != self.last_seq:
+                    self.gaps += 1
+                self.last_seq = seq + len(vals)
+
+                block_raw.append((ts, seq, vals))
+            elif f.type == link.TYPE_RSP:
+                self._on_response(bytes(f.payload))
+
+        if block_raw:
+            self._consume(block_raw)
+            self._note_arrival(now)
+
+    def _note_arrival(self, now: float) -> None:
+        """
+        Trail the newest sample by a little more than the longest recent gap
+        between deliveries. Less, and the trace stalls waiting for the next
+        burst; more, and it lags for nothing.
+        """
+        if self._last_data_t:
+            gap = now - self._last_data_t
+            if gap < 1.0:  # a pause in streaming is not link jitter
+                self._gap_peak = max(gap, self._gap_peak * math.exp(-gap / 3.0))
+                self._latency = min(LATENCY_MAX_S, max(
+                    LATENCY_MIN_S, self._gap_peak * 1.5 + 1.0 / self.pacer.hz))
+        self._last_data_t = now
 
     def _on_response(self, p: bytes) -> None:
         if len(p) < 2 or p[0] != link.CMD_GET_CONFIG or p[1] != 0:
@@ -599,7 +783,9 @@ class App(tk.Tk):
         sps = p[4] | (p[5] << 8)
         if sps in (250, 500, 1000):
             self.rate_var.set(str(sps))
-            self.rate = sps
+            if sps != self.rate:
+                self.rate = sps
+                self._reset_traces()
             self.chain.set_rate(sps)
 
         enc = p[3]
@@ -669,101 +855,241 @@ class App(tk.Tk):
                     self.chain.reset()
 
         out = self.chain.process(uv)
-
-        for ch in range(link.CHANNELS):
-            self.traces[ch].extend(out[:, ch])
+        self._ring_write(out.T)
 
     # -------------------------------------------------------------- draw --
 
-    def _span_for(self, ch: int, shown) -> float:
+    def _cfg(self, item: int, **kw) -> None:
+        """itemconfigure, skipped when nothing changed - Tk redraws either way."""
+        key = tuple(sorted(kw.items()))
+        if self._item_cfg.get(item) != key:
+            self._item_cfg[item] = key
+            self.canvas.itemconfigure(item, **kw)
+
+    def _render(self, now: float) -> None:
+        c = self.canvas
+        self._advance_clock(now)
+        self._update_stats(now)
+
+        w, h = c.winfo_width(), c.winfo_height()
+        shown = [i for i in range(link.CHANNELS) if self.enabled[i].get()]
+        if w < 60 or h < 60 or not shown:
+            if self._lay is not None:
+                c.delete("all")
+                self._lay = None
+            return
+
+        window = float(self.window_var.get())
+        key = (w, h, tuple(shown), window)
+        if self._lay is None or self._lay["key"] != key:
+            self._lay = self._layout(key)
+        lay = self._lay
+
+        self._draw_traces(lay, window)
+
+        settled = (time.time() - self.started_at) > self.chain.settling_seconds
+        self._cfg(lay["settle"], text=(
+            f"filters settling ({self.chain.settling_seconds:.0f} s)"
+            if not settled and self.samples else ""))
+
+        n_rail = sum(1 for ch in shown if self.saturated[ch])
+        if n_rail:
+            # Full-scale differential input is VREF/gain, so 187.5 mV at
+            # gain 24. An electrode that is not touching skin floats well
+            # past that, which is the usual reason a channel rails.
+            fs_mv = 4500.0 / max(1, self.gain)
+            text = (f"{n_rail} channel(s) at full scale "
+                    f"(+/-{fs_mv:.0f} mV) - electrode not connected, "
+                    f"or contact lost")
+        else:
+            text = ""
+        self._cfg(lay["rail"], text=text)
+
+    def _layout(self, key) -> dict:
         """
-        Vertical range for one lane.
+        Make the canvas items for one size and channel selection.
+
+        Items are made once and then moved. Deleting and recreating every
+        line and label each frame cost more than the whole redraw does now.
+        """
+        w, h, shown, window = key
+        c = self.canvas
+        c.delete("all")
+        self._item_cfg.clear()
+
+        left = 118
+        plot_w = w - left - 24
+        lane = h / len(shown)
+
+        # A grid line a second, drawn first so the traces sit on top of it.
+        for sec in range(1, int(window) + 1):
+            x = left + plot_w * (sec / window)
+            c.create_line(x, 0, x, h, fill="#171a21")
+
+        bases, subs, traces = [], [], []
+        for row, ch in enumerate(shown):
+            base = lane * (row + 0.5)
+            bases.append(base)
+            c.create_line(left, base, w - 24, base, fill="#1c2029")
+            c.create_text(left - 10, base - 7, anchor="e", fill=COLORS[ch],
+                          text=f"CH{ch + 1} {SITES[ch]}",
+                          font=("Consolas", 10, "bold"))
+            subs.append(c.create_text(left - 10, base + 8, anchor="e",
+                                      fill=DIM, text="",
+                                      font=("Consolas", 8)))
+            traces.append(c.create_line(0, 0, 0, 0, fill=COLORS[ch],
+                                        width=1))
+
+        c.create_text(w - 26, h - 10, anchor="e", fill=DIM,
+                      font=("Consolas", 8), text=f"{window:.0f} s window")
+
+        return {
+            "key": key, "left": left, "plot_w": plot_w, "lane": lane,
+            "rows": list(shown), "bases": np.array(bases), "subs": subs,
+            "traces": traces,
+            "settle": c.create_text(w // 2, 16, fill="#ffd866",
+                                    font=("Segoe UI", 10), text=""),
+            "rail": c.create_text(w // 2, h - 26, fill="#ff6b6b",
+                                  font=("Segoe UI", 11, "bold"), text=""),
+        }
+
+    def _advance_clock(self, now: float) -> None:
+        """
+        Move the right edge of the plot through the stream.
+
+        It runs at the sample rate and aims to sit `_latency` behind the
+        newest sample, pulled there gently: a burst arriving changes its
+        speed by a few percent instead of making the trace jump. It never
+        runs past the last sample.
+        """
+        dt = min(0.25, max(0.0, now - self._clock_t))
+        self._clock_t = now
+        self._frame_dt = dt
+
+        if self.n_total == 0:
+            self.disp = 0.0
+            return
+
+        target = self.n_total - self._latency * self.rate
+        self.disp += dt * self.rate
+        err = target - self.disp
+        if abs(err) > 0.5 * self.rate:
+            self.disp = target  # starting, or recovering from a stall
+        else:
+            self.disp += err * min(1.0, dt * 3.0)
+        self.disp = max(0.0, min(self.disp, float(self.n_total)))
+
+    def _draw_traces(self, lay: dict, window: float) -> None:
+        """
+        Put the visible stretch of the stream on the canvas.
+
+        Never much more than a point per pixel. Past that, each bin of
+        samples is drawn as its minimum and maximum, which shows the same
+        picture - spikes included - for a fraction of the work. Bins are
+        pinned to sample numbers rather than to screen columns, so a
+        scrolling trace does not shimmer as samples cross column edges.
+        """
+        c = self.canvas
+        rows = lay["rows"]
+        left, plot_w = lay["left"], lay["plot_w"]
+
+        n_win = max(2, int(round(window * self.rate)))
+        start = self.disp - n_win
+        first = max(0, self.n_total - self.cap, math.ceil(start))
+        end = min(self.n_total, math.floor(self.disp) + 1)
+        pxps = plot_w / n_win
+        budget = max(50, int(plot_w / self._pix_per_pt))
+
+        vals = xs = None
+        if end - first >= 2 and n_win <= budget:
+            vals = self._ring_read(first, end)[rows]
+            xs = left + (np.arange(first, end) - start) * pxps
+        elif end - first >= 2:
+            b = math.ceil(2.0 * n_win / budget)
+            k0, k1 = -(-first // b), end // b
+            if k1 > k0:
+                seg = self._ring_read(k0 * b, k1 * b)[rows]
+                seg = seg.reshape(len(rows), k1 - k0, b)
+                lo, hi = seg.min(axis=2), seg.max(axis=2)
+                lo_first = seg.argmin(axis=2) <= seg.argmax(axis=2)
+                vals = np.empty((len(rows), 2 * (k1 - k0)))
+                vals[:, 0::2] = np.where(lo_first, lo, hi)
+                vals[:, 1::2] = np.where(lo_first, hi, lo)
+                xk = left + (np.arange(k0, k1) * b - start) * pxps
+                xs = np.empty(2 * (k1 - k0))
+                xs[0::2] = xk
+                xs[1::2] = xk + (b - 1) * pxps
+
+        spans = self._spans(rows, vals)
+
+        if vals is None:
+            for item in lay["traces"]:
+                c.coords(item, 0, 0, 0, 0)
+        else:
+            k = (lay["lane"] * 0.42) / spans
+            ys = (lay["bases"][:, None]
+                  - np.clip(vals, -spans[:, None], spans[:, None]) * k[:, None])
+            pts = np.empty((len(rows), 2 * xs.size))
+            pts[:, 0::2] = xs
+            pts[:, 1::2] = ys
+            # Straight to Tcl, the coordinates as one list: tkinter's coords()
+            # flattens and copies every argument first.
+            call, name = c.tk.call, c._w
+            for r, item in enumerate(lay["traces"]):
+                call(name, "coords", item, pts[r].tolist())
+
+        for r, ch in enumerate(rows):
+            if self.saturated[ch]:
+                self._cfg(lay["subs"][r], text="RAILED", fill="#ff6b6b",
+                          font=("Consolas", 8, "bold"))
+                self._cfg(lay["traces"][r], fill="#4a3038")
+            else:
+                self._cfg(lay["subs"][r], text=f"+/-{spans[r]:,.0f}uV",
+                          fill=DIM, font=("Consolas", 8))
+                self._cfg(lay["traces"][r], fill=COLORS[ch])
+
+    def _spans(self, rows: list[int], vals) -> np.ndarray:
+        """
+        Vertical range for each lane.
 
         Per-channel by default. A shared range is useless the moment one
         electrode is off: that channel sits at 187 500 uV, and a range large
         enough to contain it draws every real trace as a flat line - which
         looks exactly like a device that is not working.
+
+        In auto a range grows at once and shrinks over a second or so, so a
+        blink scrolling out of view does not snap its lane to a new scale.
         """
         pick = self.scale_var.get()
-
         if pick != "auto":
-            return float(pick)
+            return np.full(len(rows), float(pick))
 
-        if self.perch_var.get():
-            source = [ch]
-        else:
-            source = shown
+        current = self._span[rows]
+        if vals is None or vals.shape[1] == 0:
+            return current
 
-        peak = 0.0
-        for i in source:
-            t = self.traces[i]
-            if t:
-                peak = max(peak, max(abs(v) for v in t))
+        peak = np.max(np.abs(vals), axis=1)
+        if not self.perch_var.get():
+            peak[:] = peak.max()
+        target = np.maximum(5.0, peak * 1.15)
 
-        return max(5.0, peak * 1.15)
+        shrink = min(1.0, self._frame_dt * 2.0)
+        span = np.where(target > current, target,
+                        current + (target - current) * shrink)
+        self._span[rows] = span
+        return span
 
-    def _draw(self) -> None:
-        c = self.canvas
-        c.delete("all")
-        w, h = c.winfo_width(), c.winfo_height()
-        if w < 60 or h < 60:
+    def _update_stats(self, now: float) -> None:
+        """Text that would change faster than it can be read: 5 times a second."""
+        self._fps_count += 1
+        if now - self._fps_t >= 1.0:
+            self._fps = self._fps_count / (now - self._fps_t)
+            self._fps_count = 0
+            self._fps_t = now
+
+        if now < self._stats_next:
             return
-
-        shown = [i for i in range(link.CHANNELS) if self.enabled[i].get()]
-        if not shown:
-            return
-
-        left = 118
-        plot_w = w - left - 24
-        lane = h / len(shown)
-        window = float(self.window_var.get())
-
-        settled = (time.time() - self.started_at) > self.chain.settling_seconds
-
-        for row, ch in enumerate(shown):
-            base = lane * (row + 0.5)
-            span = self._span_for(ch, shown)
-
-            c.create_line(left, base, w - 24, base, fill="#1c2029")
-
-            # Lane label, plus what this lane is actually showing.
-            c.create_text(left - 10, base - 7, anchor="e", fill=COLORS[ch],
-                          text=f"CH{ch + 1} {SITES[ch]}",
-                          font=("Consolas", 10, "bold"))
-
-            if self.saturated[ch]:
-                c.create_text(left - 10, base + 8, anchor="e", fill="#ff6b6b",
-                              text="RAILED", font=("Consolas", 8, "bold"))
-            else:
-                c.create_text(left - 10, base + 8, anchor="e", fill=DIM,
-                              text=f"+/-{span:,.0f}uV", font=("Consolas", 8))
-
-            t = self.traces[ch]
-            if len(t) < 2:
-                continue
-
-            step = plot_w / (len(t) - 1)
-            k = (lane * 0.42) / span
-
-            pts = []
-            for i, v in enumerate(t):
-                y = base - max(-span, min(span, v)) * k
-                pts.extend((left + i * step, y))
-
-            colour = "#4a3038" if self.saturated[ch] else COLORS[ch]
-            c.create_line(*pts, fill=colour, width=1)
-
-        # Time axis: a grid line a second, so the window is readable.
-        for sec in range(1, int(window) + 1):
-            x = left + plot_w * (sec / window)
-            c.create_line(x, 0, x, h, fill="#171a21")
-        c.create_text(w - 26, h - 10, anchor="e", fill=DIM,
-                      font=("Consolas", 8), text=f"{window:.0f} s window")
-
-        if not settled and self.samples:
-            c.create_text(w // 2, 16, fill="#ffd866", font=("Segoe UI", 10),
-                          text=f"filters settling "
-                               f"({self.chain.settling_seconds:.0f} s)")
+        self._stats_next = now + 0.2
 
         m = self.chain.measured_mains
         if m and self.chain.notch_track:
@@ -774,28 +1100,20 @@ class App(tk.Tk):
         else:
             self.mains_label.config(text="")
 
-        n_rail = sum(1 for ch in shown if self.saturated[ch])
-        if n_rail:
-            # Full-scale differential input is VREF/gain, so 187.5 mV at
-            # gain 24. An electrode that is not touching skin floats well
-            # past that, which is the usual reason a channel rails.
-            fs_mv = 4500.0 / max(1, self.gain)
-            c.create_text(
-                w // 2, h - 26, fill="#ff6b6b", font=("Segoe UI", 11, "bold"),
-                text=f"{n_rail} channel(s) at full scale "
-                     f"(+/-{fs_mv:.0f} mV) - electrode not connected, "
-                     f"or contact lost")
-
         el = max(1e-3, time.time() - self.started_at)
         rec = f"  rec {self.rec_rows}" if self.recorder else ""
         bad = self.link.bad_frames if self.link else 0
         dc = " ".join(f"{v:+.0f}" for v in self.dc_mv)
-        self.stats.config(
-            text=(f"{self.samples} samples  {self.samples / el:6.1f} SPS"
-                  + chr(10) +
-                  f"{self.frames} frames  {bad} bad  {self.gaps} gaps{rec}"
-                  + chr(10) +
-                  f"DC mV: {dc}"))
+        if self._active:
+            display = (f"plot {self._fps:5.1f} fps on {self.pacer.hz:.0f} Hz, "
+                       f"{self._latency * 1000:.0f} ms behind")
+        else:
+            display = "plot idle - no data arriving"
+        self.stats.config(text="\n".join([
+            f"{self.samples} samples  {self.samples / el:6.1f} SPS",
+            f"{self.frames} frames  {bad} bad  {self.gaps} gaps{rec}",
+            f"DC mV: {dc}",
+            display]))
 
     def _close(self) -> None:
         if self.recorder is not None:
@@ -806,6 +1124,7 @@ class App(tk.Tk):
             except Exception:  # noqa: BLE001
                 pass
             self.link.close()
+        self.pacer.close()
         self.after(200, self.destroy)
 
 

@@ -1,6 +1,7 @@
 #include "imu.h"
 
 #include <errno.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <zephyr/devicetree.h>
@@ -37,6 +38,7 @@ LOG_MODULE_REGISTER(imu, CONFIG_LOG_DEFAULT_LEVEL);
 #define REG_CTRL8         0x17 /* accel full scale [1:0] */
 #define REG_FIFO_STATUS1  0x1B /* unread words, bits 7:0 */
 #define REG_FIFO_STATUS2  0x1C /* bit 0: unread words bit 8; bit 3: overrun */
+#define REG_INTERNAL_FREQ 0x4F /* the sensor's clock error, 0.13 % a count */
 #define REG_FIFO_DATA_TAG 0x78 /* tag byte, then six data bytes */
 
 #define WHO_AM_I_VALUE           0x70
@@ -106,9 +108,9 @@ static struct imu_stats stats;
 
 /* Timing state, owned by the IMU thread. */
 static uint8_t  batch;        /* samples per watermark */
-static uint32_t last_capture; /* capture register at the last edge used */
+static uint32_t last_capture; /* capture register when the last read ended */
 static bool     have_edge;
-static uint64_t edge_us;      /* time of the last watermark edge */
+static uint64_t edge_us;      /* time of the last trusted watermark edge */
 static uint64_t edge_index;   /* sample index that edge belongs to */
 static uint32_t edges;        /* period measurements so far */
 static uint64_t period_q8;    /* sample period in use, 1/256 us */
@@ -120,6 +122,7 @@ struct motion {
 	int16_t v[6]; /* accel x y z, gyro x y z */
 };
 
+static uint8_t fifo_buf[DRAIN_WORDS_MAX * WORD_BYTES];
 static struct motion samples[DRAIN_WORDS_MAX / 2];
 static uint8_t payload[HDR_LEN + FRAME_SAMPLES_MAX * SAMPLE_BYTES];
 static uint8_t frame[PROTO_OVERHEAD + sizeof(payload)];
@@ -362,11 +365,24 @@ static int drain(void)
 	}
 
 	/*
-	 * The edge was latched when the watermark word went in, which was
-	 * before the status read above could see it.
+	 * The edge for this batch was latched when the watermark word went in,
+	 * which was before the status read above could count it.
 	 */
 	const uint32_t capture = timebase_imu_capture_get();
 	const uint64_t polled_us = timebase_now_us();
+
+	/*
+	 * Every word in one transfer; the address wraps from the last data
+	 * byte back to the tag. Read word by word, a 480 Hz batch took long
+	 * enough for new words to push the FIFO back over the watermark while
+	 * it was still being emptied - and that edge was then taken for the
+	 * next batch's own, putting samples up to 25 ms out.
+	 */
+	if (reg_read(REG_FIFO_DATA_TAG, fifo_buf, (size_t)words * WORD_BYTES) != 0) {
+		return -EIO;
+	}
+
+	const uint32_t after = timebase_imu_capture_get();
 
 	uint16_t n = 0;
 	int edge_sample = -1;
@@ -379,12 +395,7 @@ static int drain(void)
 	int16_t gyr[3] = { 0 };
 
 	for (uint16_t w = 0; w < words; w++) {
-		uint8_t word[WORD_BYTES];
-
-		if (reg_read(REG_FIFO_DATA_TAG, word, sizeof(word)) != 0) {
-			return -EIO;
-		}
-
+		const uint8_t *word = &fifo_buf[w * WORD_BYTES];
 		const uint8_t tag = (uint8_t)(word[0] >> 3);
 		const uint8_t cnt = (uint8_t)((word[0] >> 1) & 0x03);
 		int16_t xyz[3];
@@ -428,33 +439,42 @@ static int drain(void)
 		have_g = false;
 	}
 
-	if (n == 0) {
-		return 0;
-	}
-
 	uint8_t flags = next_flags;
-	uint64_t anchor_us;
+	uint64_t first_us;
 
 	next_flags = 0;
 
 	if (capture != last_capture && edge_sample >= 0) {
-		last_capture = capture;
-		anchor_us = timebase_stamp_past_us(capture);
-		learn_period(anchor_us, (uint64_t)seq + (uint64_t)edge_sample);
-	} else {
+		/* An edge of this batch's own: anchor on it. */
+		const uint64_t at_us = timebase_stamp_past_us(capture);
+
+		learn_period(at_us, (uint64_t)seq + (uint64_t)edge_sample);
+		first_us = at_us - (((uint64_t)edge_sample * period_q8) >> 8);
+	} else if (have_edge) {
 		/*
-		 * No new edge - INT2 not reaching the timer. Fall back on the
-		 * poll: the newest sample is at most one poll old.
+		 * No edge to call its own - lost to a late poll, say. Carry on
+		 * from the last one at the measured period, which by now is
+		 * known far better than a poll time could be.
 		 */
-		last_capture = capture;
-		edge_sample = (int)n - 1;
-		anchor_us = polled_us;
+		first_us = edge_us + (((uint64_t)seq - edge_index) * period_q8 >> 8);
+		stats.extrapolated++;
+	} else {
+		/* Nothing to go on yet: the newest sample is at most a poll old. */
+		first_us = polled_us - ((uint64_t)(n ? n - 1 : 0) * period_q8 >> 8);
 		flags |= IMU_FLAG_TIME_ESTIMATED;
 		stats.estimated++;
 	}
 
-	const uint64_t first_us =
-		anchor_us - (((uint64_t)edge_sample * period_q8) >> 8);
+	/*
+	 * An edge that landed while the words were being read cannot be
+	 * placed: it may belong to one of them. Consume it, so the next batch
+	 * does not take it for its own watermark.
+	 */
+	last_capture = after;
+
+	if (n == 0) {
+		return 0;
+	}
 
 	if (stream_enabled()) {
 		for (uint16_t off = 0; off < n; off = (uint16_t)(off + FRAME_SAMPLES_MAX)) {
@@ -567,6 +587,21 @@ int imu_init(void)
 	if (err) {
 		LOG_ERR("IMU setup failed (%d)", err);
 		return -EIO;
+	}
+
+	/*
+	 * The sensor's own estimate of its clock error. Logged so the period
+	 * measured against TIMER1 has something independent to be checked
+	 * against.
+	 */
+	uint8_t freq = 0;
+
+	if (reg_read(REG_INTERNAL_FREQ, &freq, 1) == 0) {
+		const int hundredths = (int)(int8_t)freq * 13;
+
+		LOG_INF("IMU clock %s%d.%02d %% from nominal, by its own estimate",
+			(hundredths < 0) ? "-" : "+", abs(hundredths) / 100,
+			abs(hundredths) % 100);
 	}
 
 	err = capture_edge_init(NRF_GPIO_PIN_MAP(INT2_PORT, INT2_PIN), true,

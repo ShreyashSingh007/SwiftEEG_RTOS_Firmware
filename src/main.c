@@ -298,9 +298,9 @@ static void report_health(void)
 
 		/* The period in microseconds, to three decimals. */
 		LOG_INF("imu: %u samples, %u frames, %u overruns, %u unpaired, "
-			"%u timed by poll; period %u.%03u us",
+			"%u extrapolated, %u timed by poll; period %u.%03u us",
 			is.samples, is.frames, is.overruns, is.unpaired,
-			is.estimated, is.period_us_q8 >> 8,
+			is.extrapolated, is.estimated, is.period_us_q8 >> 8,
 			((is.period_us_q8 & 0xFFu) * 1000u) >> 8);
 	}
 }

@@ -38,7 +38,8 @@ struct imu_stats {
 	uint32_t frames;       /* handed to a link */
 	uint32_t overruns;     /* times the sensor FIFO overflowed */
 	uint32_t unpaired;     /* FIFO words without a partner, dropped */
-	uint32_t estimated;    /* batches timed without a watermark edge */
+	uint32_t extrapolated; /* batches placed from an earlier edge */
+	uint32_t estimated;    /* batches timed from the poll, no edge yet */
 	uint32_t period_us_q8; /* measured sample period, 1/256 us */
 };
 

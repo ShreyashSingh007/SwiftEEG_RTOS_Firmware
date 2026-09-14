@@ -1,5 +1,6 @@
 #include "command.h"
 
+#include <errno.h>
 #include <string.h>
 
 #include <zephyr/kernel.h>
@@ -7,6 +8,7 @@
 #include <zephyr/logging/log.h>
 
 #include "afe/ads1299.h"
+#include "dsp/dsp.h"
 #include "imu/imu.h"
 #include "pipeline/pipeline.h"
 #include "proto/proto.h"
@@ -16,7 +18,12 @@
 
 LOG_MODULE_REGISTER(command, CONFIG_LOG_DEFAULT_LEVEL);
 
-#define CMD_STACK_SIZE 1536
+/*
+ * Immediate-mode logging formats on the calling thread's stack, and a filter
+ * upload decodes its sections there too. The Bluetooth receive thread
+ * overflowed on less; this one is given room.
+ */
+#define CMD_STACK_SIZE 3072
 #define CMD_PRIORITY   6 /* below the DSP thread: commands can wait */
 
 /*
@@ -25,6 +32,9 @@ LOG_MODULE_REGISTER(command, CONFIG_LOG_DEFAULT_LEVEL);
  * poll. The timeout is only a backstop in case a wake-up is ever missed.
  */
 #define CMD_IDLE_MS 200
+
+/* One section on the wire: g, k, m0, m1, m2, little-endian float32 each. */
+#define SECTION_BYTES 20u
 
 static struct k_sem cmd_ready;
 
@@ -37,9 +47,10 @@ static proto_stream_t ble_stream;  /* BLE, separate so a partial frame on
 
 /*
  * Bytes handed over by the Bluetooth thread, drained by the command thread.
- * Commands are small and infrequent; this only has to absorb a burst.
+ * A filter upload is up to 176 bytes, one per stage, and the Bluetooth thread
+ * can deliver both before this thread next runs - so this holds several.
  */
-#define BLE_RX_BYTES 256
+#define BLE_RX_BYTES 1024
 static uint8_t ble_rx_storage[BLE_RX_BYTES];
 static struct ring_buf ble_rx_rb;
 static uint8_t rsp_buf[64];
@@ -51,6 +62,79 @@ static uint16_t rsp_seq;
  * and cannot tell that from a command that was ignored.
  */
 static bool reply_via_ble;
+
+static inline uint16_t get_u16(const uint8_t *p)
+{
+	return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+}
+
+static inline uint32_t get_u32(const uint8_t *p)
+{
+	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+	       ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static inline void put_u16(uint8_t *p, uint16_t v)
+{
+	p[0] = (uint8_t)(v & 0xFFu);
+	p[1] = (uint8_t)(v >> 8);
+}
+
+static inline void put_u32(uint8_t *p, uint32_t v)
+{
+	p[0] = (uint8_t)(v & 0xFFu);
+	p[1] = (uint8_t)((v >> 8) & 0xFFu);
+	p[2] = (uint8_t)((v >> 16) & 0xFFu);
+	p[3] = (uint8_t)((v >> 24) & 0xFFu);
+}
+
+static inline float get_f32(const uint8_t *p)
+{
+	const uint32_t bits = get_u32(p);
+	float v;
+
+	memcpy(&v, &bits, sizeof(v));
+	return v;
+}
+
+static dsp_section_t get_section(const uint8_t *p)
+{
+	return (dsp_section_t){
+		.g = get_f32(&p[0]),
+		.k = get_f32(&p[4]),
+		.m0 = get_f32(&p[8]),
+		.m1 = get_f32(&p[12]),
+		.m2 = get_f32(&p[16]),
+	};
+}
+
+static void put_section(uint8_t *p, const dsp_section_t *s)
+{
+	const float v[5] = { s->g, s->k, s->m0, s->m1, s->m2 };
+
+	for (size_t i = 0; i < 5; i++) {
+		uint32_t bits;
+
+		memcpy(&bits, &v[i], sizeof(bits));
+		put_u32(&p[4 * i], bits);
+	}
+}
+
+/*
+ * CRC of a stage's sections in their wire form. Reported with the
+ * configuration so a host can tell whether the device still holds exactly
+ * what it sent - after a reconnect, say - without reading every value back.
+ */
+static uint16_t sections_crc(const dsp_section_t *sections, uint8_t count)
+{
+	uint8_t buf[DSP_MAX_SECTIONS * SECTION_BYTES];
+
+	for (uint8_t i = 0; i < count; i++) {
+		put_section(&buf[(size_t)i * SECTION_BYTES], &sections[i]);
+	}
+
+	return proto_crc16(buf, (size_t)count * SECTION_BYTES);
+}
 
 static void respond(uint8_t opcode, uint8_t status, const uint8_t *extra,
 		    size_t extra_len)
@@ -81,6 +165,88 @@ static void respond(uint8_t opcode, uint8_t status, const uint8_t *extra,
 	}
 }
 
+/* An OK that says from which sample a filter change applies. */
+static void respond_seq(uint8_t opcode, uint32_t seq)
+{
+	uint8_t extra[4];
+
+	put_u32(extra, seq);
+	respond(opcode, CMD_OK, extra, sizeof(extra));
+}
+
+static uint8_t status_for(int err)
+{
+	if (err == 0) {
+		return CMD_OK;
+	}
+	return (err == -EINVAL) ? CMD_EBADARG : CMD_EFAILED;
+}
+
+/*
+ * After anything that can change a gain. The chain scales each channel by
+ * its own gain, and a stale one makes every microvolt it reports wrong by
+ * the ratio of the two.
+ */
+static uint8_t sync_gains(uint8_t status)
+{
+	if (status == CMD_OK && pipeline_sync_gains() != 0) {
+		LOG_WRN("a gain changed but the chain could not follow it");
+		return CMD_EFAILED;
+	}
+	return status;
+}
+
+/*
+ * [1] stage, [2] flags (bit 0 keep state), [3..4] the rate the sections were
+ * designed for, [5] count, then count sections of SECTION_BYTES each.
+ */
+static void handle_set_filter(const proto_frame_t *f)
+{
+	const uint8_t op = f->payload[0];
+
+	if (f->len < 6u) {
+		respond(op, CMD_EBADARG, NULL, 0);
+		return;
+	}
+
+	const uint8_t stage = f->payload[1];
+	const bool keep = (f->payload[2] & 0x01u) != 0u;
+	const uint16_t designed_for = get_u16(&f->payload[3]);
+	const uint8_t count = f->payload[5];
+
+	if (stage > PIPELINE_STAGE_POST || count > DSP_MAX_SECTIONS ||
+	    f->len != 6u + SECTION_BYTES * count) {
+		respond(op, CMD_EBADARG, NULL, 0);
+		return;
+	}
+
+	/*
+	 * A section is only the filter it was designed to be at the rate it
+	 * was designed for; run at another rate it quietly moves. That class of
+	 * mistake once put 3390 uV of noise on a quiet channel, so a mismatch
+	 * is refused rather than run.
+	 */
+	if (designed_for != pipeline_rate()) {
+		respond(op, CMD_EBADARG, NULL, 0);
+		return;
+	}
+
+	dsp_section_t sections[DSP_MAX_SECTIONS];
+
+	for (uint8_t i = 0; i < count; i++) {
+		sections[i] = get_section(&f->payload[6u + SECTION_BYTES * i]);
+	}
+
+	uint32_t seq = 0;
+	const int err = pipeline_set_stage(stage, sections, count, keep, &seq);
+
+	if (err == 0) {
+		respond_seq(op, seq);
+	} else {
+		respond(op, status_for(err), NULL, 0);
+	}
+}
+
 static void handle(const proto_frame_t *f)
 {
 	if (f->type != PROTO_TYPE_CMD || f->len < 1) {
@@ -103,7 +269,7 @@ static void handle(const proto_frame_t *f)
 		break;
 
 	case CMD_SET_ENCODING:
-		if (f->len < 2) {
+		if (f->len < 2 || f->payload[1] > STREAM_ENC_RAW_UV) {
 			status = CMD_EBADARG;
 		} else {
 			stream_set_encoding(f->payload[1]);
@@ -128,6 +294,7 @@ static void handle(const proto_frame_t *f)
 			stream_enable(false);
 			status = (ads1299_test_signal(on, freq) == 0)
 					 ? CMD_OK : CMD_EFAILED;
+			status = sync_gains(status);
 			stream_enable(was_streaming);
 		}
 		break;
@@ -157,6 +324,7 @@ static void handle(const proto_frame_t *f)
 			stream_enable(false);
 			status = (ads1299_set_input(mux, freq) == 0)
 					 ? CMD_OK : CMD_EFAILED;
+			status = sync_gains(status);
 			stream_enable(was_streaming);
 		}
 		break;
@@ -167,8 +335,7 @@ static void handle(const proto_frame_t *f)
 			break;
 		}
 
-		const uint16_t sps = (uint16_t)f->payload[1] |
-				     ((uint16_t)f->payload[2] << 8);
+		const uint16_t sps = get_u16(&f->payload[1]);
 
 		/*
 		 * Answer before restarting. The restart tears down the DSP
@@ -192,6 +359,7 @@ static void handle(const proto_frame_t *f)
 						      f->payload[3], pd,
 						      srb2) == 0)
 					 ? CMD_OK : CMD_EFAILED;
+			status = sync_gains(status);
 		}
 		break;
 
@@ -212,8 +380,7 @@ static void handle(const proto_frame_t *f)
 		if (f->len < 2) {
 			status = CMD_EBADARG;
 		} else {
-			status = (pipeline_set_notch(f->payload[1]) == 0)
-					 ? CMD_OK : CMD_EBADARG;
+			status = status_for(pipeline_set_notch(f->payload[1]));
 		}
 		break;
 
@@ -236,11 +403,9 @@ static void handle(const proto_frame_t *f)
 		} else {
 			const struct imu_config cfg = {
 				.enabled = f->payload[1] != 0,
-				.rate_hz = (uint16_t)(f->payload[2] |
-						      (f->payload[3] << 8)),
+				.rate_hz = get_u16(&f->payload[2]),
 				.accel_g = f->payload[4],
-				.gyro_dps = (uint16_t)(f->payload[5] |
-						       (f->payload[6] << 8)),
+				.gyro_dps = get_u16(&f->payload[5]),
 			};
 			const int err = imu_configure(&cfg);
 
@@ -248,6 +413,40 @@ static void handle(const proto_frame_t *f)
 				 : (err == -EINVAL) ? CMD_EBADARG : CMD_EFAILED;
 		}
 		break;
+
+	case CMD_SET_FILTER:
+		handle_set_filter(f);
+		return;
+
+	case CMD_SET_CAR: {
+		if (f->len < 3) {
+			status = CMD_EBADARG;
+			break;
+		}
+
+		uint32_t seq = 0;
+		const int err = pipeline_set_car(f->payload[1] != 0,
+						 f->payload[2], &seq);
+
+		if (err == 0) {
+			respond_seq(op, seq);
+			return;
+		}
+		status = status_for(err);
+		break;
+	}
+
+	case CMD_RESET_CHAIN: {
+		uint32_t seq = 0;
+		const int err = pipeline_reset_chain(&seq);
+
+		if (err == 0) {
+			respond_seq(op, seq);
+			return;
+		}
+		status = status_for(err);
+		break;
+	}
 
 	case CMD_GET_CONFIG: {
 		/*
@@ -258,28 +457,40 @@ static void handle(const proto_frame_t *f)
 		 */
 		uint8_t chset[ADS1299_CHANNELS] = { 0 };
 		struct imu_config imu;
+		struct pipeline_filters filt;
 
 		(void)ads1299_get_channels(chset, ADS1299_CHANNELS);
 		imu_get_config(&imu);
+		pipeline_get_filters(&filt);
 
 		const uint16_t sps = pipeline_rate();
-		uint8_t cfg[19];
+		uint8_t cfg[27];
 
 		cfg[0] = ADS1299_CHANNELS;
 		cfg[1] = stream_encoding();
-		cfg[2] = (uint8_t)(sps & 0xFFu);
-		cfg[3] = (uint8_t)(sps >> 8);
+		put_u16(&cfg[2], sps);
 		cfg[4] = pipeline_notch();
 		memcpy(&cfg[5], chset, sizeof(chset));
 
 		/* Motion sensor: bit 0 on, bit 1 fitted; then rate and ranges. */
 		cfg[13] = (uint8_t)((imu.enabled ? 0x01u : 0u) |
 				    (imu_present() ? 0x02u : 0u));
-		cfg[14] = (uint8_t)(imu.rate_hz & 0xFFu);
-		cfg[15] = (uint8_t)(imu.rate_hz >> 8);
+		put_u16(&cfg[14], imu.rate_hz);
 		cfg[16] = imu.accel_g;
-		cfg[17] = (uint8_t)(imu.gyro_dps & 0xFFu);
-		cfg[18] = (uint8_t)(imu.gyro_dps >> 8);
+		put_u16(&cfg[17], imu.gyro_dps);
+
+		/*
+		 * The chain: sections per stage; flags (bit 0 common average
+		 * on, bit 1 the pre stage is the device's own notch); the
+		 * average's channel mask; a CRC of each stage's sections.
+		 */
+		cfg[19] = filt.pre_count;
+		cfg[20] = filt.post_count;
+		cfg[21] = (uint8_t)((filt.car ? 0x01u : 0u) |
+				    (filt.pre_is_notch ? 0x02u : 0u));
+		cfg[22] = filt.car_mask;
+		put_u16(&cfg[23], sections_crc(filt.pre, filt.pre_count));
+		put_u16(&cfg[25], sections_crc(filt.post, filt.post_count));
 
 		respond(op, CMD_OK, cfg, sizeof(cfg));
 		return;

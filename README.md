@@ -5,8 +5,9 @@ nRF Connect SDK. Designed as a raw BCI tool: full hardware control, on-chip
 DSP, precise timestamps, and a transport-agnostic binary API.
 
 > **Status: M1-M4 done, M5 Windows app working, motion sensor streaming on
-> the EEG's clock. Next: recordings of a moving subject, then motion-artifact
-> cleanup.**
+> the EEG's clock. M6: the app's filter chain runs on the device too, and
+> matches the reference bit for bit on the chip. Motion-artifact recordings
+> wait for an electrode solder fix.**
 >
 > | Check | Result |
 > |---|---|
@@ -20,7 +21,9 @@ DSP, precise timestamps, and a transport-agnostic binary API.
 > | Shorted-input noise | **130-149 nV RMS** (datasheet ~140) |
 > | Test-signal amplitude | **0.17-0.22 % error**, 0.05 % channel spread |
 > | Golden vectors vs reference | worst 3.4 nV over 512 frames x 8 ch |
-> | Unit tests on target | 42/42 |
+> | On-device filter chain vs reference | **0.00 uV** at 250 / 500 / 1000 SPS over BLE, 0 gaps |
+> | Register reads while streaming, 1 kSPS | 60 reads, **0 stale samples** (60 before the fix) |
+> | Unit tests on target | 52/52 |
 >
 > Everything streams and is controllable over Bluetooth: eight EEG channels
 > and six motion axes, on one clock.
@@ -61,7 +64,9 @@ straight over a noisy front end.
 - DRDY drives everything in hardware: one PPI channel timestamps the sample
   and starts its SPI transfer, so the CPU wakes with 27 bytes already in RAM
 - Lock-free ring from the interrupt to a DSP thread; 0 drops up to 1 kSPS
-- Chain: 24-bit decode, integer DC removal, microvolt scaling, mains notch
+- Chain: 24-bit decode, integer DC removal, per-channel microvolt scaling,
+  then two host-programmable stages either side of a common average - the
+  Windows app's whole filter chain can run on the device (M6)
 - Binary protocol, byte-identical over BLE and USB, 6 samples a frame,
   packed 24-bit by default
 - Every device control over either link, answered while streaming: rate
@@ -77,7 +82,7 @@ straight over a noisy front end.
   method needs real recordings of a moving subject to be built against.
 - **Not yet checked on a head:** alpha with eyes closed at Oz/P3/P4. Blinks
   have been seen on the frontal channels.
-- The on-device filter chain is not yet matched to the host chain (M6).
+- Motion cleanup is not on the device - it has to be built first.
 - No impedance measurement - lead-off detection only.
 - No SD card. Last item, may not happen.
 
@@ -164,8 +169,8 @@ Every channel's negative input is tied to **SRB1** internally
 
 | Wire | Goes to | Purpose |
 |---|---|---|
-| **SRB1** | **right mastoid** | the reference every channel is measured against |
-| **BIAS** (BIASOUT) | **left mastoid** | driven right leg - cancels common-mode |
+| **SRB1** | **left mastoid** | the reference every channel is measured against |
+| **BIAS** (BIASOUT) | **right mastoid** | driven right leg - cancels common-mode |
 
 Mastoids are the conventional choice: close to the head, electrically quiet,
 and far enough from the scalp sites to carry little EEG of their own.
@@ -197,7 +202,7 @@ src/afe/                    ADS1299 driver: probe, config, DMA streaming
 src/imu/                    LSM6DSV16X driver: FIFO, INT2 watermark on TIMER1
 src/timebase/               1 MHz TIMER1, 64-bit extension, PPI capture tasks
 src/pipeline/               capture (GPIOTE+PPI), chain (DSP), pipeline (thread)
-src/dsp/                    DC removal, biquads, filter design
+src/dsp/                    DC removal, second-order sections, filter design
 src/sys/                    lock-free SPSC ring
 src/proto/                  binary codec
 src/transport/              USB CDC, BLE, stream batching, command handling
@@ -217,6 +222,7 @@ tools/build.ps1             builds app or any test suite
 tools/flash.ps1             mass-erase, write, verify, reset
 tools/rtt.py                read the log (RTT is the only log path)
 tools/verify.py             hardware acceptance checks, pass/fail
+tools/verify_chain.py       on-device filter chain vs the reference, no electrodes
 tools/swifteeg_app.py       the Windows application (M5)
 tools/swifteeg_link.py      USB and BLE links behind one interface
 tools/eeg_dsp.py            host filter chain
@@ -232,9 +238,9 @@ Tests do not mirror `src/`. The ringbuf suite lives inside `tests/dsp`, and
 
 ```
 tests/proto/                 9 tests
-tests/dsp/                  17 tests  (dsp + ringbuf suites)
+tests/dsp/                  22 tests  (dsp + ringbuf suites)
 tests/timebase/              8 tests
-tests/pipeline/              8 tests  (whole-chain golden vectors)
+tests/pipeline/             13 tests  (whole-chain golden vectors)
 ```
 
 ## 3. Flash map
@@ -436,8 +442,9 @@ set notch      18 ms      set rate       restarts acquisition
 7 of 7 answered.  Streaming through it: 1033 SPS, 0 bad, 0 sequence gaps
 ```
 
-Nothing was dropped while the AFE was reconfigured mid-stream. Three things
-make that true:
+Nothing was dropped while the AFE was reconfigured mid-stream - no sequence
+gaps. Each register access did slip one old sample in, though, unnoticed
+until M6; see the mistakes below. Three things keep the device responsive:
 
 - **Commands never run on a thread that cannot afford to block.** The GATT
   write callback only queues bytes; a low-priority thread does the work.
@@ -480,6 +487,27 @@ central connected. `CONFIG_BT_RX_STACK_SIZE` is now 4096.
 thread's motion frames and the command thread's replies all go into one
 ring buffer that is only safe for a single writer. Writers now take a lock,
 and a frame goes in whole or not at all.
+
+**Every register access during streaming slipped in an old sample.** A
+setting change takes the AFE out of continuous-read mode and back, and the
+DMA was left pointing at the one-byte command buffers. The first frame
+afterwards was read one byte long, and the interrupt passed an old frame on
+as if it were new. Sequence numbers had no gap, so nothing noticed. Measured
+at 1 kSPS with the inputs shorted: 60 register reads, 60 samples identical to
+the one two before. The resume path now points the DMA back at the frame
+buffers - 0 in 60. (`CMD_GET_CONFIG` reads the channel registers, so even
+asking the device its state did this.)
+
+**A register access could wedge the SPI bus.** A DRDY edge just before the
+trigger was gated off had already started a transfer, and the driver changed
+the clock and buffers underneath it. Now and then at 1 kSPS a transfer timed
+out, every transfer after it timed out too, and the next rate change failed
+to restart acquisition - after which the firmware ignored every rate change
+until reset, waiting for a "next start" nothing would request. The driver now
+lets that last transfer finish first, recovers the peripheral if a transfer
+ever sticks, and a failed restart is retried rather than parked. The chain
+also takes channel gains from what the driver wrote, instead of reading them
+back after every change.
 
 ### M5 — Windows application  (built)
 
@@ -639,15 +667,138 @@ Motion frames flow while the stream is enabled, like the EEG's.
 Zephyr's own LSM6DSV16X driver is switched off in `prj.conf`; `src/imu` owns
 the chip.
 
-### M6 — push the validated chain into the firmware
+### M6 — push the validated chain into the firmware  (filters: built)
 
 The settings found in M5, and the motion cleanup, become the device's own,
-which is what the original plan always called for.
+which is what the original plan always called for. The filter half is built;
+the motion half waits for the cleanup to exist.
 
-The mechanism already exists in the design: the DSP chain's last stage is a
-**host-programmable biquad cascade**. The host uploads coefficients; firmware
-runs them. Nothing needs redesigning - the host application becomes the tool
-that designs the coefficients it then uploads.
+**In the app:** *filters (display) - run on: device.* The app sends the chain
+it designed and switches the stream to raw and filtered side by side: the
+plot shows what the device computed, and the recording stays raw. Settings,
+the "in average" ticks and the mains tracking follow onto the device as they
+change, and only a stage that changed is sent, so moving the low-pass does
+not restart the high-pass. If the device refuses anything, the filters go
+back to the PC and the panel says why.
+
+#### The chain on the device
+
+```
+raw counts -> integer DC removal, 0.08 Hz -> microvolts at each channel's gain
+           -> pre sections: high-pass, notch and its harmonic
+           -> common average over the ticked channels
+           -> post sections: low-pass
+```
+
+Up to eight sections a stage. Left alone, the pre stage is the device's own
+50 Hz notch and the post stage is empty, as before.
+
+A filter change lands between two samples, never inside one: the command
+thread hands it to the DSP thread, which applies it at the top of the next
+sample and reports which sample that was. Samples inside a filter's settling
+time carry the protocol's SETTLING flag.
+
+The one intended difference from the PC chain is the DC removal in front,
+which exists for float32 headroom. It is first order at 0.08 Hz, so the two
+differ by 3 % at 0.3 Hz and by under 1 % from 0.6 Hz up.
+
+#### Why the sections are state-variable filters
+
+Measured before anything was built: a fourth-order Butterworth high-pass in
+float32, against the same filter in float64, on 3 mV of drift with EEG on top.
+
+```
+                        transposed direct form II   state-variable (TPT)
+0.1 Hz at  250 SPS      2.0 uV RMS                  0.02 uV RMS
+0.1 Hz at 1000 SPS      13.6 uV RMS, 28 uV peak     0.08 uV RMS
+0.3 Hz at 1000 SPS      0.59 uV RMS                 0.012 uV RMS
+45 Hz low-pass, notch   under 0.004 uV RMS          under 0.001 uV RMS
+```
+
+The direct form - what the audio-EQ cookbook formulas are written for, and
+what the firmware first had - is fine for a notch and unusable for the 0.1 Hz
+drift cut ERP work needs. Its poles sit almost on z = 1, float32 rounds away
+most of its coefficients' precision, and every rounding error in its state is
+amplified by the filter's own gain near DC. A state-variable filter with
+trapezoidal integrators (Zavalishin's topology-preserving transform, in
+Simper's form) keeps its state as integrators of the signal and its
+coefficients as small numbers. It is the same filter: the two forms agree to
+under 1e-6 in float64.
+
+A section is five float32 numbers: `g = tan(pi fc / fs)`, `k = 1/Q`, and how
+the output mixes the input, band-pass and low-pass (`m0 m1 m2`). With `g` and
+`k` positive a section is stable whatever its mix, so the device can check
+what it is sent. Any stable biquad converts: `dsp_ref.from_biquad`.
+
+#### On the wire
+
+`CMD_SET_FILTER` (`0x10`): stage (0 before the average, 1 after), flags (bit 0
+keep state, for a retune in place), the rate the sections were designed for,
+the count, then five float32 per section. Refused if the rate is not the
+running one - a filter designed for one rate is a different filter at
+another - or if a section is invalid.
+
+`CMD_SET_CAR` (`0x11`): enable, channel mask. `CMD_RESET_CHAIN` (`0x12`):
+restart every filter and re-prime the DC removal from the next sample. All
+three answer with the sequence number of the first sample they apply to.
+
+Encoding `3`, raw and filtered: for every channel, three bytes of counts then
+four of microvolts. Three samples a frame, so a frame still fits one
+notification.
+
+`CMD_GET_CONFIG` appends sections per stage; flags (bit 0 average on, bit 1
+the pre stage is the device's notch); the average's mask; and a CRC-16 of
+each stage's sections, so a host can tell whether the device still holds
+what it sent. A rate change drops sections designed for the old rate.
+
+#### Verified
+
+- **Golden vectors.** Both references were rewritten for the sections
+  (`tools/dsp_ref.py`, `tools/pipeline_ref.py`), including the whole host
+  chain with a notch retune, a change of average and a restart partway
+  through. The on-target suites run the firmware's own code against them.
+- **The app against a simulated device** running the reference chain: the
+  plot is the device's output to 0.00 uV, the recording is the raw counts, a
+  low-pass change sends only the post stage, a mains re-aim retunes in place,
+  a rate change re-sends for the new rate, and a refusal falls back to the
+  PC. The older app checks still pass: 144 fps at 250-1000 SPS, bad-channel
+  handling, motion lanes.
+- **On the chip,** over Bluetooth, with `python tools/verify_chain.py`: a
+  chain loaded, restarted at a sample the device reported, and the device's
+  output compared with the reference model run on the raw counts streamed
+  beside it - on the ADS1299's own test signal, channel 2 at gain 12 and
+  channel 7 at gain 6, no electrodes.
+
+  ```
+   250 SPS   3004 samples x 8 ch   worst 0.00 uV   0 gaps   250.3 SPS delivered
+   500 SPS   4004 samples x 8 ch   worst 0.00 uV   0 gaps   500.2 SPS delivered
+  1000 SPS   8136 samples x 8 ch   worst 0.00 uV   0 gaps  1014.7 SPS delivered
+  ```
+
+  Bit for bit. Also checked there: sections for the wrong rate and unstable
+  sections refused; section CRCs read back; the common average moving 1.4 mV
+  of test square wave onto the shorted channels; settling flagged for 787
+  samples against 785 expected. On-target suites: dsp 22/22, with the 0.1 Hz
+  high-pass 0.00 uV from its reference, and pipeline 13/13, with the whole
+  host chain 0.00 uV.
+
+#### Found along the way
+
+- **The notch could not be switched off.** `CMD_SET_NOTCH 0` reported success
+  and left it running, and a rate change after it would have failed to
+  design a 0 Hz notch and stopped acquisition.
+- **Filter changes raced the DSP thread.** The notch was rebuilt from the
+  command thread while samples were being filtered.
+- **Device microvolts ignored channel gains.** The chain scaled every channel
+  for gain 24, whatever it was set to.
+- **The DC corner moved with the rate:** 0.08 Hz at 250 SPS but 0.31 Hz at
+  1000 SPS, inside the range that distorts slow ERP components. It now holds
+  0.08 Hz at every rate.
+- **The device notch was Q 30,** 1.7 Hz wide, aimed at 50.0 Hz against mains
+  measured at 49.6 - about 7 dB of rejection. It is Q 12 now, like the app's.
+- **Register access during streaming** slipped an old sample in each time,
+  and could wedge the SPI bus. Both are older than M6; see *Mistakes worth
+  keeping* under M4.
 
 **Accept:** with the host chain bypassed, on-device output matches what the
 host chain produced from the same raw input, within tolerance.
@@ -665,11 +816,12 @@ transport-agnostic and documented, so any platform can speak it.
 
 Firmware does only what *must* happen on-chip - DC removal for numeric
 headroom, mains notch, anti-alias decimation, IMU artifact removal - and
-exposes everything else as a **host-programmable biquad cascade**. No
+exposes everything else as **host-programmable second-order sections**. No
 filtering opinion is baked in.
 
-Total group delay of the active configuration is computed and reported, so
-the host can correct sample timestamps exactly.
+The group delay of any section can be computed (`dsp_section_group_delay`),
+which is what correcting timestamps for the filters in use needs. It is not
+yet reported in the stream.
 
 ### 7.1 Getting a signal worth trusting
 
@@ -719,10 +871,9 @@ why the impedance measurement is an acceptance item and not a nicety.
 ### 7.3 The route from host to device
 
 M5 tunes the chain on the host, where a change is visible in a second. M6
-moves the settled chain onto the device, where it belongs.
+moves the settled chain onto the device, where it belongs - and for the
+filters that is now a switch in the app (see M6).
 
-That transfer needs no new architecture. The chain's last stage is a
-programmable biquad cascade: the host designs coefficients and uploads them.
-The host application becomes the tool that designs what it then installs, and
-the acceptance test for M6 is that the device reproduces, from the same raw
-input, what the host chain produced.
+The host designs and the device runs: the app sends the sections it designed,
+and the device reproduces, from the same raw input, what the host chain
+produced - apart from the DC removal it keeps in front for numeric headroom.

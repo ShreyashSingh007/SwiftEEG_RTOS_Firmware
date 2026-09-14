@@ -2,9 +2,10 @@
  * Whole-chain golden vectors.
  *
  * The DSP suite checks each primitive on its own. This checks how they are
- * composed - decode, then integer DC removal, then scaling, then the notch -
- * because a chain built from correct parts is still wrong if a stage runs in
- * the wrong order or the scaling lands on the wrong side of the DC removal.
+ * composed - decode, integer DC removal, per-channel scaling, the pre
+ * sections, the common average, the post sections - because a chain built
+ * from correct parts is still wrong if a stage runs in the wrong order or
+ * the scaling lands on the wrong side of the DC removal.
  *
  * It calls src/pipeline/chain.c, the same code the firmware runs. A golden
  * test against a reimplementation written for the test would only prove that
@@ -45,18 +46,56 @@ static bool close_enough(float got, float want)
 	return diff <= (ABS_TOL_UV + REL_TOL * mag);
 }
 
+/* Compare one output row, tracking the worst channel seen so far. */
+static void check_row(const float *got, const float *want, int frame,
+		      float *worst)
+{
+	for (int ch = 0; ch < GOLDEN_PIPE_CHANNELS; ch++) {
+		float diff = got[ch] - want[ch];
+
+		if (diff < 0.0f) {
+			diff = -diff;
+		}
+		if (diff > *worst) {
+			*worst = diff;
+		}
+
+		zassert_true(close_enough(got[ch], want[ch]),
+			     "frame %d ch %d: got %f uV, want %f uV",
+			     frame, ch + 1, (double)got[ch], (double)want[ch]);
+	}
+}
+
 static chain_t chain;
 
-static int build(void)
+/* A: the device's default chain. */
+static int build(chain_t *c)
 {
-	return chain_init(&chain, GOLDEN_PIPE_FS, GOLDEN_PIPE_DC_SHIFT,
-			  GOLDEN_PIPE_NOTCH_HZ, GOLDEN_PIPE_NOTCH_Q, 4.5f, 24);
+	return chain_init(c, GOLDEN_A_FS, GOLDEN_A_DC_SHIFT, GOLDEN_A_NOTCH_HZ,
+			  GOLDEN_A_NOTCH_Q, 4.5f, 24);
+}
+
+/* B: the host chain, loaded the way the firmware loads it. */
+static void build_full(chain_t *c)
+{
+	zassert_ok(chain_init(c, GOLDEN_B_FS, GOLDEN_B_DC_SHIFT, 0.0f, 12.0f,
+			      4.5f, 24));
+
+	for (uint8_t ch = 0; ch < GOLDEN_PIPE_CHANNELS; ch++) {
+		zassert_ok(chain_set_gain(c, ch, golden_b_gains[ch]));
+	}
+
+	zassert_ok(chain_set_stage(c, CHAIN_STAGE_PRE, golden_b_pre,
+				   GOLDEN_B_PRE_COUNT, false, NULL));
+	zassert_ok(chain_set_stage(c, CHAIN_STAGE_POST, golden_b_post,
+				   GOLDEN_B_POST_COUNT, false, NULL));
+	chain_set_car(c, true, GOLDEN_B_CAR_MASK);
 }
 
 ZTEST(pipeline, test_lsb_matches_reference)
 {
-	zassert_ok(build());
-	zassert_within(chain.lsb_uv, GOLDEN_PIPE_LSB_UV, 1e-9f,
+	zassert_ok(build(&chain));
+	zassert_within(chain.lsb_uv[0], GOLDEN_PIPE_LSB_UV, 1e-9f,
 		       "LSB is the scale everything else rests on");
 }
 
@@ -87,44 +126,57 @@ ZTEST(pipeline, test_status_marker_is_checked)
 	zassert_false(frame_is_valid(f), "all-ones status must be rejected");
 }
 
-ZTEST(pipeline, test_chain_matches_reference)
+ZTEST(pipeline, test_default_chain_matches_reference)
 {
-	zassert_ok(build());
+	zassert_ok(build(&chain));
 
 	float uv[FRAME_CHANNELS];
 	float worst = 0.0f;
-	int worst_i = -1, worst_ch = -1;
 
 	for (int i = 0; i < GOLDEN_PIPE_FRAMES; i++) {
 		zassert_true(chain_process(&chain, FRAME_AT(i), NULL, uv),
 			     "frame %d was rejected", i);
-
-		for (int ch = 0; ch < GOLDEN_PIPE_CHANNELS; ch++) {
-			const float want = golden_pipe_out[i][ch];
-			float diff = uv[ch] - want;
-
-			if (diff < 0.0f) {
-				diff = -diff;
-			}
-			if (diff > worst) {
-				worst = diff;
-				worst_i = i;
-				worst_ch = ch;
-			}
-
-			zassert_true(close_enough(uv[ch], want),
-				     "frame %d ch %d: got %f uV, want %f uV",
-				     i, ch + 1, (double)uv[ch], (double)want);
-		}
+		check_row(uv, golden_a_out[i], i, &worst);
 	}
 
-	TC_PRINT("worst deviation %e uV at frame %d ch %d\n",
-		 (double)worst, worst_i, worst_ch + 1);
+	TC_PRINT("default chain: worst deviation %e uV\n", (double)worst);
+}
+
+ZTEST(pipeline, test_full_chain_matches_reference)
+{
+	build_full(&chain);
+
+	float uv[FRAME_CHANNELS];
+	float worst = 0.0f;
+
+	for (int i = 0; i < GOLDEN_PIPE_FRAMES; i++) {
+		if (i == GOLDEN_B_RETUNE_AT) {
+			bool kept = false;
+
+			zassert_ok(chain_set_stage(&chain, CHAIN_STAGE_PRE,
+						   golden_b_pre_retuned,
+						   GOLDEN_B_PRE_COUNT, true,
+						   &kept));
+			zassert_true(kept, "a same-size retune restarted");
+		}
+		if (i == GOLDEN_B_CAR_AT) {
+			chain_set_car(&chain, true, GOLDEN_B_CAR_MASK_LATER);
+		}
+		if (i == GOLDEN_B_RESET_AT) {
+			chain_reset(&chain);
+		}
+
+		zassert_true(chain_process(&chain, FRAME_AT(i), NULL, uv),
+			     "frame %d was rejected", i);
+		check_row(uv, golden_b_out[i], i, &worst);
+	}
+
+	TC_PRINT("full chain: worst deviation %e uV\n", (double)worst);
 }
 
 ZTEST(pipeline, test_dc_offset_is_removed)
 {
-	zassert_ok(build());
+	zassert_ok(build(&chain));
 
 	float uv[FRAME_CHANNELS];
 
@@ -145,7 +197,7 @@ ZTEST(pipeline, test_dc_offset_is_removed)
 
 ZTEST(pipeline, test_mains_is_notched_out)
 {
-	zassert_ok(build());
+	zassert_ok(build(&chain));
 
 	float uv[FRAME_CHANNELS];
 	float peak = 0.0f;
@@ -172,7 +224,7 @@ ZTEST(pipeline, test_mains_is_notched_out)
 
 ZTEST(pipeline, test_alpha_survives_the_notch)
 {
-	zassert_ok(build());
+	zassert_ok(build(&chain));
 
 	float uv[FRAME_CHANNELS];
 	float peak = 0.0f;
@@ -205,7 +257,7 @@ ZTEST(pipeline, test_bad_frame_leaves_no_trace)
 	float uv_bad[FRAME_CHANNELS];
 
 	/* Reference run: 64 clean frames. */
-	zassert_ok(build());
+	zassert_ok(build(&chain));
 	for (int i = 0; i < 64; i++) {
 		(void)chain_process(&chain, FRAME_AT(i), NULL, uv_ref);
 	}
@@ -213,9 +265,7 @@ ZTEST(pipeline, test_bad_frame_leaves_no_trace)
 	/* Same run, with one corrupted frame offered partway through. */
 	chain_t spoiled;
 
-	zassert_ok(chain_init(&spoiled, GOLDEN_PIPE_FS, GOLDEN_PIPE_DC_SHIFT,
-			      GOLDEN_PIPE_NOTCH_HZ, GOLDEN_PIPE_NOTCH_Q,
-			      4.5f, 24));
+	zassert_ok(build(&spoiled));
 
 	uint8_t bad[FRAME_BYTES];
 
@@ -238,6 +288,88 @@ ZTEST(pipeline, test_bad_frame_leaves_no_trace)
 		zassert_equal(uv_bad[ch], uv_ref[ch],
 			      "ch %d diverged after a rejected frame: %f vs %f",
 			      ch + 1, (double)uv_bad[ch], (double)uv_ref[ch]);
+	}
+}
+
+ZTEST(pipeline, test_invalid_stage_changes_nothing)
+{
+	build_full(&chain);
+
+	dsp_section_t bad = golden_b_post[0];
+
+	bad.k = 0.0f;
+
+	zassert_equal(chain_set_stage(&chain, CHAIN_STAGE_POST, &bad, 1, false,
+				      NULL), -EINVAL, "invalid section accepted");
+	zassert_equal(chain_set_stage(&chain, 2u, golden_b_post,
+				      GOLDEN_B_POST_COUNT, false, NULL),
+		      -EINVAL, "stage 2 accepted");
+	zassert_equal(chain.post.count, GOLDEN_B_POST_COUNT,
+		      "a refused change altered the stage");
+}
+
+ZTEST(pipeline, test_average_needs_two_channels)
+{
+	chain_t plain, one;
+	float a[FRAME_CHANNELS], b[FRAME_CHANNELS];
+
+	zassert_ok(build(&plain));
+	zassert_ok(build(&one));
+
+	/* An average of one channel is not an average of anything. */
+	chain_set_car(&one, true, 0x08u);
+
+	for (int i = 0; i < 64; i++) {
+		(void)chain_process(&plain, FRAME_AT(i), NULL, a);
+		(void)chain_process(&one, FRAME_AT(i), NULL, b);
+
+		for (int ch = 0; ch < FRAME_CHANNELS; ch++) {
+			zassert_equal(a[ch], b[ch],
+				      "frame %d ch %d changed by a one-channel average",
+				      i, ch + 1);
+		}
+	}
+}
+
+ZTEST(pipeline, test_gain_rescales_one_channel)
+{
+	zassert_ok(build(&chain));
+
+	const float lsb24 = chain.lsb_uv[0];
+
+	zassert_ok(chain_set_gain(&chain, 1, 12));
+	zassert_within(chain.lsb_uv[1], 2.0f * lsb24, 1e-9f,
+		       "gain 12 should double the LSB");
+	zassert_equal(chain.lsb_uv[0], lsb24, "another channel's scale moved");
+	zassert_equal(chain_set_gain(&chain, 1, 0), -EINVAL, "gain 0 accepted");
+}
+
+ZTEST(pipeline, test_reset_is_a_fresh_start)
+{
+	/*
+	 * A reset must be exactly a new chain started at that frame. That is
+	 * what lets a host reproduce the device's output from a known sample.
+	 */
+	chain_t fresh;
+	float a[FRAME_CHANNELS], b[FRAME_CHANNELS];
+
+	build_full(&chain);
+	for (int i = 0; i < 100; i++) {
+		(void)chain_process(&chain, FRAME_AT(i), NULL, a);
+	}
+	chain_reset(&chain);
+
+	build_full(&fresh);
+
+	for (int i = 100; i < 200; i++) {
+		(void)chain_process(&chain, FRAME_AT(i), NULL, a);
+		(void)chain_process(&fresh, FRAME_AT(i), NULL, b);
+
+		for (int ch = 0; ch < FRAME_CHANNELS; ch++) {
+			zassert_equal(a[ch], b[ch],
+				      "frame %d ch %d: reset %f vs fresh %f",
+				      i, ch + 1, (double)a[ch], (double)b[ch]);
+		}
 	}
 }
 

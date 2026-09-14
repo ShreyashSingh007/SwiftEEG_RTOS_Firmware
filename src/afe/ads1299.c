@@ -71,6 +71,30 @@ static const struct gpio_dt_spec afe_drdy =
 static uint8_t afe_tx[8];
 static uint8_t afe_rx[8];
 
+/*
+ * Two frame buffers. EasyDMA writes one while the callback reads the other,
+ * so a frame is never being overwritten while it is being consumed. They
+ * must live in RAM - EasyDMA cannot reach flash.
+ */
+static uint8_t afe_frame[2][ADS1299_FRAME_BYTES];
+static uint8_t afe_dummy[ADS1299_FRAME_BYTES];
+static uint8_t afe_active;
+
+/*
+ * What was last written to each CHnSET. Every write goes through this
+ * driver, so this is what the part holds - from its reset value, gain 24
+ * with the inputs shorted, onwards.
+ */
+static uint8_t afe_chset[ADS1299_CHANNELS] = {
+	0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61,
+};
+
+/*
+ * How long a transfer DRDY had already started may still be running once
+ * the trigger is gated off: 27 bytes at 8 MHz take ~30 us.
+ */
+#define AFE_XFER_SETTLE_US 500
+
 static bool afe_bus_ready;
 
 /*
@@ -137,6 +161,30 @@ static void afe_xfer_done(void)
 	}
 }
 
+/*
+ * Put a stuck SPIM3 back in working order. STOP abandons whatever transfer
+ * it believes is running, and a disable-enable cycle clears the rest; the
+ * configuration registers survive both. Without this, one stuck transfer
+ * made every one after it time out as well, and acquisition could not be
+ * restarted short of a reset.
+ */
+static void afe_recover(void)
+{
+	nrf_spim_task_trigger(AFE_SPIM, NRF_SPIM_TASK_STOP);
+
+	for (int i = 0; i < 100; i++) {
+		if (nrf_spim_event_check(AFE_SPIM, NRF_SPIM_EVENT_STOPPED)) {
+			break;
+		}
+		k_busy_wait(100);
+	}
+
+	nrf_spim_event_clear(AFE_SPIM, NRF_SPIM_EVENT_STOPPED);
+	nrf_spim_disable(AFE_SPIM);
+	nrf_spim_enable(AFE_SPIM);
+	nrf_spim_event_clear(AFE_SPIM, NRF_SPIM_EVENT_END);
+}
+
 /* Blocking transfer. Used for register access only; streaming is DMA. */
 static int afe_xfer(size_t len)
 {
@@ -178,6 +226,7 @@ static int afe_xfer(size_t len)
 		k_busy_wait(1);
 	}
 
+	afe_recover();
 	afe_xfer_done();
 	LOG_ERR("AFE SPI transfer timed out");
 	return -ETIMEDOUT;
@@ -363,6 +412,17 @@ static int afe_enter_command_mode(bool *was_streaming)
 	}
 
 	/*
+	 * An edge just before the gate closed may already have started a
+	 * transfer, which runs on for ~30 us. Touching the peripheral before it
+	 * ends - a new clock rate, new buffers, a START while it is busy - left
+	 * SPIM3 stuck: at 1000 SPS a register access now and then timed out,
+	 * every transfer after it did too, and the next rate change could not
+	 * restart acquisition. Waiting it out costs a register access nothing,
+	 * and the streaming interrupt takes that last frame as normal.
+	 */
+	k_busy_wait(AFE_XFER_SETTLE_US);
+
+	/*
 	 * Drop back to the register clock. Streaming runs the bus at 8 MHz,
 	 * where a byte takes 1 us - shorter than the ~2 us the part needs
 	 * between a command byte and the data that follows it, so reads come
@@ -420,6 +480,16 @@ static int afe_resume_streaming(bool was_streaming)
 	afe_cs_held = true;
 
 	err = afe_cmd(ADS1299_CMD_START);
+
+	/*
+	 * Point the DMA back at the frame buffers. Register access leaves it on
+	 * the one-byte command buffers, so without this the first frame after
+	 * every register access was read one byte long, and the interrupt
+	 * passed on an old frame as if it were new.
+	 */
+	nrf_spim_tx_buffer_set(AFE_SPIM, afe_dummy, ADS1299_FRAME_BYTES);
+	nrf_spim_rx_buffer_set(AFE_SPIM, afe_frame[afe_active],
+			       ADS1299_FRAME_BYTES);
 
 	/* Payload rate again now the commands are done. */
 	nrf_spim_frequency_set(AFE_SPIM, AFE_FREQ_STREAM);
@@ -646,9 +716,15 @@ int ads1299_set_channel(uint8_t ch, uint8_t gain, uint8_t mux, bool power_down,
 	if (ch == 0xFFu) {
 		for (uint8_t i = 0; i < ADS1299_CHANNELS && err == 0; i++) {
 			err = afe_write_reg(ADS1299_REG_CH1SET + i, val);
+			if (err == 0) {
+				afe_chset[i] = val;
+			}
 		}
 	} else {
 		err = afe_write_reg(ADS1299_REG_CH1SET + ch, val);
+		if (err == 0) {
+			afe_chset[ch] = val;
+		}
 	}
 
 	const int resume_err = afe_resume_streaming(was_streaming);
@@ -675,6 +751,8 @@ int ads1299_set_channels(uint8_t gain, uint8_t mux)
 			LOG_ERR("CH%uSET write failed (%d)", i + 1, err);
 			return err;
 		}
+
+		afe_chset[i] = val;
 	}
 
 	/* One readback is enough to catch a bus that is not working at all. */
@@ -690,6 +768,13 @@ int ads1299_set_channels(uint8_t gain, uint8_t mux)
 	}
 
 	return 0;
+}
+
+void ads1299_get_channels_cached(uint8_t *out, uint8_t count)
+{
+	if (out != NULL && count <= ADS1299_CHANNELS) {
+		memcpy(out, afe_chset, count);
+	}
 }
 
 const char *afe_probe_str(afe_probe_result_t r)
@@ -794,15 +879,6 @@ bool ads1299_start_pin_stuck_high(void)
 
 
 /* ---- continuous acquisition ---------------------------------------- */
-
-/*
- * Two frame buffers. EasyDMA writes one while the callback reads the other,
- * so a frame is never being overwritten while it is being consumed. They
- * must live in RAM - EasyDMA cannot reach flash.
- */
-static uint8_t afe_frame[2][ADS1299_FRAME_BYTES];
-static uint8_t afe_dummy[ADS1299_FRAME_BYTES];
-static uint8_t afe_active;
 
 static ads1299_frame_cb_t afe_cb;
 static volatile uint32_t afe_overrun;

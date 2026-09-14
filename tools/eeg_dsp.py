@@ -2,10 +2,13 @@
 Host-side DSP chain.
 
 This is where filter settings get chosen. It runs on the PC so a change is
-visible immediately, and it is built from the same biquad forms the firmware
-uses - transposed direct form II, RBJ cookbook coefficients - so a setting
-that works here transfers to the device as coefficients rather than as a
-rewrite.
+visible immediately, and it designs the same filters the firmware runs -
+audio-EQ cookbook responses, prewarped at their corners - so a setting that
+works here transfers to the device as sections rather than as a rewrite.
+Here they run in float64 as direct-form biquads. On the device they run in
+float32 as state-variable sections, which is what keeps a 0.1 Hz corner
+accurate there (see src/dsp/dsp.h); device_stages() gives the chain in that
+form.
 
 The chain, in order, and why that order:
 
@@ -70,9 +73,9 @@ def butterworth_qs(order: int) -> list[float]:
     return sorted(qs)
 
 
-# --- coefficient design, matching src/dsp/dsp.c ---------------------------
+# --- coefficient design ------------------------------------------------------
 # Returned as (b0, b1, b2, a1, a2) with the a terms already negated, which is
-# the form the firmware's inner loop expects.
+# the form the loop below expects.
 
 def _norm(b0, b1, b2, a0, a1, a2):
     inv = 1.0 / a0
@@ -97,6 +100,41 @@ def design_highpass(fs, fc, q):
     cw, alpha = math.cos(w0), math.sin(w0) / (2 * q)
     b0 = (1.0 + cw) / 2
     return _norm(b0, -(1.0 + cw), b0, 1 + alpha, -2 * cw, 1 - alpha)
+
+
+# --- the same filters as sections, the form the device runs ------------------
+# (g, k, m0, m1, m2): g = tan(pi fc / fs), k = 1 / Q, then how the output mixes
+# the input, the band-pass and the low-pass. Same responses as the designs
+# above, to rounding.
+
+def svf_notch(fs, f0, q):
+    g, k = math.tan(math.pi * f0 / fs), 1.0 / q
+    return (g, k, 1.0, -k, 0.0)
+
+
+def svf_lowpass(fs, fc, q):
+    g, k = math.tan(math.pi * fc / fs), 1.0 / q
+    return (g, k, 0.0, 0.0, 1.0)
+
+
+def svf_highpass(fs, fc, q):
+    g, k = math.tan(math.pi * fc / fs), 1.0 / q
+    return (g, k, 1.0, -k, -1.0)
+
+
+def svf_response(sections, fs, freqs):
+    """Magnitude of a cascade of sections at the given frequencies."""
+    w = 2 * np.pi * np.asarray(freqs, dtype=float) / fs
+    z1, z2 = np.exp(-1j * w), np.exp(-2j * w)
+    h = np.ones_like(w, dtype=complex)
+
+    for g, k, m0, m1, m2 in sections:
+        gg = g * g
+        den = (1.0 + g * k + gg) + 2.0 * (gg - 1.0) * z1 + (1.0 - g * k + gg) * z2
+        num = m0 * den + m1 * g * (1.0 - z2) + m2 * gg * (1.0 + z1) ** 2
+        h *= num / den
+
+    return np.abs(h)
 
 
 def find_mains(block, fs: float, nominal: float = 50.0) -> float | None:
@@ -270,6 +308,14 @@ class Chain:
 
     # -- configuration ----------------------------------------------------
 
+    def _highpass_qs(self) -> list[float]:
+        on = self.highpass_hz and self.highpass_hz > 0
+        return butterworth_qs(self.order) if on else []
+
+    def _lowpass_qs(self) -> list[float]:
+        on = self.lowpass_hz and 0 < self.lowpass_hz < self.fs / 2.0 * 0.95
+        return butterworth_qs(self.order) if on else []
+
     def rebuild(self) -> None:
         """
         Redesign every stage for the current settings and sample rate.
@@ -278,17 +324,10 @@ class Chain:
         changing one setting does not restart the others. Any stage that
         does restart is primed again on the next sample.
         """
-        nyq = self.fs / 2.0
-
-        hp = []
-        if self.highpass_hz and self.highpass_hz > 0:
-            for q in butterworth_qs(self.order):
-                hp.append(design_highpass(self.fs, self.highpass_hz, q))
-
-        lp = []
-        if self.lowpass_hz and 0 < self.lowpass_hz < nyq * 0.95:
-            for q in butterworth_qs(self.order):
-                lp.append(design_lowpass(self.fs, self.lowpass_hz, q))
+        hp = [design_highpass(self.fs, self.highpass_hz, q)
+              for q in self._highpass_qs()]
+        lp = [design_lowpass(self.fs, self.lowpass_hz, q)
+              for q in self._lowpass_qs()]
 
         restarted = self._hp.set(hp, self.channels)
         restarted |= self._notch.set(self._notch_sections(), self.channels)
@@ -296,7 +335,7 @@ class Chain:
         if restarted:
             self._primed = False
 
-    def _notch_sections(self) -> list:
+    def _notch_freqs(self) -> list[float]:
         if not (self.notch_hz and self.notch_hz > 0):
             return []
 
@@ -308,14 +347,39 @@ class Chain:
             if abs(self.measured_mains - self.notch_hz) < 3.0:
                 f0 = self.measured_mains
 
-        sections = [design_notch(self.fs, f0, self.notch_q)]
+        freqs = [f0]
 
         # The harmonic tracks the fundamental, so it moves with it.
-        second = f0 * 2.0
-        if self.notch_harmonic and second < self.fs / 2.0 * 0.95:
-            sections.append(design_notch(self.fs, second, self.notch_q))
+        if self.notch_harmonic and f0 * 2.0 < self.fs / 2.0 * 0.95:
+            freqs.append(f0 * 2.0)
 
-        return sections
+        return freqs
+
+    def _notch_sections(self) -> list:
+        return [design_notch(self.fs, f, self.notch_q)
+                for f in self._notch_freqs()]
+
+    def device_stages(self) -> tuple[list, list]:
+        """
+        This chain in the form the device runs it: the sections before its
+        common average and those after, each (g, k, m0, m1, m2).
+
+        The same filters as the host stages. The device keeps its own
+        0.08 Hz DC removal in front of them, which this chain has no need of,
+        so the two differ below about 0.3 Hz - by 3 % at 0.3 Hz, and by
+        less than 1 % from 0.6 Hz up.
+        """
+        pre = [svf_highpass(self.fs, self.highpass_hz, q)
+               for q in self._highpass_qs()]
+        pre += [svf_notch(self.fs, f, self.notch_q) for f in self._notch_freqs()]
+        post = [svf_lowpass(self.fs, self.lowpass_hz, q)
+                for q in self._lowpass_qs()]
+        return pre, post
+
+    @property
+    def car_bits(self) -> int:
+        """car_mask as the device takes it: bit n for channel n + 1."""
+        return sum(1 << i for i, on in enumerate(self.car_mask) if on)
 
     def update_mains(self, block) -> bool:
         """
@@ -481,6 +545,7 @@ def _self_test() -> None:
     o3 = c3.process(bad)[int(fs * 8):]
     assert np.abs(o3[:, 0]).max() < 3.0, "a masked channel leaked into the average"
     assert np.abs(o3[:, 5]).max() > 1000.0, "the masked channel itself was lost"
+    assert c3.car_bits == 0xDF, hex(c3.car_bits)
 
     # Primed on its first sample, a 0.1 Hz high-pass starts settled instead
     # of spending most of a minute recovering from each electrode's offset.
@@ -511,6 +576,21 @@ def _self_test() -> None:
     second = moved.process(sig2[half:])
     jump = np.abs(np.vstack((first, second))[half:] - ref[half:]).max()
     assert jump < 5.0, f"re-aiming the notch disturbed the output by {jump:.0f} uV"
+
+    # The device's form of the chain is the same filters, whatever the
+    # settings: its sections and the host stages agree.
+    for hp_hz, lp_hz in ((0.1, 45.0), (0.5, 30.0), (2.0, 0.0), (0.0, 100.0)):
+        c = Chain(fs, 8)
+        c.highpass_hz, c.lowpass_hz = hp_hz, lp_hz
+        c.measured_mains = 49.7
+        c.rebuild()
+        pre, post = c.device_stages()
+        freqs = np.linspace(0.05, fs / 2 * 0.99, 2000)
+        host = response(c._hp.sections + c._notch.sections + c._lp.sections,
+                        fs, freqs)
+        dev = svf_response(pre + post, fs, freqs)
+        err = np.abs(host - dev).max()
+        assert err < 1e-6, f"device sections differ from the host by {err:.1e}"
 
     print("eeg_dsp self-test: OK")
     print(f"  settling at {DEFAULT_HIGHPASS_HZ} Hz high-pass: "

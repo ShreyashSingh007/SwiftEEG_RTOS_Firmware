@@ -17,6 +17,7 @@
 #include <stdint.h>
 
 #include "afe/ads1299.h"
+#include "dsp/dsp.h"
 
 /* Sample flags, mirroring the protocol's DATA header. */
 #define EEG_FLAG_SETTLING 0x01 /* filters have not settled yet */
@@ -65,6 +66,9 @@ void pipeline_stop(void);
  * Change the sample rate, restarting acquisition around it. The filters are
  * redesigned for the new rate - a notch is only at 50 Hz for the rate it was
  * designed at, so carrying the old coefficients over would quietly move it.
+ * Sections a host loaded are dropped for the same reason: the pre stage goes
+ * back to the device's own notch and the post stage empties. The common
+ * average settings are kept, since they do not depend on the rate.
  *
  * `sps` is the real rate, not a register code; 250 to 1000 are supported
  * over BLE, higher needs USB. Returns 0, or a negative errno.
@@ -75,16 +79,65 @@ int pipeline_set_rate(uint16_t sps);
 uint16_t pipeline_rate(void);
 
 /*
- * Set the mains notch frequency: 50, 60, or 0 to remove it.
+ * Filter changes land between two samples, never inside one: the DSP thread
+ * applies each at the top of the next sample. Every call below reports, in
+ * `applied_seq` (may be NULL), the sequence number of the first sample
+ * processed with the change, so a host can line its own records up with the
+ * device's exactly. They return -ENODEV when there is no chain to change.
+ */
+
+/*
+ * Set the device's own mains notch: 50, 60, or 0 to remove it.
  *
- * Rebuilds the filter in place; acquisition keeps running. The biquad state
- * is cleared, so there is a brief settling transient - unavoidable, since
- * the old state belongs to a different filter.
+ * Replaces the pre stage with that single notch, including any sections a
+ * host loaded there, and starts it from rest.
  */
 int pipeline_set_notch(uint8_t hz);
 
-/* The notch frequency in use, or 0 when it is disabled. */
+/* The device notch's frequency, or 0 when the pre stage holds something else. */
 uint8_t pipeline_notch(void);
+
+#define PIPELINE_STAGE_PRE  0u /* before the common average */
+#define PIPELINE_STAGE_POST 1u /* after it */
+
+/*
+ * Load a stage with sections a host designed. With `keep_state` and the
+ * same number of sections, the filter is retuned in place; otherwise it
+ * starts from rest. Returns -EINVAL, changing nothing, for an invalid
+ * section.
+ */
+int pipeline_set_stage(uint8_t stage, const dsp_section_t *sections,
+		       uint8_t count, bool keep_state, uint32_t *applied_seq);
+
+/* Common average reference on or off, and which channels make the average. */
+int pipeline_set_car(bool enable, uint8_t mask, uint32_t *applied_seq);
+
+/*
+ * Restart the chain from the next sample: the DC estimate re-primes and every
+ * filter starts from rest. What a host needs to run its own copy of the chain
+ * from exactly the same starting point.
+ */
+int pipeline_reset_chain(uint32_t *applied_seq);
+
+/*
+ * Take every channel's gain from what the AFE driver last wrote, and scale
+ * the chain to match. Call after anything that changes a gain, or microvolts
+ * from the chain are wrong by the ratio of the old gain to the new.
+ */
+int pipeline_sync_gains(void);
+
+/* What the chain is doing, for reporting to a host. */
+struct pipeline_filters {
+	dsp_section_t pre[DSP_MAX_SECTIONS];
+	dsp_section_t post[DSP_MAX_SECTIONS];
+	uint8_t pre_count;
+	uint8_t post_count;
+	bool    pre_is_notch; /* the pre stage is the device's own notch */
+	bool    car;
+	uint8_t car_mask;
+};
+
+void pipeline_get_filters(struct pipeline_filters *out);
 
 /* Zero the counters and begin a fresh measurement window. */
 void pipeline_reset_stats(void);

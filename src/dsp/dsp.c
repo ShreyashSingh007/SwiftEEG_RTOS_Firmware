@@ -54,7 +54,7 @@ float dsp_lsb_uv(float vref_volts, uint8_t gain)
 	return (2.0f * vref_volts) / ((float)gain * 16777216.0f) * 1e6f;
 }
 
-/* --- Biquad cascade ------------------------------------------------------ */
+/* --- Second-order sections ----------------------------------------------- */
 
 void dsp_cascade_init(dsp_cascade_t *c, uint8_t channels)
 {
@@ -63,19 +63,73 @@ void dsp_cascade_init(dsp_cascade_t *c, uint8_t channels)
 	}
 	memset(c, 0, sizeof(*c));
 	c->channels = (channels > DSP_MAX_CHANNELS) ? DSP_MAX_CHANNELS : channels;
-	c->sections = 0;
 }
 
-bool dsp_cascade_set(dsp_cascade_t *c, const dsp_biquad_coeffs_t *coeffs,
-		     uint8_t sections)
+bool dsp_section_is_valid(const dsp_section_t *s)
 {
-	if (c == NULL || coeffs == NULL || sections > DSP_MAX_SECTIONS) {
+	return s != NULL &&
+	       isfinite(s->g) && isfinite(s->k) &&
+	       isfinite(s->m0) && isfinite(s->m1) && isfinite(s->m2) &&
+	       s->g > 0.0f && s->k > 0.0f;
+}
+
+static bool sections_valid(const dsp_section_t *sections, uint8_t count)
+{
+	if (count > DSP_MAX_SECTIONS || (count != 0 && sections == NULL)) {
 		return false;
 	}
 
-	memcpy(c->coeffs, coeffs, (size_t)sections * sizeof(*coeffs));
-	c->sections = sections;
+	for (uint8_t i = 0; i < count; i++) {
+		if (!dsp_section_is_valid(&sections[i])) {
+			return false;
+		}
+	}
+
+	return true;
+}
+
+/*
+ * Derive what the loop runs. Done here, in float32, so a host that mirrors
+ * the loop can derive exactly the same values from the same section.
+ */
+static void load(dsp_cascade_t *c, const dsp_section_t *sections, uint8_t count)
+{
+	for (uint8_t i = 0; i < count; i++) {
+		const dsp_section_t s = sections[i];
+		dsp_section_run_t *r = &c->run[i];
+
+		c->sections[i] = s;
+		r->a1 = 1.0f / (1.0f + s.g * (s.g + s.k));
+		r->a2 = s.g * r->a1;
+		r->a3 = s.g * r->a2;
+		r->m0 = s.m0;
+		r->m1 = s.m1;
+		r->m2 = s.m2;
+	}
+
+	c->count = count;
+}
+
+bool dsp_cascade_set(dsp_cascade_t *c, const dsp_section_t *sections,
+		     uint8_t count)
+{
+	if (c == NULL || !sections_valid(sections, count)) {
+		return false;
+	}
+
+	load(c, sections, count);
 	dsp_cascade_reset_state(c);
+	return true;
+}
+
+bool dsp_cascade_retune(dsp_cascade_t *c, const dsp_section_t *sections,
+			uint8_t count)
+{
+	if (c == NULL || count != c->count || !sections_valid(sections, count)) {
+		return false;
+	}
+
+	load(c, sections, count);
 	return true;
 }
 
@@ -92,37 +146,62 @@ float dsp_cascade_apply(dsp_cascade_t *c, uint8_t channel, float x)
 		return x;
 	}
 
-	for (uint8_t s = 0; s < c->sections; s++) {
-		const dsp_biquad_coeffs_t *k = &c->coeffs[s];
-		dsp_biquad_state_t *st = &c->state[channel][s];
+	for (uint8_t i = 0; i < c->count; i++) {
+		const dsp_section_run_t *r = &c->run[i];
+		dsp_section_state_t *st = &c->state[channel][i];
 
-		/* Transposed direct form II. a1/a2 are pre-negated. */
-		const float y = k->b0 * x + st->s1;
-		st->s1 = k->b1 * x + k->a1 * y + st->s2;
-		st->s2 = k->b2 * x + k->a2 * y;
-		x = y;
+		/*
+		 * v1 is the band-pass and v2 the low-pass; ic1 and ic2 are the
+		 * two trapezoidal integrators' states.
+		 */
+		const float v3 = x - st->ic2;
+		const float v1 = r->a1 * st->ic1 + r->a2 * v3;
+		const float v2 = st->ic2 + r->a2 * st->ic1 + r->a3 * v3;
+
+		st->ic1 = 2.0f * v1 - st->ic1;
+		st->ic2 = 2.0f * v2 - st->ic2;
+
+		x = r->m0 * x + r->m1 * v1 + r->m2 * v2;
 	}
 
 	return x;
 }
 
-/* --- Coefficient design -------------------------------------------------- */
-
-/*
- * Standard RBJ audio-EQ cookbook forms. Coefficients are normalised by a0 and
- * the feedback terms negated on the way out, matching the inner loop above.
- */
-static void normalise(dsp_biquad_coeffs_t *out,
-		      float b0, float b1, float b2,
-		      float a0, float a1, float a2)
+uint32_t dsp_cascade_settle_samples(const dsp_cascade_t *c)
 {
-	const float inv = 1.0f / a0;
-	out->b0 = b0 * inv;
-	out->b1 = b1 * inv;
-	out->b2 = b2 * inv;
-	out->a1 = -a1 * inv;
-	out->a2 = -a2 * inv;
+	if (c == NULL) {
+		return 0;
+	}
+
+	/*
+	 * Each section's slowest pole, taken from the analogue prototype it was
+	 * prewarped from (w0 = 2 fs g). An underdamped pair decays at w0 / 2Q,
+	 * a time constant of 1 / (g k) samples; an overdamped one at its slower
+	 * real pole, (k + sqrt(k^2 - 4)) / 4g. Decaying to 1 % takes ln(100),
+	 * about 4.6 time constants.
+	 */
+	float total = 0.0f;
+
+	for (uint8_t i = 0; i < c->count; i++) {
+		const float g = c->sections[i].g;
+		const float k = c->sections[i].k;
+		const float tau = (k > 2.0f)
+				  ? (k + sqrtf(k * k - 4.0f)) / (4.0f * g)
+				  : 1.0f / (g * k);
+
+		total += 4.6f * tau;
+	}
+
+	/* The largest float32 below 2^32; also catches a NaN. */
+	if (!(total < 4294967040.0f)) {
+		return UINT32_MAX;
+	}
+
+	/* Rounded up, so a cascade with nothing to settle is exactly zero. */
+	return (uint32_t)ceilf(total);
 }
+
+/* --- Section design ------------------------------------------------------ */
 
 static bool design_valid(float fs_hz, float f0_hz, float q)
 {
@@ -130,65 +209,79 @@ static bool design_valid(float fs_hz, float f0_hz, float q)
 	return fs_hz > 0.0f && f0_hz > 0.0f && q > 0.0f && f0_hz < fs_hz * 0.5f;
 }
 
-bool dsp_design_notch(dsp_biquad_coeffs_t *out, float fs_hz, float f0_hz, float q)
+/*
+ * The corner is prewarped, so a section designed at fc has exactly the
+ * response the bilinear transform of its analogue prototype would - the
+ * same as the audio-EQ cookbook biquad at that corner and Q.
+ */
+static void design(dsp_section_t *out, float fs_hz, float fc_hz, float q,
+		   float m0, float m1_per_k, float m2)
+{
+	out->g = tanf(DSP_PI * fc_hz / fs_hz);
+	out->k = 1.0f / q;
+	out->m0 = m0;
+	out->m1 = m1_per_k * out->k;
+	out->m2 = m2;
+}
+
+bool dsp_design_notch(dsp_section_t *out, float fs_hz, float f0_hz, float q)
 {
 	if (out == NULL || !design_valid(fs_hz, f0_hz, q)) {
 		return false;
 	}
 
-	const float w0 = 2.0f * DSP_PI * f0_hz / fs_hz;
-	const float cw = cosf(w0);
-	const float alpha = sinf(w0) / (2.0f * q);
-
-	normalise(out, 1.0f, -2.0f * cw, 1.0f,
-		       1.0f + alpha, -2.0f * cw, 1.0f - alpha);
+	design(out, fs_hz, f0_hz, q, 1.0f, -1.0f, 0.0f);
 	return true;
 }
 
-bool dsp_design_lowpass(dsp_biquad_coeffs_t *out, float fs_hz, float fc_hz, float q)
+bool dsp_design_lowpass(dsp_section_t *out, float fs_hz, float fc_hz, float q)
 {
 	if (out == NULL || !design_valid(fs_hz, fc_hz, q)) {
 		return false;
 	}
 
-	const float w0 = 2.0f * DSP_PI * fc_hz / fs_hz;
-	const float cw = cosf(w0);
-	const float alpha = sinf(w0) / (2.0f * q);
-	const float b1 = 1.0f - cw;
-
-	normalise(out, b1 * 0.5f, b1, b1 * 0.5f,
-		       1.0f + alpha, -2.0f * cw, 1.0f - alpha);
+	design(out, fs_hz, fc_hz, q, 0.0f, 0.0f, 1.0f);
 	return true;
 }
 
-bool dsp_design_highpass(dsp_biquad_coeffs_t *out, float fs_hz, float fc_hz, float q)
+bool dsp_design_highpass(dsp_section_t *out, float fs_hz, float fc_hz, float q)
 {
 	if (out == NULL || !design_valid(fs_hz, fc_hz, q)) {
 		return false;
 	}
 
-	const float w0 = 2.0f * DSP_PI * fc_hz / fs_hz;
-	const float cw = cosf(w0);
-	const float alpha = sinf(w0) / (2.0f * q);
-	const float b0 = (1.0f + cw) * 0.5f;
-
-	normalise(out, b0, -(1.0f + cw), b0,
-		       1.0f + alpha, -2.0f * cw, 1.0f - alpha);
+	design(out, fs_hz, fc_hz, q, 1.0f, -1.0f, -1.0f);
 	return true;
 }
 
-float dsp_biquad_group_delay(const dsp_biquad_coeffs_t *c, float fs_hz, float f_hz)
+float dsp_section_group_delay(const dsp_section_t *s, float fs_hz, float f_hz)
 {
-	if (c == NULL || fs_hz <= 0.0f) {
+	if (s == NULL || fs_hz <= 0.0f) {
 		return 0.0f;
 	}
+
+	/*
+	 * The section as a transfer function n(z) / d(z), both normalised so
+	 * d has a leading 1:
+	 *   d = d0 + 2(g^2 - 1) z^-1 + (1 - gk + g^2) z^-2,  d0 = 1 + gk + g^2
+	 *   n = m0 d + m1 g (1 - z^-2) + m2 g^2 (1 + z^-1)^2
+	 */
+	const float g = s->g;
+	const float k = s->k;
+	const float gg = g * g;
+	const float d0 = 1.0f + g * k + gg;
+	const float d1 = 2.0f * (gg - 1.0f) / d0;
+	const float d2 = (1.0f - g * k + gg) / d0;
+	const float n0 = (s->m0 * d0 + s->m1 * g + s->m2 * gg) / d0;
+	const float n1 = (2.0f * s->m0 * (gg - 1.0f) + 2.0f * s->m2 * gg) / d0;
+	const float n2 = (s->m0 * (1.0f - g * k + gg) - s->m1 * g + s->m2 * gg) / d0;
 
 	/*
 	 * Group delay via numerical differentiation of the phase response.
 	 *
 	 * Evaluating H(e^jw) either side of w and differencing the unwrapped
 	 * phase is far less error-prone than the closed form, and this is
-	 * computed once at configuration time, not per sample.
+	 * computed at configuration time, not per sample.
 	 */
 	const float w = 2.0f * DSP_PI * f_hz / fs_hz;
 	const float dw = 1e-4f;
@@ -199,11 +292,10 @@ float dsp_biquad_group_delay(const dsp_biquad_coeffs_t *c, float fs_hz, float f_
 		const float cw1 = cosf(wi),  sw1 = sinf(wi);
 		const float cw2 = cosf(2.0f * wi), sw2 = sinf(2.0f * wi);
 
-		/* a1/a2 are stored negated, so undo that here. */
-		const float nr = c->b0 + c->b1 * cw1 + c->b2 * cw2;
-		const float ni = -(c->b1 * sw1 + c->b2 * sw2);
-		const float dr = 1.0f - c->a1 * cw1 - c->a2 * cw2;
-		const float di = -(-c->a1 * sw1 - c->a2 * sw2);
+		const float nr = n0 + n1 * cw1 + n2 * cw2;
+		const float ni = -(n1 * sw1 + n2 * sw2);
+		const float dr = 1.0f + d1 * cw1 + d2 * cw2;
+		const float di = -(d1 * sw1 + d2 * sw2);
 
 		phase[i] = atan2f(ni, nr) - atan2f(di, dr);
 	}

@@ -29,6 +29,9 @@ import proto_ref  # noqa: E402
 
 TYPE_CMD, TYPE_RSP, TYPE_EVT, TYPE_DATA, TYPE_IMU = 0x01, 0x02, 0x03, 0x04, 0x05
 
+# Frame flags. SETTLING marks samples still inside a filter's settling time.
+FLAG_SETTLING, FLAG_OVERRUN = 0x01, 0x02
+
 CMD_PING = 0x01
 CMD_STREAM_START = 0x02
 CMD_STREAM_STOP = 0x03
@@ -44,8 +47,17 @@ CMD_SET_NOTCH = 0x0C
 CMD_SET_LEADOFF = 0x0D
 CMD_GET_CONFIG = 0x0E
 CMD_SET_IMU = 0x0F
+CMD_SET_FILTER = 0x10
+CMD_SET_CAR = 0x11
+CMD_RESET_CHAIN = 0x12
 
-ENC_RAW_I32, ENC_UV_F32, ENC_RAW_I24 = 0, 1, 2
+# Status byte of a response.
+STATUS_OK, STATUS_BADARG, STATUS_FAILED, STATUS_UNKNOWN = 0, 1, 2, 3
+
+# Raw counts in 32 or 24 bits; microvolts after the device's chain; or both
+# side by side for every channel, so a host can record the one and show the
+# other.
+ENC_RAW_I32, ENC_UV_F32, ENC_RAW_I24, ENC_RAW_UV = 0, 1, 2, 3
 
 MUX_NORMAL, MUX_SHORTED, MUX_TEST = 0x00, 0x01, 0x05
 
@@ -54,6 +66,11 @@ GAIN_FROM_CODE = {v: k for k, v in GAIN_CODES.items()}
 
 CHANNELS = 8
 DATA_HDR = struct.Struct("<QIBBH")
+
+# The device chain has two stages of sections, either side of its common
+# average reference.
+STAGE_PRE, STAGE_POST = 0, 1
+MAX_SECTIONS = 8
 
 # Motion sensor: ts, seq, period in 1/256 us, accel g, gyro dps, axes,
 # flags, count. Rates and ranges are the ones the LSM6DSV16X offers.
@@ -100,28 +117,109 @@ DEVICE_NAME = "SwiftEEG"
 USB_VID, USB_PID = 0x2FE3, 0x0001
 
 
+def _i24(raw: np.ndarray) -> np.ndarray:
+    """Little-endian 24-bit two's complement, three bytes on the last axis."""
+    a = raw.astype(np.int32)
+    v = a[..., 0] | (a[..., 1] << 8) | (a[..., 2] << 16)
+    return np.where(v & 0x800000, v - (1 << 24), v)
+
+
 def decode_data(payload: bytes):
-    """A DATA payload to (ts_us, seq, counts) with counts as (samples, ch)."""
+    """
+    A DATA payload to (ts_us, seq, encoding, counts, uv).
+
+    counts is (samples, channels) of raw converter counts and uv the device
+    chain's microvolts, the same shape; either is None when the encoding does
+    not carry it.
+    """
     ts, seq, ch, enc, count = DATA_HDR.unpack_from(payload)
-    width = 3 if enc == ENC_RAW_I24 else 4
+    width = {ENC_RAW_I24: 3, ENC_RAW_UV: 7}.get(enc, 4)
     need = count * ch * width
     body = payload[DATA_HDR.size:DATA_HDR.size + need]
 
     if len(body) < need:
         return None
 
-    if enc == ENC_RAW_I24:
-        # Little-endian 24-bit two's complement, three bytes per channel.
-        a = np.frombuffer(body, dtype=np.uint8).reshape(-1, 3).astype(np.int32)
-        v = a[:, 0] | (a[:, 1] << 8) | (a[:, 2] << 16)
-        v = np.where(v & 0x800000, v - (1 << 24), v)
-        vals = v.reshape(count, ch)
-    elif enc == ENC_UV_F32:
-        vals = np.frombuffer(body, dtype="<f4").reshape(count, ch)
-    else:
-        vals = np.frombuffer(body, dtype="<i4").reshape(count, ch)
+    raw = np.frombuffer(body, dtype=np.uint8)
 
-    return ts, seq, enc, vals
+    if enc == ENC_RAW_I24:
+        return ts, seq, enc, _i24(raw.reshape(count, ch, 3)), None
+    if enc == ENC_RAW_UV:
+        rec = raw.reshape(count, ch, 7)
+        uv = np.ascontiguousarray(rec[:, :, 3:]).view("<f4").reshape(count, ch)
+        return ts, seq, enc, _i24(rec[:, :, :3]), uv
+    if enc == ENC_UV_F32:
+        return ts, seq, enc, None, np.frombuffer(body, dtype="<f4").reshape(count, ch)
+    return ts, seq, enc, np.frombuffer(body, dtype="<i4").reshape(count, ch), None
+
+
+def pack_sections(sections) -> bytes:
+    """Sections as they travel: g, k, m0, m1, m2, each little-endian float32."""
+    return b"".join(struct.pack("<5f", *s) for s in sections)
+
+
+def filter_args(stage: int, sections, fs: float,
+                keep_state: bool = False) -> list[int]:
+    """
+    Arguments for CMD_SET_FILTER.
+
+    `fs` is the rate the sections were designed for. The device refuses them
+    at any other rate: a filter designed for one rate is a different filter
+    at another.
+    """
+    if len(sections) > MAX_SECTIONS:
+        raise ValueError(f"at most {MAX_SECTIONS} sections per stage")
+    fs = int(round(fs))
+    return [stage, 1 if keep_state else 0, fs & 0xFF, fs >> 8, len(sections),
+            *pack_sections(sections)]
+
+
+def sections_crc(sections) -> int:
+    """The CRC the device reports for a stage holding these sections."""
+    return proto_ref.crc16(pack_sections(sections))
+
+
+def response_seq(payload: bytes) -> int | None:
+    """The sample a filter change applies from, read from its OK response."""
+    if len(payload) >= 6 and payload[1] == STATUS_OK:
+        return struct.unpack_from("<I", payload, 2)[0]
+    return None
+
+
+def decode_config(p: bytes) -> dict | None:
+    """
+    A CMD_GET_CONFIG response - opcode, status, then the state - as a dict.
+    Older firmware sends less, and only what arrived is filled in.
+    """
+    if len(p) < 7 or p[0] != CMD_GET_CONFIG or p[1] != STATUS_OK:
+        return None
+
+    cfg = {"channels": p[2], "encoding": p[3], "rate": p[4] | (p[5] << 8),
+           "notch": p[6]}
+
+    if len(p) >= 15:
+        chset = bytes(p[7:15])
+        cfg["chset"] = chset
+        cfg["gains"] = [GAIN_FROM_CODE.get((c >> 4) & 0x07) for c in chset]
+        cfg["mux"] = [c & 0x07 for c in chset]
+
+    if len(p) >= 21:
+        cfg["imu_on"] = bool(p[15] & 0x01)
+        cfg["imu_fitted"] = bool(p[15] & 0x02)
+        cfg["imu_rate"] = p[16] | (p[17] << 8)
+        cfg["imu_accel_g"] = p[18]
+        cfg["imu_gyro_dps"] = p[19] | (p[20] << 8)
+
+    if len(p) >= 29:
+        cfg["pre_count"] = p[21]
+        cfg["post_count"] = p[22]
+        cfg["car"] = bool(p[23] & 0x01)
+        cfg["pre_is_notch"] = bool(p[23] & 0x02)
+        cfg["car_mask"] = p[24]
+        cfg["pre_crc"] = p[25] | (p[26] << 8)
+        cfg["post_crc"] = p[27] | (p[28] << 8)
+
+    return cfg
 
 
 class FrameParser:

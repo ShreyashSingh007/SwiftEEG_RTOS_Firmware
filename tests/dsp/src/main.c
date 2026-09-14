@@ -3,9 +3,9 @@
  *
  * DSP results are checked against golden vectors from tools/dsp_ref.py,
  * which is the authoritative reference. Integer DC removal must match bit
- * for bit; float paths allow a small tolerance because the compiler may
- * contract multiply-adds into FMA, which rounds differently from two
- * separate operations.
+ * for bit. Float paths allow a small tolerance: the reference designs its
+ * sections in float64 and rounds them, where the firmware designs in float32,
+ * and the last bit of a mantissa can differ.
  *
  * Build:  .\tools\build.ps1 -Target dsp
  */
@@ -22,6 +22,23 @@
 /* Signal peaks near 88, so this is roughly 1 part in 10^4. */
 #define FLOAT_TOL 5e-3f
 
+/* Relative tolerance on a section designed here against the reference's. */
+#define DESIGN_TOL 1e-5f
+
+static void assert_section_close(const dsp_section_t *got,
+				 const dsp_section_t *want, const char *what)
+{
+	const float g[5] = { got->g, got->k, got->m0, got->m1, got->m2 };
+	const float w[5] = { want->g, want->k, want->m0, want->m1, want->m2 };
+
+	for (int i = 0; i < 5; i++) {
+		const float tol = DESIGN_TOL * fabsf(w[i]) + 1e-7f;
+
+		zassert_within(g[i], w[i], tol, "%s value %d: %.9f vs %.9f",
+			       what, i, (double)g[i], (double)w[i]);
+	}
+}
+
 /* ------------------------------------------------------------------ DSP */
 
 ZTEST(dsp, test_lsb_scaling)
@@ -36,52 +53,88 @@ ZTEST(dsp, test_lsb_scaling)
 	zassert_equal(dsp_lsb_uv(4.5f, 0), 0.0f, "gain 0 not rejected");
 }
 
-ZTEST(dsp, test_notch_coeffs_match_reference)
+ZTEST(dsp, test_notch_design_matches_reference)
 {
-	dsp_biquad_coeffs_t c;
+	dsp_section_t s;
 
-	zassert_true(dsp_design_notch(&c, GOLDEN_DSP_FS, 50.0f, 30.0f),
+	zassert_true(dsp_design_notch(&s, GOLDEN_DSP_FS, 50.0f, 30.0f),
 		     "notch design failed");
-
-	const float got[5] = { c.b0, c.b1, c.b2, c.a1, c.a2 };
-	for (int i = 0; i < 5; i++) {
-		zassert_within(got[i], golden_notch50_coeffs[i], 1e-6f,
-			       "notch coeff %d: %.9f vs %.9f", i,
-			       (double)got[i], (double)golden_notch50_coeffs[i]);
-	}
+	assert_section_close(&s, &golden_notch50, "notch");
 }
 
-ZTEST(dsp, test_lowpass_coeffs_match_reference)
+ZTEST(dsp, test_lowpass_design_matches_reference)
 {
-	dsp_biquad_coeffs_t c;
-	const float q = 1.0f / sqrtf(2.0f);
+	dsp_section_t s;
 
-	zassert_true(dsp_design_lowpass(&c, GOLDEN_DSP_FS, 40.0f, q),
+	zassert_true(dsp_design_lowpass(&s, GOLDEN_DSP_FS, 40.0f,
+					1.0f / sqrtf(2.0f)),
 		     "lowpass design failed");
+	assert_section_close(&s, &golden_lp40, "lowpass");
+}
 
-	const float got[5] = { c.b0, c.b1, c.b2, c.a1, c.a2 };
-	for (int i = 0; i < 5; i++) {
-		zassert_within(got[i], golden_lp40_coeffs[i], 1e-6f,
-			       "lp coeff %d: %.9f vs %.9f", i,
-			       (double)got[i], (double)golden_lp40_coeffs[i]);
-	}
+ZTEST(dsp, test_highpass_design_matches_reference)
+{
+	dsp_section_t s;
+
+	zassert_true(dsp_design_highpass(&s, GOLDEN_DSP_FS, 0.1f,
+					 GOLDEN_DSP_HP_Q),
+		     "highpass design failed");
+	assert_section_close(&s, &golden_hp01, "highpass");
 }
 
 ZTEST(dsp, test_design_rejects_bad_args)
 {
-	dsp_biquad_coeffs_t c;
+	dsp_section_t s;
 
 	/* At or above Nyquist is not designable. */
-	zassert_false(dsp_design_notch(&c, 1000.0f, 500.0f, 30.0f),
+	zassert_false(dsp_design_notch(&s, 1000.0f, 500.0f, 30.0f),
 		      "f0 at Nyquist accepted");
-	zassert_false(dsp_design_notch(&c, 1000.0f, 600.0f, 30.0f),
+	zassert_false(dsp_design_notch(&s, 1000.0f, 600.0f, 30.0f),
 		      "f0 above Nyquist accepted");
-	zassert_false(dsp_design_lowpass(&c, 1000.0f, 40.0f, 0.0f),
+	zassert_false(dsp_design_lowpass(&s, 1000.0f, 40.0f, 0.0f),
 		      "zero Q accepted");
-	zassert_false(dsp_design_highpass(&c, 0.0f, 1.0f, 0.7f),
+	zassert_false(dsp_design_highpass(&s, 0.0f, 1.0f, 0.7f),
 		      "zero fs accepted");
 	zassert_false(dsp_design_notch(NULL, 1000.0f, 50.0f, 30.0f),
 		      "null output accepted");
+}
+
+ZTEST(dsp, test_invalid_sections_are_refused)
+{
+	dsp_cascade_t c;
+	dsp_section_t bad;
+
+	dsp_cascade_init(&c, 1);
+	zassert_true(dsp_cascade_set(&c, &golden_notch50, 1), NULL);
+
+	/*
+	 * g and k must be positive and every value finite. Anything else is
+	 * refused without touching what is loaded - a section from a host
+	 * that would not be stable is not run.
+	 */
+	bad = golden_notch50;
+	bad.g = 0.0f;
+	zassert_false(dsp_cascade_set(&c, &bad, 1), "g = 0 accepted");
+
+	bad = golden_notch50;
+	bad.k = -1.0f;
+	zassert_false(dsp_cascade_set(&c, &bad, 1), "negative k accepted");
+
+	bad = golden_notch50;
+	bad.m1 = NAN;
+	zassert_false(dsp_cascade_set(&c, &bad, 1), "NaN accepted");
+
+	bad = golden_notch50;
+	bad.g = INFINITY;
+	zassert_false(dsp_cascade_retune(&c, &bad, 1), "infinite g accepted");
+
+	zassert_equal(c.count, 1, "a refused load changed the cascade");
+
+	/* No sections at all is a pass-through, not an error. */
+	zassert_true(dsp_cascade_set(&c, NULL, 0), "clearing refused");
+	zassert_equal(c.count, 0, "cascade not cleared");
+	zassert_equal(dsp_cascade_apply(&c, 0, 12.5f), 12.5f,
+		      "an empty cascade must pass samples through");
 }
 
 ZTEST(dsp, test_integer_dc_removal_is_exact)
@@ -125,14 +178,12 @@ ZTEST(dsp, test_dc_priming_removes_startup_transient)
 	zassert_equal(dsp_dc_apply(&dc, -250000), 0, "negative constant leaked");
 }
 
-ZTEST(dsp, test_single_biquad_matches_reference)
+ZTEST(dsp, test_single_section_matches_reference)
 {
 	dsp_cascade_t c;
-	dsp_biquad_coeffs_t notch;
 
 	dsp_cascade_init(&c, 1);
-	zassert_true(dsp_design_notch(&notch, GOLDEN_DSP_FS, 50.0f, 30.0f), NULL);
-	zassert_true(dsp_cascade_set(&c, &notch, 1), NULL);
+	zassert_true(dsp_cascade_set(&c, &golden_notch50, 1), NULL);
 
 	for (int i = 0; i < GOLDEN_DSP_N; i++) {
 		float y = dsp_cascade_apply(&c, 0, golden_dsp_input[i]);
@@ -146,12 +197,9 @@ ZTEST(dsp, test_single_biquad_matches_reference)
 ZTEST(dsp, test_two_section_cascade_matches_reference)
 {
 	dsp_cascade_t c;
-	dsp_biquad_coeffs_t sections[2];
-	const float q = 1.0f / sqrtf(2.0f);
+	const dsp_section_t sections[2] = { golden_notch50, golden_lp40 };
 
 	dsp_cascade_init(&c, 1);
-	zassert_true(dsp_design_notch(&sections[0], GOLDEN_DSP_FS, 50.0f, 30.0f), NULL);
-	zassert_true(dsp_design_lowpass(&sections[1], GOLDEN_DSP_FS, 40.0f, q), NULL);
 	zassert_true(dsp_cascade_set(&c, sections, 2), NULL);
 
 	for (int i = 0; i < GOLDEN_DSP_N; i++) {
@@ -163,14 +211,41 @@ ZTEST(dsp, test_two_section_cascade_matches_reference)
 	}
 }
 
+ZTEST(dsp, test_low_corner_highpass_matches_reference)
+{
+	/*
+	 * The case this section form exists for: a 0.1 Hz high-pass on 3 mV of
+	 * slow signal. The direct form it replaced ended microvolts away from
+	 * the float64 answer on input like this.
+	 */
+	dsp_cascade_t c;
+	float worst = 0.0f;
+
+	dsp_cascade_init(&c, 1);
+	zassert_true(dsp_cascade_set(&c, &golden_hp01, 1), NULL);
+
+	for (int i = 0; i < GOLDEN_DSP_N_HP; i++) {
+		const float y = dsp_cascade_apply(&c, 0, golden_dsp_drift[i]);
+		const float d = fabsf(y - golden_dsp_highpassed[i]);
+
+		if (d > worst) {
+			worst = d;
+		}
+
+		zassert_within(y, golden_dsp_highpassed[i], FLOAT_TOL,
+			       "sample %d: got %.6f, reference %.6f",
+			       i, (double)y, (double)golden_dsp_highpassed[i]);
+	}
+
+	TC_PRINT("worst deviation %e uV\n", (double)worst);
+}
+
 ZTEST(dsp, test_channels_are_independent)
 {
 	dsp_cascade_t c;
-	dsp_biquad_coeffs_t notch;
 
 	dsp_cascade_init(&c, DSP_MAX_CHANNELS);
-	zassert_true(dsp_design_notch(&notch, GOLDEN_DSP_FS, 50.0f, 30.0f), NULL);
-	zassert_true(dsp_cascade_set(&c, &notch, 1), NULL);
+	zassert_true(dsp_cascade_set(&c, &golden_notch50, 1), NULL);
 
 	/*
 	 * Drive channel 0 hard while channel 1 sees only zeros. If state were
@@ -189,12 +264,10 @@ ZTEST(dsp, test_channels_are_independent)
 ZTEST(dsp, test_reset_state_clears_history)
 {
 	dsp_cascade_t c;
-	dsp_biquad_coeffs_t notch;
 	float first_run[16];
 
 	dsp_cascade_init(&c, 1);
-	zassert_true(dsp_design_notch(&notch, GOLDEN_DSP_FS, 50.0f, 30.0f), NULL);
-	zassert_true(dsp_cascade_set(&c, &notch, 1), NULL);
+	zassert_true(dsp_cascade_set(&c, &golden_notch50, 1), NULL);
 
 	for (int i = 0; i < 16; i++) {
 		first_run[i] = dsp_cascade_apply(&c, 0, golden_dsp_input[i]);
@@ -211,19 +284,68 @@ ZTEST(dsp, test_reset_state_clears_history)
 	}
 }
 
-ZTEST(dsp, test_group_delay_is_sane)
+ZTEST(dsp, test_retune_keeps_state)
 {
-	dsp_biquad_coeffs_t lp;
-	const float q = 1.0f / sqrtf(2.0f);
+	/*
+	 * Retuning to the very same sections must be invisible: the output
+	 * carries on exactly as if nothing had happened. A retune that reset
+	 * the state would put a transient in instead.
+	 */
+	dsp_cascade_t steady, retuned;
+	const dsp_section_t sections[2] = { golden_notch50, golden_lp40 };
 
-	zassert_true(dsp_design_lowpass(&lp, GOLDEN_DSP_FS, 40.0f, q), NULL);
+	dsp_cascade_init(&steady, 1);
+	dsp_cascade_init(&retuned, 1);
+	zassert_true(dsp_cascade_set(&steady, sections, 2), NULL);
+	zassert_true(dsp_cascade_set(&retuned, sections, 2), NULL);
+
+	for (int i = 0; i < GOLDEN_DSP_N; i++) {
+		if (i == GOLDEN_DSP_N / 2) {
+			zassert_true(dsp_cascade_retune(&retuned, sections, 2),
+				     "retune refused");
+		}
+
+		const float a = dsp_cascade_apply(&steady, 0, golden_dsp_input[i]);
+		const float b = dsp_cascade_apply(&retuned, 0, golden_dsp_input[i]);
+
+		zassert_equal(a, b, "retune disturbed sample %d: %f vs %f",
+			      i, (double)a, (double)b);
+	}
+
+	/* A different number of sections is a different filter: refused. */
+	zassert_false(dsp_cascade_retune(&retuned, sections, 1),
+		      "retune accepted a different number of sections");
+	zassert_equal(retuned.count, 2, "a refused retune changed the cascade");
+}
+
+ZTEST(dsp, test_settle_samples_are_sane)
+{
+	dsp_cascade_t c;
+
+	dsp_cascade_init(&c, 1);
+	zassert_equal(dsp_cascade_settle_samples(&c), 0,
+		      "an empty cascade has nothing to settle");
 
 	/*
-	 * A causal filter cannot have negative group delay in its passband,
-	 * and the value must be finite - it is reported to the host so
-	 * timestamps can be corrected.
+	 * A Q 30 notch at 50 Hz and 1 kSPS rings down to 1 % in about
+	 * 4.6 Q / (pi f0) seconds: some 880 samples.
 	 */
-	const float d = dsp_biquad_group_delay(&lp, GOLDEN_DSP_FS, 10.0f);
+	zassert_true(dsp_cascade_set(&c, &golden_notch50, 1), NULL);
+
+	const uint32_t n = dsp_cascade_settle_samples(&c);
+
+	zassert_true(n > 800u && n < 960u, "notch settles in %u samples", n);
+}
+
+ZTEST(dsp, test_group_delay_is_sane)
+{
+	/*
+	 * A causal filter cannot have negative group delay in its passband,
+	 * and the value must be finite - it is what timestamps get corrected
+	 * by.
+	 */
+	const float d = dsp_section_group_delay(&golden_lp40, GOLDEN_DSP_FS,
+						10.0f);
 
 	zassert_true(isfinite(d), "group delay is not finite");
 	zassert_true(d > 0.0f, "passband group delay %.4f is negative",
@@ -235,13 +357,19 @@ ZTEST(dsp, test_group_delay_is_sane)
 ZTEST(dsp, test_cascade_rejects_too_many_sections)
 {
 	dsp_cascade_t c;
-	dsp_biquad_coeffs_t sections[DSP_MAX_SECTIONS + 1];
+	dsp_section_t sections[DSP_MAX_SECTIONS + 1];
 
 	dsp_cascade_init(&c, 1);
-	memset(sections, 0, sizeof(sections));
+
+	/* Every section valid, so only the count can be what is refused. */
+	for (int i = 0; i < DSP_MAX_SECTIONS + 1; i++) {
+		sections[i] = golden_notch50;
+	}
 
 	zassert_false(dsp_cascade_set(&c, sections, DSP_MAX_SECTIONS + 1),
 		      "oversized cascade accepted");
+	zassert_true(dsp_cascade_set(&c, sections, DSP_MAX_SECTIONS),
+		     "a full cascade refused");
 }
 
 ZTEST_SUITE(dsp, NULL, NULL, NULL, NULL, NULL);

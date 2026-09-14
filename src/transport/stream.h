@@ -23,6 +23,8 @@
 #define STREAM_ENC_RAW_I32 0u /* ADC counts, before the DSP chain */
 #define STREAM_ENC_UV_F32  1u /* microvolts, after the DSP chain */
 #define STREAM_ENC_RAW_I24 2u /* ADC counts packed to three bytes */
+#define STREAM_ENC_RAW_UV  3u /* both, per channel: counts in three bytes,
+                               * then microvolts after the chain */
 
 struct stream_stats {
 	uint32_t frames_sent;

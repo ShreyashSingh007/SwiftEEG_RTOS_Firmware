@@ -258,6 +258,15 @@ int ads1299_set_leadoff(bool enable, uint8_t sensp, uint8_t sensn);
 int ads1299_get_channels(uint8_t *out, uint8_t count);
 
 /*
+ * The CHnSET values this driver last wrote, without touching the bus. Every
+ * write goes through the driver, so this is what the part holds. The chain
+ * takes its gains from here: a register read pauses acquisition for a few
+ * milliseconds, a price worth paying to report state to a host but not to
+ * rescale after every command.
+ */
+void ads1299_get_channels_cached(uint8_t *out, uint8_t count);
+
+/*
  * Configure one channel, or every channel when `ch` is 0xFF.
  * `power_down` parks an unused channel; `srb2` routes its negative input to
  * SRB2 instead of SRB1.

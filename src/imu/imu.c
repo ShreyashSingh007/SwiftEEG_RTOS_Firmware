@@ -131,6 +131,20 @@ static uint64_t nominal_q8;   /* what the rate says it should be */
 static uint32_t seq;          /* index of the next sample */
 static uint8_t  next_flags;
 
+/*
+ * The accelerometer and gyroscope words of one time slot leave the FIFO one
+ * after the other, and a read can end between them. The half read last waits
+ * here for its partner, which is then the first word of the next read.
+ */
+struct half {
+	bool    have;
+	uint8_t cnt;
+	int16_t xyz[3];
+};
+
+static struct half pend_acc;
+static struct half pend_gyr;
+
 struct motion {
 	int16_t v[6]; /* accel x y z, gyro x y z */
 };
@@ -263,6 +277,10 @@ static void timing_reset(uint16_t hz)
 	nominal_q8 = ((uint64_t)1000000 << 8) / hz;
 	period_q8 = nominal_q8;
 	last_capture = timebase_imu_capture_get();
+
+	/* A half still waiting belongs to samples no longer in the FIFO. */
+	pend_acc.have = false;
+	pend_gyr.have = false;
 }
 
 static int apply(const struct imu_config *c)
@@ -409,58 +427,74 @@ static int drain(void)
 	const uint32_t after = timebase_imu_capture_get();
 
 	uint16_t n = 0;
+	uint16_t lost = 0;
 	int edge_sample = -1;
 	bool edge_word_read = false;
-	bool have_a = false;
-	bool have_g = false;
-	uint8_t cnt_a = 0;
-	uint8_t cnt_g = 0;
-	int16_t acc[3] = { 0 };
-	int16_t gyr[3] = { 0 };
 
 	for (uint16_t w = 0; w < words; w++) {
 		const uint8_t *word = &fifo_buf[w * WORD_BYTES];
 		const uint8_t tag = (uint8_t)(word[0] >> 3);
 		const uint8_t cnt = (uint8_t)((word[0] >> 1) & 0x03);
+
+		if (w == (uint16_t)(wtm - 1)) {
+			edge_word_read = true;
+		}
+
+		if (tag != TAG_ACCEL && tag != TAG_GYRO) {
+			continue;
+		}
+
+		const bool is_acc = (tag == TAG_ACCEL);
+		struct half *mine = is_acc ? &pend_acc : &pend_gyr;
+		struct half *other = is_acc ? &pend_gyr : &pend_acc;
 		int16_t xyz[3];
 
 		for (int a = 0; a < 3; a++) {
 			xyz[a] = (int16_t)(word[1 + 2 * a] | (word[2 + 2 * a] << 8));
 		}
 
-		if (tag == TAG_ACCEL) {
-			memcpy(acc, xyz, sizeof(acc));
-			cnt_a = cnt;
-			have_a = true;
-		} else if (tag == TAG_GYRO) {
-			memcpy(gyr, xyz, sizeof(gyr));
-			cnt_g = cnt;
-			have_g = true;
-		}
-
-		if (w == (uint16_t)(wtm - 1)) {
-			edge_word_read = true;
-		}
-
-		if (!(have_a && have_g)) {
-			continue;
-		}
-
 		/* Both words of one time slot share a tag counter. */
-		if (cnt_a == cnt_g) {
-			memcpy(samples[n].v, acc, sizeof(acc));
-			memcpy(&samples[n].v[3], gyr, sizeof(gyr));
+		if (other->have && other->cnt == cnt) {
+			memcpy(samples[n].v, is_acc ? xyz : other->xyz, sizeof(xyz));
+			memcpy(&samples[n].v[3], is_acc ? other->xyz : xyz,
+			       sizeof(xyz));
+			other->have = false;
 			n++;
 
 			if (edge_word_read && edge_sample < 0) {
 				edge_sample = (int)n - 1;
 			}
-		} else {
-			stats.unpaired++;
+			continue;
 		}
 
-		have_a = false;
-		have_g = false;
+		/*
+		 * No partner for this word yet, so whatever was waiting will
+		 * never have one: that one sample is lost, and only that one.
+		 * Throwing both words away at any mismatch, as this once did,
+		 * lost every sample of a read that began with the second half
+		 * of a slot - ten at a time, with nothing to say so - because
+		 * each word after it was then paired with the wrong one.
+		 */
+		if (other->have) {
+			other->have = false;
+			lost++;
+		}
+		if (mine->have) {
+			lost++;
+		}
+		mine->have = true;
+		mine->cnt = cnt;
+		memcpy(mine->xyz, xyz, sizeof(xyz));
+	}
+
+	if (lost != 0u) {
+		/*
+		 * The run has a hole in it. Say so, and do not carry the timing
+		 * on from an edge the missing samples sit behind.
+		 */
+		stats.unpaired += lost;
+		next_flags |= IMU_FLAG_OVERRUN;
+		have_edge = false;
 	}
 
 	uint8_t flags = next_flags;

@@ -24,7 +24,8 @@
 
 /* IMU frame flags. */
 #define IMU_FLAG_TIME_ESTIMATED 0x01 /* no watermark edge; timed from the poll */
-#define IMU_FLAG_OVERRUN        0x02 /* the sensor FIFO overflowed before this */
+#define IMU_FLAG_OVERRUN        0x02 /* samples lost before this batch: the FIFO
+                                      * overflowed, or a word had no pair */
 
 struct imu_config {
 	bool     enabled;
@@ -37,7 +38,7 @@ struct imu_stats {
 	uint32_t samples;      /* read from the sensor */
 	uint32_t frames;       /* handed to a link */
 	uint32_t overruns;     /* times the sensor FIFO overflowed */
-	uint32_t unpaired;     /* FIFO words without a partner, dropped */
+	uint32_t unpaired;     /* samples lost: a FIFO word whose pair never came */
 	uint32_t extrapolated; /* batches placed from an earlier edge */
 	uint32_t estimated;    /* batches timed from the poll, no edge yet */
 	uint32_t period_us_q8; /* measured sample period, 1/256 us */

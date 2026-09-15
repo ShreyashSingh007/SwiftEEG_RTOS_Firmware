@@ -13,7 +13,8 @@ The chain, in order:
       -> 24-bit big-endian two's complement, per channel   (frame.h)
       -> integer DC removal, leaky integrator              (dsp_dc_apply)
       -> times the channel's own LSB, to microvolts        (float32 from here)
-      -> pre sections: high-pass and notch                 (dsp_cascade_apply)
+      -> pre sections: high-pass                           (dsp_cascade_apply)
+      -> the mains notch and its harmonic
       -> common average over the masked channels
       -> post sections: low-pass
 
@@ -107,6 +108,17 @@ def frame_is_valid(frame: bytes) -> bool:
 
 # --- the chain ------------------------------------------------------------
 
+def notch_sections(fs: float, hz: float, q: float, harmonic: bool) -> list:
+    """The sections chain_set_notch designs, the way it designs them."""
+    if hz <= 0:
+        return []
+    sections = [dsp_ref.design_notch_f32(fs, hz, q)]
+    twice = F32(2.0) * F32(hz)
+    if harmonic and twice < F32(0.95) * F32(0.5) * F32(fs):
+        sections.append(dsp_ref.design_notch_f32(fs, twice, q))
+    return sections
+
+
 class Chain:
     """
     Mirror of chain_t, operation for operation. Settings change between
@@ -116,7 +128,7 @@ class Chain:
 
     def __init__(self, fs: float = FS_HZ, dc_shift: int | None = None,
                  notch_hz: float = NOTCH_HZ, notch_q: float = NOTCH_Q,
-                 vref: float = VREF_V, gain: int = GAIN):
+                 harmonic: bool = True, vref: float = VREF_V, gain: int = GAIN):
         self.fs = float(fs)
         self.shift = dc_shift_for(fs) if dc_shift is None else dc_shift
         self.vref = vref
@@ -124,13 +136,23 @@ class Chain:
         self.dc_acc = [0] * CHANNELS
         self.dc_primed = [False] * CHANNELS
         self.pre = dsp_ref.Cascade(CHANNELS)
+        self.notch = dsp_ref.Cascade(CHANNELS)
         self.post = dsp_ref.Cascade(CHANNELS)
         self.car = False
         self.mask = 0xFF
-        self.set_notch(notch_hz, notch_q)
+        self.mains_mask = 0xFF
+        self.mains_in = F32(0.0)
+        self.set_notch(notch_hz, notch_q, harmonic)
 
-    def set_notch(self, hz: float, q: float = NOTCH_Q) -> None:
-        self.pre.set([] if hz <= 0 else [dsp_ref.design_notch(self.fs, hz, q)])
+    def set_notch(self, hz: float, q: float = NOTCH_Q, harmonic: bool = True,
+                  keep_state: bool = False) -> bool:
+        """Mirrors chain_set_notch. Returns whether the state was kept."""
+        sections = notch_sections(self.fs, hz, q, harmonic)
+        if keep_state and self.notch.retune(sections):
+            return True
+        if not self.notch.set(sections):
+            raise ValueError("invalid notch")
+        return False
 
     def set_stage(self, stage: int, sections, keep_state: bool = False) -> bool:
         """Load a stage. Returns whether the state was kept."""
@@ -145,6 +167,9 @@ class Chain:
         self.car = bool(enable)
         self.mask = int(mask) & 0xFF
 
+    def set_mains_mask(self, mask: int) -> None:
+        self.mains_mask = int(mask) & 0xFF
+
     def set_gain(self, ch: int, gain: int) -> None:
         lsb = dsp_ref.lsb_uv_f32(self.vref, gain)
         if lsb != self.lsb[ch]:
@@ -154,15 +179,20 @@ class Chain:
     def reset(self) -> None:
         self.dc_primed = [False] * CHANNELS
         self.pre.reset()
+        self.notch.reset()
         self.post.reset()
 
     def settle_samples(self) -> int:
-        return min(0xFFFFFFFF,
-                   self.pre.settle_samples() + self.post.settle_samples())
+        total = 0
+        for cas in (self.pre, self.notch, self.post):
+            total = min(0xFFFFFFFF, total + cas.settle_samples())
+        return total
 
     def process_counts(self, counts):
         """One sample's eight raw counts in, eight float32 microvolts out."""
         v = []
+        in_sum = F32(0.0)
+        in_n = 0
         for ch in range(CHANNELS):
             s = int(counts[ch])
 
@@ -176,11 +206,16 @@ class Chain:
 
             # Stage 1: microvolts, at this channel's own gain.
             uv = F32(ac) * self.lsb[ch]
+            if self.mains_mask & (1 << ch):
+                in_sum = in_sum + uv
+                in_n += 1
 
-            # Stage 2: the pre sections.
-            v.append(self.pre.apply(ch, uv))
+            # Stages 2 and 3: the pre sections, then the notch.
+            v.append(self.notch.apply(ch, self.pre.apply(ch, uv)))
 
-        # Stage 3: common average over the masked channels.
+        self.mains_in = in_sum / F32(in_n) if in_n else F32(0.0)
+
+        # Stage 4: common average over the masked channels.
         if self.car:
             total = F32(0.0)
             n = 0
@@ -192,7 +227,7 @@ class Chain:
                 mean = total / F32(n)
                 v = [x - mean for x in v]
 
-        # Stage 4: the post sections.
+        # Stage 5: the post sections.
         return np.array([self.post.apply(ch, v[ch]) for ch in range(CHANNELS)],
                         dtype=F32)
 
@@ -264,34 +299,37 @@ def make_frames(n: int, fs: float = FS_HZ):
 
 def full_config() -> dict:
     """
-    What the host application loads: a 0.5 Hz high-pass and a mains notch
-    with its harmonic before the average, a 45 Hz low-pass after it. Partway
-    through, the notch follows the mains 0.2 Hz down keeping its state, the
+    What the host application loads: a 0.5 Hz high-pass before the average,
+    a 45 Hz low-pass after it, and the device's notch with its harmonic.
+    Partway through, the mains input leaves channel 1 out, the notch follows
+    the mains 0.2 Hz down keeping its state, the low-pass restarts, the
     average takes in another channel, and the chain restarts.
     """
     fs = 250.0
     q1, q2 = dsp_ref.butterworth_qs(4)
-    hp = [dsp_ref.design_highpass(fs, 0.5, q1), dsp_ref.design_highpass(fs, 0.5, q2)]
     return {
         "fs": fs,
         "gains": [24, 12, 24, 24, 24, 24, 24, 24],
-        "pre": hp + [dsp_ref.design_notch(fs, 50.0, 12.0),
-                     dsp_ref.design_notch(fs, 100.0, 12.0)],
-        "pre_retuned": hp + [dsp_ref.design_notch(fs, 49.8, 12.0),
-                             dsp_ref.design_notch(fs, 99.6, 12.0)],
+        "pre": [dsp_ref.design_highpass(fs, 0.5, q1),
+                dsp_ref.design_highpass(fs, 0.5, q2)],
+        "notch_hz": 50.0,
+        "notch_q": 12.0,
+        "notch_retuned_hz": 49.8,
         "post": [dsp_ref.design_lowpass(fs, 45.0, q1),
                  dsp_ref.design_lowpass(fs, 45.0, q2)],
         "mask": 0x3F,
         "mask_later": 0x7F,
+        "mains_mask": 0xFE,
+        "mains_mask_at": 128,
         "retune_at": 256,
+        "restart_post_at": 320,
         "car_at": 384,
         "reset_at": 448,
-        "restart_post_at": 320,
     }
 
 
 def build_full(cfg: dict) -> Chain:
-    c = Chain(cfg["fs"], notch_hz=0.0)
+    c = Chain(cfg["fs"], notch_hz=cfg["notch_hz"], notch_q=cfg["notch_q"])
     for ch, g in enumerate(cfg["gains"]):
         c.set_gain(ch, g)
     c.set_stage(STAGE_PRE, cfg["pre"])
@@ -301,11 +339,15 @@ def build_full(cfg: dict) -> Chain:
 
 
 def run_full(frames, cfg: dict, events: bool = True):
+    """Microvolts out, and mains_in after each frame."""
     c = build_full(cfg)
-    rows = []
+    rows, mains_in = [], []
     for i, f in enumerate(frames):
+        if events and i == cfg["mains_mask_at"]:
+            c.set_mains_mask(cfg["mains_mask"])
         if events and i == cfg["retune_at"]:
-            assert c.set_stage(STAGE_PRE, cfg["pre_retuned"], keep_state=True)
+            assert c.set_notch(cfg["notch_retuned_hz"], cfg["notch_q"], True,
+                               keep_state=True)
         if events and i == cfg["restart_post_at"]:
             assert not c.set_stage(STAGE_POST, cfg["post"])
         if events and i == cfg["car_at"]:
@@ -313,7 +355,8 @@ def run_full(frames, cfg: dict, events: bool = True):
         if events and i == cfg["reset_at"]:
             c.reset()
         rows.append(c.process_frame(f))
-    return np.array(rows, dtype=F32)
+        mains_in.append(c.mains_in)
+    return np.array(rows, dtype=F32), np.array(mains_in, dtype=F32)
 
 
 # --- self-test ------------------------------------------------------------
@@ -341,6 +384,13 @@ def _self_test() -> None:
     for sps in (250, 500, 1000, 2000, 4000, 8000, 16000):
         fc = sps / (2 * np.pi * (1 << dc_shift_for(sps)))
         assert 0.07 < fc < 0.09, (sps, fc)
+
+    # The harmonic only where the rate leaves room: 100 Hz at 250 SPS is
+    # under 95 % of Nyquist, 120 Hz is not.
+    assert len(Chain(250.0, notch_hz=50.0).notch.sections) == 2
+    assert len(Chain(250.0, notch_hz=60.0).notch.sections) == 1
+    assert len(Chain(250.0, notch_hz=50.0, harmonic=False).notch.sections) == 1
+    assert len(Chain(250.0, notch_hz=0.0).notch.sections) == 0
 
     frames = make_frames(600)
     out = run_chain(frames)
@@ -397,19 +447,32 @@ def _self_test() -> None:
     assert np.array_equal(run_chain(common, one), run_chain(common, Chain(notch_hz=0.0))), \
         "a single-channel average changed the signal"
 
-    # A retune that keeps its state barely disturbs a signal the filter
-    # passes, where a restart rings: 20 uV of alpha through the notch, moved
-    # 0.2 Hz partway through.
+    # mains_in is the unfiltered mean of the masked channels: with every
+    # channel carrying the same tone it is that tone, and with none, zero.
+    probe = Chain()
+    for fr in common[:50]:
+        probe.process_frame(fr)
+    single = Chain()
+    single.set_mains_mask(0x10)
+    for fr in common[:50]:
+        single.process_frame(fr)
+    assert probe.mains_in == single.mains_in, (probe.mains_in, single.mains_in)
+    probe.set_mains_mask(0x00)
+    probe.process_frame(common[50])
+    assert probe.mains_in == 0.0
+
+    # A notch retune that keeps its state barely disturbs a signal the notch
+    # passes, where a restart rings: 20 uV of alpha, the notch moved 0.2 Hz
+    # partway through.
     alpha20 = (20.0 / (lsb_uv() * 1e-6) * 1e-6) * np.sin(2 * np.pi * 10.0 * t)
     tone = [encode_frame([int(v)] * CHANNELS) for v in alpha20]
-    moved = [dsp_ref.design_notch(FS_HZ, 49.8, NOTCH_Q)]
 
     def retuned(keep: bool):
         c = Chain()
         rows = []
         for i, fr in enumerate(tone):
             if i == 200:
-                c.set_stage(STAGE_PRE, moved, keep_state=keep)
+                c.set_notch(49.8, NOTCH_Q, True, keep_state=keep)
             rows.append(c.process_frame(fr))
         return np.array(rows, dtype=F32)
 
@@ -422,14 +485,16 @@ def _self_test() -> None:
     # The full chain, with its events.
     cfg = full_config()
     frames_b = make_frames(512)
-    with_events = run_full(frames_b, cfg)
+    with_events, mains_b = run_full(frames_b, cfg)
+    assert np.isfinite(mains_b).all()
 
     # A reset is exactly a fresh chain started at that frame. This is what
     # lets a host reproduce the device's output from a known sample.
     r = cfg["reset_at"]
     fresh = build_full(cfg)
-    fresh.set_stage(STAGE_PRE, cfg["pre_retuned"])
+    fresh.set_notch(cfg["notch_retuned_hz"], cfg["notch_q"])
     fresh.set_car(True, cfg["mask_later"])
+    fresh.set_mains_mask(cfg["mains_mask"])
     replay = np.array([fresh.process_frame(fr) for fr in frames_b[r:]], dtype=F32)
     assert np.array_equal(replay, with_events[r:]), "a reset is not a fresh start"
 
@@ -471,11 +536,18 @@ def _c_rows(out) -> list[str]:
             for row in out]
 
 
+def _c_values(vals) -> str:
+    return ",\n\t\t".join(
+        ", ".join(f"{float(v):.9e}f" for v in vals[i:i + 6])
+        for i in range(0, len(vals), 6)
+    )
+
+
 def _emit() -> None:
     frames = make_frames(N_GOLDEN)
     out_a = run_chain(frames)
     cfg = full_config()
-    out_b = run_full(frames, cfg)
+    out_b, mains_b = run_full(frames, cfg)
 
     blob = b"".join(frames)
 
@@ -486,9 +558,9 @@ def _emit() -> None:
     A(" *")
     A(" * Produced by tools/pipeline_ref.py, the reference for the whole")
     A(" * acquisition chain: frame decode, integer DC removal, per-channel")
-    A(" * scaling, the pre sections, the common average and the post sections,")
-    A(" * composed exactly as chain.c composes them. If the C disagrees with")
-    A(" * these values, the C is wrong.")
+    A(" * scaling, the pre sections, the mains notch, the common average and the")
+    A(" * post sections, composed exactly as chain.c composes them. If the C")
+    A(" * disagrees with these values, the C is wrong.")
     A(" *")
     A(" * Regenerate:  python tools/pipeline_ref.py --emit")
     A(" */")
@@ -509,7 +581,7 @@ def _emit() -> None:
     A("\t\t" + _c_bytes(blob))
     A("};")
     A("")
-    A("/* A: the device's default chain - the mains notch, nothing else. */")
+    A("/* A: the device's default chain - the mains notch and its harmonic. */")
     A(f"#define GOLDEN_A_FS       {FS_HZ:.1f}f")
     A(f"#define GOLDEN_A_DC_SHIFT {dc_shift_for(FS_HZ)}")
     A(f"#define GOLDEN_A_NOTCH_HZ {NOTCH_HZ:.1f}f")
@@ -522,26 +594,31 @@ def _emit() -> None:
     A("")
     A("/*")
     A(" * B: the host application's chain loaded onto the device, channel 2 at")
-    A(" * gain 12. At RETUNE_AT the notch pair moves 0.2 Hz keeping its state;")
-    A(" * at RESTART_POST_AT the low-pass restarts, priming on its next input;")
-    A(" * at CAR_AT the average takes in channel 7; at RESET_AT the chain")
-    A(" * restarts.")
+    A(" * gain 12. At MAINS_MASK_AT channel 1 leaves the mains input; at")
+    A(" * RETUNE_AT the notch moves 0.2 Hz keeping its state; at")
+    A(" * RESTART_POST_AT the low-pass restarts, priming on its next input; at")
+    A(" * CAR_AT the average takes in channel 7; at RESET_AT the chain restarts.")
     A(" */")
-    A(f"#define GOLDEN_B_FS            {cfg['fs']:.1f}f")
-    A(f"#define GOLDEN_B_DC_SHIFT      {dc_shift_for(cfg['fs'])}")
-    A(f"#define GOLDEN_B_PRE_COUNT     {len(cfg['pre'])}")
-    A(f"#define GOLDEN_B_POST_COUNT    {len(cfg['post'])}")
-    A(f"#define GOLDEN_B_CAR_MASK      0x{cfg['mask']:02x}u")
-    A(f"#define GOLDEN_B_CAR_MASK_LATER 0x{cfg['mask_later']:02x}u")
-    A(f"#define GOLDEN_B_RETUNE_AT     {cfg['retune_at']}")
-    A(f"#define GOLDEN_B_CAR_AT        {cfg['car_at']}")
-    A(f"#define GOLDEN_B_RESET_AT      {cfg['reset_at']}")
+    A(f"#define GOLDEN_B_FS              {cfg['fs']:.1f}f")
+    A(f"#define GOLDEN_B_DC_SHIFT        {dc_shift_for(cfg['fs'])}")
+    A(f"#define GOLDEN_B_PRE_COUNT       {len(cfg['pre'])}")
+    A(f"#define GOLDEN_B_POST_COUNT      {len(cfg['post'])}")
+    A(f"#define GOLDEN_B_NOTCH_HZ        {cfg['notch_hz']:.1f}f")
+    A(f"#define GOLDEN_B_NOTCH_Q         {cfg['notch_q']:.1f}f")
+    A(f"#define GOLDEN_B_NOTCH_RETUNED_HZ {cfg['notch_retuned_hz']:.9e}f")
+    A(f"#define GOLDEN_B_CAR_MASK        0x{cfg['mask']:02x}u")
+    A(f"#define GOLDEN_B_CAR_MASK_LATER  0x{cfg['mask_later']:02x}u")
+    A(f"#define GOLDEN_B_MAINS_MASK      0x{cfg['mains_mask']:02x}u")
+    A(f"#define GOLDEN_B_MAINS_MASK_AT   {cfg['mains_mask_at']}")
+    A(f"#define GOLDEN_B_RETUNE_AT       {cfg['retune_at']}")
     A(f"#define GOLDEN_B_RESTART_POST_AT {cfg['restart_post_at']}")
+    A(f"#define GOLDEN_B_CAR_AT          {cfg['car_at']}")
+    A(f"#define GOLDEN_B_RESET_AT        {cfg['reset_at']}")
     A("")
     A("static const uint8_t golden_b_gains[GOLDEN_PIPE_CHANNELS] = { "
       + ", ".join(str(g) for g in cfg["gains"]) + " };")
     A("")
-    for name in ("pre", "pre_retuned", "post"):
+    for name in ("pre", "post"):
         count = "GOLDEN_B_POST_COUNT" if name == "post" else "GOLDEN_B_PRE_COUNT"
         A(f"static const dsp_section_t golden_b_{name}[{count}] = {{")
         for s in cfg[name]:
@@ -551,6 +628,11 @@ def _emit() -> None:
     A("static const float golden_b_out"
       "[GOLDEN_PIPE_FRAMES][GOLDEN_PIPE_CHANNELS] = {")
     L.extend(_c_rows(out_b))
+    A("};")
+    A("")
+    A("/* mains_in after each frame of B. */")
+    A("static const float golden_b_mains_in[GOLDEN_PIPE_FRAMES] = {")
+    A("\t\t" + _c_values(mains_b))
     A("};")
     A("")
     A("#endif /* SWIFTEEG_GOLDEN_PIPELINE_H */")

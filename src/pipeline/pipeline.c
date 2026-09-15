@@ -1,6 +1,7 @@
 #include "pipeline.h"
 
 #include <errno.h>
+#include <math.h>
 #include <string.h>
 
 #include <zephyr/kernel.h>
@@ -10,6 +11,7 @@
 #include "capture.h"
 #include "chain.h"
 #include "dsp/dsp.h"
+#include "dsp/mains.h"
 #include "sys/ringbuf.h"
 #include "timebase/timebase.h"
 
@@ -29,12 +31,20 @@ BUILD_ASSERT(PIPELINE_STAGE_PRE == CHAIN_STAGE_PRE &&
 #define RAW_RING_FRAMES 128
 
 /*
- * Mains notch, the pre stage's default. Q 12 is about 4 Hz wide. Mains is
- * never where the nameplate says - measured at 49.6 Hz here - and a Q 30
- * notch aimed at 50.0 takes only 7 dB off that. The host application
- * defaults to Q 12 for the same reason.
+ * The mains notch, Q 12 by default: about 4 Hz wide at 50 Hz. A Q 30 notch
+ * aimed at 50.0 took only 7 dB off mains measured at 49.6 Hz; at Q 12, aimed
+ * at a measurement tens of millihertz out, it takes over 30 dB off.
  */
-#define NOTCH_Q 12.0f
+#define NOTCH_Q_DEFAULT 12u
+
+/*
+ * How far from nominal a measured mains frequency may be and still aim the
+ * notch - grids keep well inside it - and how far a new measurement has to
+ * move before the notch follows. Following is a retune in place, so it adds
+ * no transient; the threshold only stops it chasing the tracker's own noise.
+ */
+#define MAINS_ACCEPT_HZ 1.0f
+#define MAINS_REAIM_HZ  0.03f
 
 /* The part's internal reference. */
 #define VREF_VOLTS 4.5f
@@ -75,16 +85,33 @@ static bool afe_configured;
 static struct k_sem frame_ready;
 
 /*
- * Filter settings that outlive a restart. The device notch and the common
+ * Filter settings that outlive a restart. The notch settings and the common
  * average do not depend on the rate; sections a host loaded do, and are
  * dropped with it.
  */
-static float notch_hz = 50.0f;
+struct notch_settings {
+	uint8_t hz;       /* nominal: 0, 50 or 60 */
+	uint8_t q;
+	bool    harmonic;
+	bool    track;
+};
+
+static struct notch_settings notch = { 50u, NOTCH_Q_DEFAULT, true, true };
 static bool car_on;
 static uint8_t car_mask = 0xFFu;
 
-/* Whether the pre stage holds the device notch rather than host sections. */
-static bool pre_is_notch = true;
+/*
+ * The mains frequency the tracker last agreed on - 0 until it has - and
+ * where the notch is aimed. Both outlive a restart. While acquisition runs
+ * only the DSP thread writes them; each is one float, stored in one
+ * instruction, for whoever reads it.
+ */
+static volatile float mains_hz;
+static volatile float notch_aim_hz;
+
+static dsp_mains_t tracker;
+static bool tracking;
+static pipeline_mains_sink_t mains_sink;
 
 /* A chain has been built, so there is something to change. */
 static bool chain_ready;
@@ -138,8 +165,12 @@ struct chain_req {
 	dsp_section_t sections[DSP_MAX_SECTIONS];
 	bool car;
 	uint8_t mask;
-	float notch_hz;
+	uint8_t notch_hz;
+	uint8_t notch_q;
+	bool notch_harmonic;
+	bool notch_track;
 	uint8_t gains[FRAME_CHANNELS];
+	uint8_t electrodes; /* channels on their electrodes */
 
 	/* Filled in by whichever thread applied it. */
 	int result;
@@ -163,6 +194,85 @@ static void arm_settling(void)
 	settle_left = (n < cap) ? n : cap;
 }
 
+/* Where the notch belongs: the measured mains when following it, or nominal. */
+static float notch_target(void)
+{
+	const float measured = mains_hz;
+
+	if (notch.hz == 0u) {
+		return 0.0f;
+	}
+	if (notch.track && measured > 0.0f &&
+	    fabsf(measured - (float)notch.hz) <= MAINS_ACCEPT_HZ) {
+		return measured;
+	}
+	return (float)notch.hz;
+}
+
+static int aim_notch(bool keep_state, bool *kept)
+{
+	const float hz = notch_target();
+	const int err = chain_set_notch(&chain, sample_rate_hz, hz,
+					(float)notch.q, notch.harmonic,
+					keep_state, kept);
+
+	if (err == 0) {
+		notch_aim_hz = hz;
+	}
+	return err;
+}
+
+/*
+ * Start the tracker again, on the channels that are on their electrodes.
+ * Only they carry mains worth measuring: a shorted input carries none, and
+ * the test signal is a 0.98 Hz square wave whose 51st harmonic sits at
+ * 49.8 Hz.
+ */
+static void start_tracker(void)
+{
+	tracking = notch.track && notch.hz != 0u && chain.mains_mask != 0u &&
+		   dsp_mains_init(&tracker, sample_rate_hz, (float)notch.hz,
+				  mains_hz);
+}
+
+/*
+ * A frequency the tracker agreed on. The notch follows it from the next
+ * sample, retuned in place, and the host hears of it either way.
+ */
+static void follow_mains(float hz)
+{
+	if (fabsf(hz - (float)notch.hz) > MAINS_ACCEPT_HZ) {
+		return;
+	}
+
+	mains_hz = hz;
+
+	bool moved = false;
+
+	if (fabsf(hz - notch_aim_hz) >= MAINS_REAIM_HZ) {
+		moved = aim_notch(true, NULL) == 0;
+	}
+
+	if (mains_sink != NULL) {
+		mains_sink(hz, st_seq, moved);
+	}
+}
+
+/* Channels on their electrodes and powered: bit 7 clear, input mux normal. */
+static uint8_t electrode_mask(const uint8_t *chset)
+{
+	uint8_t mask = 0;
+
+	for (uint8_t ch = 0; ch < ADS1299_CHANNELS; ch++) {
+		if ((chset[ch] & 0x80u) == 0u &&
+		    (chset[ch] & 0x07u) == ADS1299_MUX_NORMAL) {
+			mask |= (uint8_t)(1u << ch);
+		}
+	}
+
+	return mask;
+}
+
 static void apply_request(struct chain_req *r)
 {
 	bool restarted = false;
@@ -175,9 +285,6 @@ static void apply_request(struct chain_req *r)
 					    r->count, r->keep_state, &kept);
 		if (r->result == 0) {
 			restarted = !kept;
-			if (r->stage == CHAIN_STAGE_PRE) {
-				pre_is_notch = false;
-			}
 		}
 		break;
 	}
@@ -187,14 +294,31 @@ static void apply_request(struct chain_req *r)
 		r->result = 0;
 		break;
 
-	case REQ_NOTCH:
-		r->result = chain_set_notch(&chain, sample_rate_hz, r->notch_hz,
-					    NOTCH_Q);
+	case REQ_NOTCH: {
+		const struct notch_settings was = notch;
+		const float had = mains_hz;
+		bool kept = false;
+
+		notch.hz = r->notch_hz;
+		notch.q = r->notch_q;
+		notch.harmonic = r->notch_harmonic;
+		notch.track = r->notch_track;
+
+		/* A measurement near 50 Hz says nothing about 60. */
+		if (notch.hz != was.hz) {
+			mains_hz = 0.0f;
+		}
+
+		r->result = aim_notch(true, &kept);
 		if (r->result == 0) {
-			pre_is_notch = true;
-			restarted = true;
+			restarted = !kept;
+			start_tracker();
+		} else {
+			notch = was;
+			mains_hz = had;
 		}
 		break;
+	}
 
 	case REQ_GAINS:
 		r->result = 0;
@@ -202,6 +326,10 @@ static void apply_request(struct chain_req *r)
 			if (chain_set_gain(&chain, ch, r->gains[ch]) != 0) {
 				r->result = -EINVAL;
 			}
+		}
+		if (r->electrodes != chain.mains_mask) {
+			chain_set_mains_mask(&chain, r->electrodes);
+			start_tracker();
 		}
 		break;
 
@@ -341,6 +469,10 @@ static void process(const struct raw_frame *rf)
 		out.flags |= EEG_FLAG_SETTLING;
 	}
 
+	if (tracking && dsp_mains_push(&tracker, chain.mains_in)) {
+		follow_mains(tracker.estimate_hz);
+	}
+
 	if (out.ch_uv[0] < st_ch1_min) {
 		st_ch1_min = out.ch_uv[0];
 	}
@@ -421,25 +553,28 @@ static int build_chain(void)
 	chain_ready = false;
 
 	const uint8_t shift = dc_shift_for((uint16_t)sample_rate_hz);
-	int err = chain_init(&chain, sample_rate_hz, shift, notch_hz, NOTCH_Q,
-			     VREF_VOLTS, 24);
 
-	if (err) {
-		LOG_ERR("filter design failed for fs %d Hz (%d)",
-			(int)sample_rate_hz, err);
-		return err;
-	}
+	(void)chain_init(&chain, shift, VREF_VOLTS, 24);
 
-	/* The gains the channels are set to, not the ones assumed. */
+	/* The gains and inputs the channels are set to, not the ones assumed. */
 	uint8_t chset[ADS1299_CHANNELS];
 
 	ads1299_get_channels_cached(chset, ADS1299_CHANNELS);
 	for (uint8_t ch = 0; ch < ADS1299_CHANNELS; ch++) {
 		(void)chain_set_gain(&chain, ch, gain_from_chset(chset[ch]));
 	}
+	chain_set_mains_mask(&chain, electrode_mask(chset));
+
+	const int err = aim_notch(false, NULL);
+
+	if (err) {
+		LOG_ERR("notch design failed for fs %d Hz (%d)",
+			(int)sample_rate_hz, err);
+		return err;
+	}
 
 	chain_set_car(&chain, car_on, car_mask);
-	pre_is_notch = true;
+	start_tracker();
 	arm_settling();
 	chain_ready = true;
 
@@ -526,11 +661,11 @@ int pipeline_start(uint8_t rate)
 		return err;
 	}
 
-	LOG_INF("pipeline running: %d SPS, LSB %d nV, notch %d Hz, DC shift %u "
+	LOG_INF("pipeline running: %d SPS, LSB %d nV, notch %u Hz%s, DC shift %u "
 		"(timing overhead %u us)",
 		(int)sample_rate_hz, (int)(chain.lsb_uv[0] * 1000.0f),
-		(int)notch_hz, dc_shift_for((uint16_t)sample_rate_hz),
-		timing_overhead_us);
+		notch.hz, tracking ? " following the mains" : "",
+		dc_shift_for((uint16_t)sample_rate_hz), timing_overhead_us);
 
 	return 0;
 }
@@ -559,6 +694,11 @@ void pipeline_set_sink(pipeline_sink_t s)
 	sink = s;
 }
 
+void pipeline_set_mains_sink(pipeline_mains_sink_t s)
+{
+	mains_sink = s;
+}
+
 /* Real rate to the register code the AFE wants. 0xFF if unsupported. */
 static uint8_t rate_code_for(uint16_t sps)
 {
@@ -574,36 +714,42 @@ static uint8_t rate_code_for(uint16_t sps)
 	}
 }
 
-int pipeline_set_notch(uint8_t hz)
+int pipeline_set_notch(uint8_t hz, uint8_t q, bool harmonic, bool track,
+		       uint32_t *applied_seq)
 {
-	if (hz != 0 && hz != 50 && hz != 60) {
+	if ((hz != 0u && hz != 50u && hz != 60u) || q == 0u) {
 		return -EINVAL;
 	}
 
-	notch_hz = (float)hz;
-
 	if (!chain_ready) {
-		return 0; /* takes effect when the chain is built */
+		/* Taken up when the chain is built. */
+		if (hz != notch.hz) {
+			mains_hz = 0.0f;
+		}
+		notch = (struct notch_settings){ hz, q, harmonic, track };
+		return 0;
 	}
 
 	/*
-	 * Rebuilt in place rather than by restarting acquisition: a notch
+	 * Applied in place rather than by restarting acquisition: a notch
 	 * change is a filter change, not a hardware one, and there is no
 	 * reason to drop samples for it.
 	 */
-	const struct chain_req r = { .kind = REQ_NOTCH, .notch_hz = notch_hz };
-	const int err = submit(&r, NULL);
+	const struct chain_req r = {
+		.kind = REQ_NOTCH,
+		.notch_hz = hz,
+		.notch_q = q,
+		.notch_harmonic = harmonic,
+		.notch_track = track,
+	};
+	const int err = submit(&r, applied_seq);
 
 	if (err == 0) {
-		LOG_INF("notch now %u Hz", hz);
+		LOG_INF("notch %u Hz, Q %u, harmonic %s, following the mains %s",
+			hz, q, harmonic ? "on" : "off", track ? "on" : "off");
 	}
 
 	return err;
-}
-
-uint8_t pipeline_notch(void)
-{
-	return pre_is_notch ? (uint8_t)notch_hz : 0u;
 }
 
 int pipeline_set_stage(uint8_t stage, const dsp_section_t *sections,
@@ -654,7 +800,10 @@ int pipeline_sync_gains(void)
 
 	ads1299_get_channels_cached(chset, ADS1299_CHANNELS);
 
-	struct chain_req r = { .kind = REQ_GAINS };
+	struct chain_req r = {
+		.kind = REQ_GAINS,
+		.electrodes = electrode_mask(chset),
+	};
 
 	for (uint8_t ch = 0; ch < ADS1299_CHANNELS; ch++) {
 		r.gains[ch] = gain_from_chset(chset[ch]);
@@ -667,19 +816,27 @@ void pipeline_get_filters(struct pipeline_filters *out)
 {
 	memset(out, 0, sizeof(*out));
 
+	out->notch_hz = notch.hz;
+	out->notch_q = notch.q;
+	out->notch_harmonic = notch.harmonic;
+	out->notch_track = notch.track;
+	out->mains_hz = mains_hz;
+	out->notch_aim_hz = notch_aim_hz;
+
 	if (!chain_ready) {
 		return;
 	}
 
 	/*
-	 * Only the command thread changes filters, and it waits for each change
-	 * to land, so nothing here can be mid-change while it is read.
+	 * Only the command thread changes the pre and post stages, and it waits
+	 * for each change to land, so neither can be mid-change while it is
+	 * read. The DSP thread retunes the notch on its own, which is why the
+	 * notch is reported by its settings rather than its sections.
 	 */
 	out->pre_count = chain.pre.count;
 	out->post_count = chain.post.count;
 	memcpy(out->pre, chain.pre.sections, sizeof(out->pre));
 	memcpy(out->post, chain.post.sections, sizeof(out->post));
-	out->pre_is_notch = pre_is_notch;
 	out->car = chain.car;
 	out->car_mask = chain.car_mask;
 }

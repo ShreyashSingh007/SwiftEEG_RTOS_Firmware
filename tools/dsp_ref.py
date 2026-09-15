@@ -51,6 +51,17 @@ def design_highpass(fs, fc, q):
     return _section(fs, fc, q, 1.0, -1.0, -1.0)
 
 
+def design_notch_f32(fs, f0, q):
+    """
+    A notch designed as dsp_design_notch designs it on the device, in
+    float32. The device designs its own mains notch, and a mirror of that
+    chain has to design it the same way, not in float64 and rounded.
+    """
+    g = np.tan(F32(np.pi) * F32(f0) / F32(fs))
+    k = F32(1.0) / F32(q)
+    return (F32(g), k, F32(1.0), F32(-1.0) * k, F32(0.0))
+
+
 def butterworth_qs(order: int) -> list[float]:
     """Q of each section of a Butterworth cascade of the given even order."""
     if order % 2 or order < 2:
@@ -229,6 +240,160 @@ def lsb_uv_f32(vref_volts, gain):
     return (F32(2.0) * F32(vref_volts)) / (F32(gain) * F32(16777216.0)) * F32(1e6)
 
 
+# --- mains tracking ----------------------------------------------------------
+
+class MainsTracker:
+    """
+    Mirror of dsp_mains_t, operation for operation - see src/dsp/mains.h for
+    how it works. float32 on the per-sample path, double beyond it, as the
+    firmware does it.
+    """
+
+    TWO_PI = 6.283185307179586476925
+    LOWPASS_HZ = 1.5
+    BASEBAND_HZ = 10
+    FINE, COARSE, WINDOW = 10, 2, 40
+    LOCK, SEARCH_HZ, AGREE_HZ, REAIM_HZ = 0.6, 3.0, 0.05, 0.005
+    RENORMALISE = 8192
+
+    def __init__(self, fs, nominal, start=0.0):
+        sps = int(fs)
+        if (not 250.0 <= fs <= 64000.0 or not nominal > 0 or float(sps) != fs
+                or sps % self.BASEBAND_HZ
+                or float(F32(nominal)) + self.SEARCH_HZ >= float(F32(fs)) / 2.0):
+            raise ValueError("cannot track mains at that rate")
+        self.fs, self.nominal = F32(fs), F32(nominal)
+        self.k = F32(1.0 - math.exp(-self.TWO_PI * self.LOWPASS_HZ / float(self.fs)))
+        self.decim = sps // self.BASEBAND_HZ
+        self.c, self.s = F32(1.0), F32(0.0)
+        self.turns = 0
+        self.i1 = self.i2 = self.q1 = self.q2 = F32(0.0)
+        self.sum_i = self.sum_q = F32(0.0)
+        self.phase = 0
+        self.ring_i = [F32(0.0)] * self.FINE
+        self.ring_q = [F32(0.0)] * self.FINE
+        self.ring_len = 0
+        self.head = 0
+        self._clear()
+        self.candidate = F32(0.0)
+        self.estimate = F32(0.0)
+        start = F32(start)
+        near = start > 0 and abs(float(start) - float(self.nominal)) <= self.SEARCH_HZ
+        self._aim(float(start) if near else float(self.nominal))
+
+    def _aim(self, hz: float) -> None:
+        w = self.TWO_PI * hz / float(self.fs)
+        self.mix = F32(hz)
+        self.cw = F32(math.cos(w))
+        self.sw = F32(math.sin(w))
+
+    def _clear(self) -> None:
+        zero = F32(0.0)
+        self.fine_i = self.fine_q = self.coarse_i = self.coarse_q = zero
+        self.power = zero
+        self.count = 0
+
+    def _settle(self, hz) -> bool:
+        agreed = (self.candidate != 0
+                  and abs(float(hz) - float(self.candidate)) < self.AGREE_HZ)
+        if agreed:
+            self.estimate = hz
+        self.candidate = hz
+        return agreed
+
+    def _baseband(self, zi, zq) -> bool:
+        if self.ring_len == self.FINE:
+            lag = (self.head + self.FINE - self.COARSE) % self.FINE
+            fi, fq = self.ring_i[self.head], self.ring_q[self.head]
+            ci, cq = self.ring_i[lag], self.ring_q[lag]
+            self.fine_i = self.fine_i + (zi * fi + zq * fq)
+            self.fine_q = self.fine_q + (zq * fi - zi * fq)
+            self.coarse_i = self.coarse_i + (zi * ci + zq * cq)
+            self.coarse_q = self.coarse_q + (zq * ci - zi * cq)
+            self.power = self.power + (zi * zi + zq * zq)
+            self.count += 1
+
+        self.ring_i[self.head] = zi
+        self.ring_q[self.head] = zq
+        self.head = (self.head + 1) % self.FINE
+        if self.ring_len < self.FINE:
+            self.ring_len += 1
+
+        if self.count < self.WINDOW:
+            return False
+
+        agreed = False
+        fine = math.sqrt(float(self.fine_i) * float(self.fine_i)
+                         + float(self.fine_q) * float(self.fine_q))
+        if self.power > 0 and fine >= self.LOCK * float(self.power):
+            df = (-math.atan2(float(self.coarse_q), float(self.coarse_i))
+                  / (self.TWO_PI * self.COARSE / self.BASEBAND_HZ))
+            if abs(df) < 0.3:
+                df = (-math.atan2(float(self.fine_q), float(self.fine_i))
+                      / (self.TWO_PI * self.FINE / self.BASEBAND_HZ))
+            hz = float(self.mix) + df
+            lo = float(self.nominal) - self.SEARCH_HZ
+            hi = float(self.nominal) + self.SEARCH_HZ
+            hz = lo if hz < lo else hi if hz > hi else hz
+            agreed = self._settle(F32(hz))
+            if abs(hz - float(self.mix)) > self.REAIM_HZ:
+                self._aim(hz)
+                self.ring_len = 0
+                self.head = 0
+        else:
+            self.candidate = F32(0.0)
+
+        self._clear()
+        return agreed
+
+    def push(self, x) -> bool:
+        """One sample in microvolts; True when two answers in a row agree."""
+        x = F32(x)
+        c = self.c * self.cw - self.s * self.sw
+        s = self.s * self.cw + self.c * self.sw
+        self.i1 = self.i1 + self.k * (x * c - self.i1)
+        self.i2 = self.i2 + self.k * (self.i1 - self.i2)
+        self.q1 = self.q1 + self.k * (x * s - self.q1)
+        self.q2 = self.q2 + self.k * (self.q1 - self.q2)
+        self.turns += 1
+        if self.turns == self.RENORMALISE:
+            g = F32(1.0 / math.sqrt(float(c) * float(c) + float(s) * float(s)))
+            self.c, self.s = c * g, s * g
+            self.turns = 0
+        else:
+            self.c, self.s = c, s
+        self.sum_i = self.sum_i + self.i2
+        self.sum_q = self.sum_q + self.q2
+        self.phase += 1
+        if self.phase < self.decim:
+            return False
+        zi = self.sum_i / F32(self.decim)
+        zq = self.sum_q / F32(self.decim)
+        self.phase = 0
+        self.sum_i = self.sum_q = F32(0.0)
+        return self._baseband(zi, zq)
+
+
+def mains_test_signal(fs, seconds, mains_uv, mains_hz, seed):
+    """Random-walk EEG, alpha, slow drift and mains, as float32 microvolts."""
+    rng = np.random.default_rng(seed)
+    n = int(seconds * fs)
+    t = np.arange(n) / fs
+    walk = np.cumsum(rng.standard_normal(n))
+    walk -= np.convolve(walk, np.ones(int(fs)) / fs, mode="same")
+    x = (8.0 * walk / walk.std()
+         + 10.0 * np.sin(2 * np.pi * 10.0 * t)
+         + 300.0 * np.sin(2 * np.pi * 0.1 * t)
+         + mains_uv * np.sin(2 * np.pi * mains_hz * t))
+    return x.astype(F32)
+
+
+def mains_estimates(x, fs, nominal=50.0):
+    """Every agreed estimate over a signal, as (sample, Hz)."""
+    tracker = MainsTracker(fs, nominal)
+    return [(i, float(tracker.estimate)) for i, v in enumerate(x) if tracker.push(v)]
+
+
 # --- self-test ---------------------------------------------------------------
 
 def _rbj(kind, fs, f0, q):
@@ -367,6 +532,37 @@ def _self_test() -> None:
     assert abs(lsb_uv(4.5, 24) - 0.02235) < 1e-5, f"{lsb_uv(4.5, 24)}"
     assert abs(float(lsb_uv_f32(4.5, 24)) - lsb_uv(4.5, 24)) < 1e-8
 
+    # The device's float32 notch design is the same filter as the float64 one.
+    for f0, qq in ((50.0, 12.0), (99.6, 12.0), (60.0, 30.0)):
+        assert np.allclose(design_notch_f32(250.0, f0, qq), design_notch(250.0, f0, qq),
+                           rtol=1e-6, atol=1e-7), f0
+
+    # Mains tracking. 20 uV of mains a little off 50 Hz, under EEG and drift:
+    # agreed within 15 s, and every estimate within 20 mHz.
+    got = mains_estimates(mains_test_signal(250.0, 30, 20.0, 49.62, 3), 250.0)
+    assert got and got[0][0] < 15 * 250, f"no estimate in 15 s: {got[:2]}"
+    assert all(abs(hz - 49.62) < 0.02 for _, hz in got), got
+
+    # No mains at all: nothing agreed on, in a minute.
+    got = mains_estimates(mains_test_signal(250.0, 60, 0.0, 50.0, 4), 250.0)
+    assert not got, f"agreed on mains that is not there: {got}"
+
+    # Far from nominal, and 60 Hz mains at 1000 SPS.
+    got = mains_estimates(mains_test_signal(250.0, 30, 20.0, 49.2, 5), 250.0)
+    assert got and abs(got[-1][1] - 49.2) < 0.05, got
+    got = mains_estimates(mains_test_signal(1000.0, 30, 20.0, 60.3, 6), 1000.0, 60.0)
+    assert got and abs(got[-1][1] - 60.3) < 0.02, got
+
+    # A restart starts at the last estimate, unless it is too far off.
+    assert abs(float(MainsTracker(250.0, 50.0, 49.6).mix) - 49.6) < 1e-4
+    assert float(MainsTracker(250.0, 50.0, 40.0).mix) == 50.0
+    for fs, nominal in ((255.0, 50.0), (200.0, 50.0), (250.0, 0.0)):
+        try:
+            MainsTracker(fs, nominal)
+            raise AssertionError(f"tracking accepted at {fs} SPS, {nominal} Hz")
+        except ValueError:
+            pass
+
     print("dsp_ref self-test: OK")
 
 
@@ -423,6 +619,12 @@ def _emit() -> None:
     raw = [int(400000 + 500 * math.sin(2 * math.pi * 10.0 * i / fs))
            for i in range(n)]
     dc_out = dc_apply(raw, 10)
+
+    # Mains tracking: 22 s at 250 SPS, 20 uV of mains at 49.73 Hz.
+    mains_fs, mains_nominal = 250.0, 50.0
+    mains_in = mains_test_signal(mains_fs, 22, 20.0, 49.73, 11)
+    mains_out = mains_estimates(mains_in, mains_fs, mains_nominal)
+    assert mains_out, "the tracker agreed on nothing to test against"
 
     L = []
     A = L.append
@@ -485,6 +687,27 @@ def _emit() -> None:
     A("")
     A("static const int32_t golden_dc_output[GOLDEN_DSP_N] = {")
     A("\t\t" + _c_i32(dc_out))
+    A("};")
+    A("")
+    A("/*")
+    A(" * Mains tracking: EEG, drift and 20 uV of mains at 49.73 Hz, and the")
+    A(" * sample at which the tracker agreed on each estimate, and the estimate.")
+    A(" */")
+    A(f"#define GOLDEN_MAINS_FS      {mains_fs:.1f}f")
+    A(f"#define GOLDEN_MAINS_NOMINAL {mains_nominal:.1f}f")
+    A(f"#define GOLDEN_MAINS_N       {len(mains_in)}")
+    A(f"#define GOLDEN_MAINS_EVENTS  {len(mains_out)}")
+    A("")
+    A("static const float golden_mains_input[GOLDEN_MAINS_N] = {")
+    A("\t\t" + _c_f32(mains_in))
+    A("};")
+    A("")
+    A("static const int32_t golden_mains_at[GOLDEN_MAINS_EVENTS] = {")
+    A("\t\t" + _c_i32([i for i, _ in mains_out]))
+    A("};")
+    A("")
+    A("static const float golden_mains_hz[GOLDEN_MAINS_EVENTS] = {")
+    A("\t\t" + _c_f32([F32(hz) for _, hz in mains_out]))
     A("};")
     A("")
     A("#endif /* SWIFTEEG_GOLDEN_DSP_H */")

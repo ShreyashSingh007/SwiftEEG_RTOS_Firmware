@@ -16,6 +16,7 @@
 #include <string.h>
 
 #include "dsp.h"
+#include "mains.h"
 #include "ringbuf.h"
 #include "golden_dsp.h"
 
@@ -397,6 +398,83 @@ ZTEST(dsp, test_cascade_rejects_too_many_sections)
 		      "oversized cascade accepted");
 	zassert_true(dsp_cascade_set(&c, sections, DSP_MAX_SECTIONS),
 		     "a full cascade refused");
+}
+
+ZTEST(dsp, test_mains_tracker_matches_reference)
+{
+	/*
+	 * float32 per sample and double beyond, as the reference computes it:
+	 * the same estimates at the same samples, to a few microhertz.
+	 */
+	static dsp_mains_t t;
+	int next = 0;
+
+	zassert_true(dsp_mains_init(&t, GOLDEN_MAINS_FS, GOLDEN_MAINS_NOMINAL,
+				    0.0f), NULL);
+
+	for (int i = 0; i < GOLDEN_MAINS_N; i++) {
+		if (!dsp_mains_push(&t, golden_mains_input[i])) {
+			continue;
+		}
+
+		zassert_true(next < GOLDEN_MAINS_EVENTS,
+			     "an extra estimate at sample %d", i);
+		zassert_equal(i, golden_mains_at[next],
+			      "estimate %d at sample %d, not %d", next, i,
+			      golden_mains_at[next]);
+		zassert_within(t.estimate_hz, golden_mains_hz[next], 1e-4f,
+			       "estimate %d is %.6f Hz, not %.6f", next,
+			       (double)t.estimate_hz,
+			       (double)golden_mains_hz[next]);
+		next++;
+	}
+
+	zassert_equal(next, GOLDEN_MAINS_EVENTS, "%d estimates, not %d", next,
+		      GOLDEN_MAINS_EVENTS);
+	TC_PRINT("mains tracker: %d estimates, the last %.4f Hz\n", next,
+		 (double)t.estimate_hz);
+}
+
+ZTEST(dsp, test_mains_tracker_starts_where_it_can)
+{
+	dsp_mains_t t;
+
+	zassert_false(dsp_mains_init(&t, 255.0f, 50.0f, 0.0f),
+		      "a rate that is not a whole multiple of 10");
+	zassert_false(dsp_mains_init(&t, 200.0f, 50.0f, 0.0f),
+		      "a rate below 250");
+	zassert_false(dsp_mains_init(&t, 250.0f, 0.0f, 0.0f),
+		      "no nominal frequency");
+
+	zassert_true(dsp_mains_init(&t, 250.0f, 50.0f, 49.6f), NULL);
+	zassert_within(t.mix_hz, 49.6f, 1e-4f,
+		       "a restart starts at the last estimate");
+	zassert_true(dsp_mains_init(&t, 250.0f, 50.0f, 40.0f), NULL);
+	zassert_within(t.mix_hz, 50.0f, 1e-4f,
+		       "a start far from nominal is ignored");
+}
+
+ZTEST(dsp, test_mains_tracker_cost)
+{
+	/* What one sample costs on this core, over the golden input 20 times. */
+	static dsp_mains_t t;
+	const int reps = 20;
+	const int64_t start = k_uptime_ticks();
+
+	for (int r = 0; r < reps; r++) {
+		(void)dsp_mains_init(&t, GOLDEN_MAINS_FS, GOLDEN_MAINS_NOMINAL,
+				     0.0f);
+		for (int i = 0; i < GOLDEN_MAINS_N; i++) {
+			(void)dsp_mains_push(&t, golden_mains_input[i]);
+		}
+	}
+
+	const uint64_t ns = k_ticks_to_ns_floor64(k_uptime_ticks() - start) /
+			    ((uint64_t)reps * GOLDEN_MAINS_N);
+
+	TC_PRINT("mains tracker: %u ns a sample\n", (unsigned int)ns);
+	zassert_true(ns < 20000u, "the tracker takes %u ns a sample",
+		     (unsigned int)ns);
 }
 
 ZTEST_SUITE(dsp, NULL, NULL, NULL, NULL, NULL);

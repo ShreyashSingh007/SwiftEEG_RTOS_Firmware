@@ -23,8 +23,10 @@
 #define CMD_SET_CHANNEL  0x0Au /* [1]=ch or 0xFF, [2]=gain, [3]=mux,
                                 *   [4]=power down, [5]=srb2 */
 #define CMD_SET_BIAS     0x0Bu /* [1]=enable, [2]=sensp mask, [3]=sensn mask */
-#define CMD_SET_NOTCH    0x0Cu /* [1]=Hz (0 disables, 50 or 60); replaces
-                                *   the pre stage with the device's notch */
+#define CMD_SET_NOTCH    0x0Cu /* [1]=nominal Hz (0 removes it, 50 or 60),
+                                *   [2]=Q, [3]=flags (bit 0 harmonic, bit 1
+                                *   follow the measured mains); RSP carries
+                                *   the sequence number it applies from */
 #define CMD_SET_LEADOFF  0x0Du /* [1]=enable, [2]=sensp, [3]=sensn */
 #define CMD_GET_CONFIG   0x0Eu /* no args; RSP carries the whole state */
 #define CMD_SET_IMU      0x0Fu /* [1]=enable, [2..3]=rate Hz, [4]=accel g,

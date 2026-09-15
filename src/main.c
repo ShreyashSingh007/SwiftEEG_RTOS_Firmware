@@ -261,6 +261,7 @@ static void start_acquisition(void)
 	}
 
 	pipeline_set_sink(stream_on_sample);
+	pipeline_set_mains_sink(stream_on_mains);
 
 	if (pipeline_start(ADS1299_DR_250SPS) != 0) {
 		LOG_ERR("pipeline failed to start");
@@ -281,14 +282,19 @@ static void report_health(void)
 		struct pipeline_stats ps;
 		struct stream_stats ss;
 
+		struct pipeline_filters pf;
+
 		pipeline_get_stats(&ps);
 		stream_get_stats(&ss);
+		pipeline_get_filters(&pf);
 
 		LOG_INF("health: %u samples, %u dropped, %u bad; stream %u frames, "
-			"%u samples, %u bytes lost; DSP %u us",
+			"%u samples, %u bytes lost; DSP %u us; mains %u mHz, "
+			"notch at %u mHz",
 			ps.processed, ps.ring_drops, ps.bad_status,
 			ss.frames_sent, ss.samples_sent, ss.bytes_dropped,
-			ps.dsp_mean_us);
+			ps.dsp_mean_us, (uint32_t)(pf.mains_hz * 1000.0f),
+			(uint32_t)(pf.notch_aim_hz * 1000.0f));
 	}
 
 	if (imu_present()) {

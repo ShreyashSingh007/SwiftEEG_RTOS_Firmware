@@ -9,18 +9,19 @@
  * Order matters and is the point of the whole module:
  *
  *   frame -> 24-bit decode -> integer DC removal -> microvolts
- *         -> pre sections -> common average -> post sections
+ *         -> pre sections -> mains notch -> common average -> post sections
  *
  * DC comes out in the integer domain, before the float conversion. Full
  * scale at gain 24 is +/-187.5 mV against a 22.35 nV LSB, a ratio of 8.4e6,
  * and float32 carries about 1.7e7 of mantissa - so converting first would
  * leave barely a bit for the microvolt signal riding on the offset.
  *
- * The two stages sit either side of the common average so the host
- * application's chain transfers as it is: its high-pass and notch before the
- * average, so no electrode's drift reaches the others through it, and its
- * low-pass after. By default the pre stage holds the mains notch and the
- * post stage is empty.
+ * The pre and post stages sit either side of the common average so the host
+ * application's chain transfers as it is: its high-pass before the average,
+ * so no electrode's drift reaches the others through it, and its low-pass
+ * after. The mains notch between them is the device's own, because the
+ * device measures the mains frequency it has to follow; it sits where the
+ * host chain has its notch. By default the notch is all that is loaded.
  */
 #ifndef SWIFTEEG_CHAIN_H
 #define SWIFTEEG_CHAIN_H
@@ -37,22 +38,23 @@
 typedef struct {
 	dsp_dc_t      dc[FRAME_CHANNELS];
 	dsp_cascade_t pre;
+	dsp_cascade_t notch;
 	dsp_cascade_t post;
 	float         lsb_uv[FRAME_CHANNELS]; /* per channel: gains can differ */
 	float         vref_volts;
+	float         mains_in;               /* see chain_process() */
+	uint8_t       mains_mask;             /* channels mains_in is taken over */
 	uint8_t       car_mask;               /* channels that make the average */
 	bool          car;
 	uint8_t       channels;
 } chain_t;
 
 /*
- * Build the chain: DC corner from `dc_shift`, the mains notch as the pre
- * stage (none if `notch_hz` is 0), an empty post stage, no common average,
- * and every channel scaled for `gain`.
- * Returns 0, or a negative errno if a filter could not be designed.
+ * Build the chain: DC corner from `dc_shift`, every stage empty, no common
+ * average, every channel scaled for `gain` and counted in mains_in.
+ * Returns 0, or -EINVAL for a gain of 0.
  */
-int chain_init(chain_t *c, float fs_hz, uint8_t dc_shift, float notch_hz,
-	       float notch_q, float vref_volts, uint8_t gain);
+int chain_init(chain_t *c, uint8_t dc_shift, float vref_volts, uint8_t gain);
 
 /*
  * Run one frame through.
@@ -61,6 +63,11 @@ int chain_init(chain_t *c, float fs_hz, uint8_t dc_shift, float notch_hz,
  * wrong. That frame is not a sample, and letting it into the filters would
  * corrupt the DC estimate and the filter state for everything after it.
  *
+ * Also leaves `mains_in`: the mean over the channels in `mains_mask` of the
+ * microvolts after DC removal and before any filter - what the mains tracker
+ * needs, since every stage after that point may already have taken the
+ * mains out. 0 when the mask is empty.
+ *
  * `raw_out` and `uv_out` each take FRAME_CHANNELS entries; either may be
  * NULL.
  */
@@ -68,11 +75,16 @@ bool chain_process(chain_t *c, const uint8_t *frame, int32_t *raw_out,
 		   float *uv_out);
 
 /*
- * Make the pre stage a single mains notch, or a pass-through when
- * `notch_hz` is 0. It starts again, primed on its next sample; the DC state
- * is kept, since the offset has not changed.
+ * Aim the mains notch at `hz`, `q` wide, with a second section at twice the
+ * frequency when `harmonic` and the rate leaves room for it - under 95 % of
+ * Nyquist. 0 Hz removes it. With `keep_state` and as many sections as
+ * before, the notch is retuned in place, which is how it follows the mains
+ * without a transient; otherwise it starts again, primed on its next sample.
+ * `kept` (may be NULL) says which happened. Returns -EINVAL, changing
+ * nothing, for a notch that cannot be designed at this rate.
  */
-int chain_set_notch(chain_t *c, float fs_hz, float notch_hz, float notch_q);
+int chain_set_notch(chain_t *c, float fs_hz, float hz, float q, bool harmonic,
+		    bool keep_state, bool *kept);
 
 /*
  * Load sections into one stage - CHAIN_STAGE_PRE or CHAIN_STAGE_POST.
@@ -87,6 +99,9 @@ int chain_set_stage(chain_t *c, uint8_t stage, const dsp_section_t *sections,
 
 /* Common average reference on or off, and which channels make it. */
 void chain_set_car(chain_t *c, bool enable, uint8_t mask);
+
+/* Which channels mains_in is taken over. */
+void chain_set_mains_mask(chain_t *c, uint8_t mask);
 
 /*
  * Scale one channel for a new gain. A real change re-primes that channel's

@@ -68,18 +68,23 @@ static void check_row(const float *got, const float *want, int frame,
 
 static chain_t chain;
 
-/* A: the device's default chain. */
+/* A: the device's default chain - its notch and the harmonic. */
 static int build(chain_t *c)
 {
-	return chain_init(c, GOLDEN_A_FS, GOLDEN_A_DC_SHIFT, GOLDEN_A_NOTCH_HZ,
-			  GOLDEN_A_NOTCH_Q, 4.5f, 24);
+	int err = chain_init(c, GOLDEN_A_DC_SHIFT, 4.5f, 24);
+
+	if (err == 0) {
+		err = chain_set_notch(c, GOLDEN_A_FS, GOLDEN_A_NOTCH_HZ,
+				      GOLDEN_A_NOTCH_Q, true, false, NULL);
+	}
+
+	return err;
 }
 
 /* B: the host chain, loaded the way the firmware loads it. */
 static void build_full(chain_t *c)
 {
-	zassert_ok(chain_init(c, GOLDEN_B_FS, GOLDEN_B_DC_SHIFT, 0.0f, 12.0f,
-			      4.5f, 24));
+	zassert_ok(chain_init(c, GOLDEN_B_DC_SHIFT, 4.5f, 24));
 
 	for (uint8_t ch = 0; ch < GOLDEN_PIPE_CHANNELS; ch++) {
 		zassert_ok(chain_set_gain(c, ch, golden_b_gains[ch]));
@@ -87,6 +92,8 @@ static void build_full(chain_t *c)
 
 	zassert_ok(chain_set_stage(c, CHAIN_STAGE_PRE, golden_b_pre,
 				   GOLDEN_B_PRE_COUNT, false, NULL));
+	zassert_ok(chain_set_notch(c, GOLDEN_B_FS, GOLDEN_B_NOTCH_HZ,
+				   GOLDEN_B_NOTCH_Q, true, false, NULL));
 	zassert_ok(chain_set_stage(c, CHAIN_STAGE_POST, golden_b_post,
 				   GOLDEN_B_POST_COUNT, false, NULL));
 	chain_set_car(c, true, GOLDEN_B_CAR_MASK);
@@ -150,14 +157,17 @@ ZTEST(pipeline, test_full_chain_matches_reference)
 	float worst = 0.0f;
 
 	for (int i = 0; i < GOLDEN_PIPE_FRAMES; i++) {
+		if (i == GOLDEN_B_MAINS_MASK_AT) {
+			chain_set_mains_mask(&chain, GOLDEN_B_MAINS_MASK);
+		}
 		if (i == GOLDEN_B_RETUNE_AT) {
 			bool kept = false;
 
-			zassert_ok(chain_set_stage(&chain, CHAIN_STAGE_PRE,
-						   golden_b_pre_retuned,
-						   GOLDEN_B_PRE_COUNT, true,
+			zassert_ok(chain_set_notch(&chain, GOLDEN_B_FS,
+						   GOLDEN_B_NOTCH_RETUNED_HZ,
+						   GOLDEN_B_NOTCH_Q, true, true,
 						   &kept));
-			zassert_true(kept, "a same-size retune restarted");
+			zassert_true(kept, "a notch retune restarted");
 		}
 		if (i == GOLDEN_B_RESTART_POST_AT) {
 			bool kept = true;
@@ -178,6 +188,10 @@ ZTEST(pipeline, test_full_chain_matches_reference)
 		zassert_true(chain_process(&chain, FRAME_AT(i), NULL, uv),
 			     "frame %d was rejected", i);
 		check_row(uv, golden_b_out[i], i, &worst);
+		zassert_true(close_enough(chain.mains_in, golden_b_mains_in[i]),
+			     "frame %d: mains input %f uV, want %f uV", i,
+			     (double)chain.mains_in,
+			     (double)golden_b_mains_in[i]);
 	}
 
 	TC_PRINT("full chain: worst deviation %e uV\n", (double)worst);

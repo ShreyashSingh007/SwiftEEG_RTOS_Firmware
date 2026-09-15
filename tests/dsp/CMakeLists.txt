@@ -6,10 +6,12 @@ list(APPEND DTS_ROOT   ${CMAKE_CURRENT_SOURCE_DIR}/../..)
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(dsp_test LANGUAGES C)
 
-# Covers both pure modules: the DSP primitives and the SPSC ring buffer.
+# Covers the pure modules: the DSP primitives, the mains tracker and the SPSC
+# ring buffer.
 target_sources(app PRIVATE
   src/main.c
   ${CMAKE_CURRENT_SOURCE_DIR}/../../src/dsp/dsp.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../src/dsp/mains.c
   ${CMAKE_CURRENT_SOURCE_DIR}/../../src/sys/ringbuf.c
 )
 

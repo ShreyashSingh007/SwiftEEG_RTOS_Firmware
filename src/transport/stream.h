@@ -60,6 +60,22 @@ bool stream_send(const uint8_t *frame, size_t len);
 /* Install as the pipeline's sink. Runs in the DSP thread. */
 void stream_on_sample(const struct eeg_sample *s);
 
+/* Unsolicited event ids: the first byte of an EVT payload. */
+#define STREAM_EVT_MAINS 0x01u
+
+/*
+ * Install as the pipeline's mains sink. While the stream is on, sends an EVT
+ * frame, little-endian:
+ *
+ *   u8  STREAM_EVT_MAINS
+ *   u8  flags   bit 0: the notch moved to this frequency
+ *   u32 seq     the first sample processed after the measurement
+ *   f32 hz      the mains frequency measured
+ *
+ * Runs in the DSP thread.
+ */
+void stream_on_mains(float hz, uint32_t seq, bool moved);
+
 void stream_get_stats(struct stream_stats *out);
 void stream_reset_stats(void);
 

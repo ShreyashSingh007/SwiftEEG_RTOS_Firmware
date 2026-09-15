@@ -36,6 +36,14 @@ LOG_MODULE_REGISTER(command, CONFIG_LOG_DEFAULT_LEVEL);
 /* One section on the wire: g, k, m0, m1, m2, little-endian float32 each. */
 #define SECTION_BYTES 20u
 
+/*
+ * A reply refused for want of a notification buffer is tried again, for up
+ * to 100 ms. The stream shares those buffers, and a connection event or two
+ * frees them.
+ */
+#define RSP_RETRIES  25
+#define RSP_RETRY_MS 4
+
 static struct k_sem cmd_ready;
 
 static K_THREAD_STACK_DEFINE(cmd_stack, CMD_STACK_SIZE);
@@ -97,6 +105,14 @@ static inline float get_f32(const uint8_t *p)
 	return v;
 }
 
+static inline void put_f32(uint8_t *p, float v)
+{
+	uint32_t bits;
+
+	memcpy(&bits, &v, sizeof(bits));
+	put_u32(p, bits);
+}
+
 static dsp_section_t get_section(const uint8_t *p)
 {
 	return (dsp_section_t){
@@ -139,7 +155,7 @@ static uint16_t sections_crc(const dsp_section_t *sections, uint8_t count)
 static void respond(uint8_t opcode, uint8_t status, const uint8_t *extra,
 		    size_t extra_len)
 {
-	uint8_t payload[32];
+	uint8_t payload[48];
 
 	payload[0] = opcode;
 	payload[1] = status;
@@ -159,7 +175,30 @@ static void respond(uint8_t opcode, uint8_t status, const uint8_t *extra,
 	}
 
 	if (reply_via_ble) {
-		(void)ble_transport_send_event(rsp_buf, (uint16_t)n);
+		/*
+		 * A host waiting for a reply that was never sent cannot tell it
+		 * from a command that was ignored, so a notification refused for
+		 * want of a buffer waits for room - and says so if it never gets
+		 * it. Under a 1000 SPS stream, none has needed to wait yet.
+		 */
+		int err = 0;
+		int tries = 0;
+
+		for (; tries < RSP_RETRIES; tries++) {
+			err = ble_transport_send_event(rsp_buf, (uint16_t)n);
+			if (err != -ENOMEM && err != -ENOBUFS && err != -EAGAIN) {
+				break;
+			}
+			k_msleep(RSP_RETRY_MS);
+		}
+
+		if (err != 0) {
+			LOG_WRN("reply to 0x%02x not sent (%d) after %d tries",
+				opcode, err, tries);
+		} else if (tries != 0) {
+			LOG_INF("reply to 0x%02x sent after %d tries", opcode,
+				tries);
+		}
 	} else {
 		(void)usb_transport_write(rsp_buf, (size_t)n);
 	}
@@ -262,10 +301,12 @@ static void handle(const proto_frame_t *f)
 
 	case CMD_STREAM_START:
 		stream_enable(true);
+		LOG_INF("stream on");
 		break;
 
 	case CMD_STREAM_STOP:
 		stream_enable(false);
+		LOG_INF("stream off");
 		break;
 
 	case CMD_SET_ENCODING:
@@ -376,13 +417,25 @@ static void handle(const proto_frame_t *f)
 		}
 		break;
 
-	case CMD_SET_NOTCH:
-		if (f->len < 2) {
+	case CMD_SET_NOTCH: {
+		if (f->len < 4) {
 			status = CMD_EBADARG;
-		} else {
-			status = status_for(pipeline_set_notch(f->payload[1]));
+			break;
 		}
+
+		uint32_t seq = 0;
+		const int err = pipeline_set_notch(f->payload[1], f->payload[2],
+						   (f->payload[3] & 0x01u) != 0u,
+						   (f->payload[3] & 0x02u) != 0u,
+						   &seq);
+
+		if (err == 0) {
+			respond_seq(op, seq);
+			return;
+		}
+		status = status_for(err);
 		break;
+	}
 
 	case CMD_SET_LEADOFF:
 		if (f->len < 2) {
@@ -464,12 +517,12 @@ static void handle(const proto_frame_t *f)
 		pipeline_get_filters(&filt);
 
 		const uint16_t sps = pipeline_rate();
-		uint8_t cfg[27];
+		uint8_t cfg[37];
 
 		cfg[0] = ADS1299_CHANNELS;
 		cfg[1] = stream_encoding();
 		put_u16(&cfg[2], sps);
-		cfg[4] = pipeline_notch();
+		cfg[4] = filt.notch_hz;
 		memcpy(&cfg[5], chset, sizeof(chset));
 
 		/* Motion sensor: bit 0 on, bit 1 fitted; then rate and ranges. */
@@ -481,16 +534,28 @@ static void handle(const proto_frame_t *f)
 
 		/*
 		 * The chain: sections per stage; flags (bit 0 common average
-		 * on, bit 1 the pre stage is the device's own notch); the
-		 * average's channel mask; a CRC of each stage's sections.
+		 * on); the average's channel mask; a CRC of each stage's
+		 * sections.
 		 */
 		cfg[19] = filt.pre_count;
 		cfg[20] = filt.post_count;
-		cfg[21] = (uint8_t)((filt.car ? 0x01u : 0u) |
-				    (filt.pre_is_notch ? 0x02u : 0u));
+		cfg[21] = filt.car ? 0x01u : 0u;
 		cfg[22] = filt.car_mask;
 		put_u16(&cfg[23], sections_crc(filt.pre, filt.pre_count));
 		put_u16(&cfg[25], sections_crc(filt.post, filt.post_count));
+
+		/*
+		 * The mains notch, its nominal frequency being byte 4: Q; flags
+		 * (bit 0 harmonic, bit 1 following the measured mains, bit 2 a
+		 * measurement exists); the measured frequency; where the notch
+		 * is aimed now.
+		 */
+		cfg[27] = filt.notch_q;
+		cfg[28] = (uint8_t)((filt.notch_harmonic ? 0x01u : 0u) |
+				    (filt.notch_track ? 0x02u : 0u) |
+				    (filt.mains_hz > 0.0f ? 0x04u : 0u));
+		put_f32(&cfg[29], filt.mains_hz);
+		put_f32(&cfg[33], filt.notch_aim_hz);
 
 		respond(op, CMD_OK, cfg, sizeof(cfg));
 		return;

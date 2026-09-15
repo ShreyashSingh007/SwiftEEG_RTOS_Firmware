@@ -18,6 +18,7 @@ target_sources(app PRIVATE
   src/pipeline/pipeline.c
   src/pipeline/chain.c
   src/dsp/dsp.c
+  src/dsp/mains.c
   src/sys/ringbuf.c
   src/transport/usb.c
   src/transport/stream.c

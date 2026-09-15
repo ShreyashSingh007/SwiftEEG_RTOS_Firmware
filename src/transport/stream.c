@@ -62,6 +62,14 @@ static inline uint16_t enc_batch(uint8_t enc)
  */
 #define DATA_HDR_LEN 16
 
+/*
+ * The batch belongs to whichever thread holds this lock: the DSP thread
+ * adding a sample, or the command thread stopping the stream and sending
+ * what was half built. Without it a STREAM_STOP landing mid-sample could send
+ * a frame the DSP thread was still writing.
+ */
+static K_MUTEX_DEFINE(batch_lock);
+
 static uint8_t batch[DATA_HDR_LEN + BATCH_BYTES];
 static uint16_t batch_stride; /* bytes per sample, fixed when a batch opens */
 static uint16_t batch_limit;  /* samples per batch, likewise */
@@ -73,6 +81,12 @@ static uint8_t batch_encoding;
 
 static uint8_t frame_buf[PROTO_MAX_FRAME];
 static uint16_t frame_seq;
+
+/* A mains event: id, flags, u32 seq, f32 Hz. */
+#define EVT_MAINS_LEN 10u
+
+static uint8_t event_frame[PROTO_OVERHEAD + EVT_MAINS_LEN];
+static uint16_t event_seq;
 
 /*
  * Packed 24-bit by default. The converter is 24-bit, so a 32-bit sample adds
@@ -194,6 +208,14 @@ void stream_on_sample(const struct eeg_sample *s)
 		return;
 	}
 
+	k_mutex_lock(&batch_lock, K_FOREVER);
+
+	/* Stopped while this thread waited for the lock. */
+	if (!enabled) {
+		k_mutex_unlock(&batch_lock);
+		return;
+	}
+
 	if (batch_count == 0) {
 		/* Fixed for the batch: the header declares one encoding. */
 		batch_ts = s->ts_us;
@@ -246,6 +268,30 @@ void stream_on_sample(const struct eeg_sample *s)
 	if (batch_count >= batch_limit) {
 		flush();
 	}
+
+	k_mutex_unlock(&batch_lock);
+}
+
+void stream_on_mains(float hz, uint32_t seq, bool moved)
+{
+	if (!enabled) {
+		return;
+	}
+
+	uint8_t payload[EVT_MAINS_LEN];
+
+	payload[0] = STREAM_EVT_MAINS;
+	payload[1] = moved ? 0x01u : 0x00u;
+	put_u32(&payload[2], seq);
+	put_f32(&payload[6], hz);
+
+	const int n = proto_encode(PROTO_TYPE_EVT, PROTO_FLAG_NONE, event_seq++,
+				   payload, sizeof(payload), event_frame,
+				   sizeof(event_frame));
+
+	if (n > 0) {
+		(void)stream_send(event_frame, (size_t)n);
+	}
 }
 
 void stream_set_encoding(uint8_t enc)
@@ -268,11 +314,13 @@ uint8_t stream_encoding(void)
 
 void stream_enable(bool on)
 {
+	k_mutex_lock(&batch_lock, K_FOREVER);
 	if (!on) {
 		flush();
 	}
 	batch_count = 0;
 	enabled = on;
+	k_mutex_unlock(&batch_lock);
 }
 
 bool stream_enabled(void)

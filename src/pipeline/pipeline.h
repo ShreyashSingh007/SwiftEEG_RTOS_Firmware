@@ -66,10 +66,12 @@ void pipeline_stop(void);
  * Change the sample rate, restarting acquisition around it. The filters are
  * redesigned for the new rate - a notch is only at 50 Hz for the rate it was
  * designed at, so carrying the old coefficients over would quietly move it.
- * Sections a host loaded are dropped for the same reason: the pre stage goes
- * back to the device's own notch and the post stage empties. The common
- * average settings are kept, since they do not depend on the rate, and so is
- * everything set on the AFE: channel gains and inputs, bias drive, lead-off.
+ * Sections a host loaded are dropped for the same reason, emptying the pre
+ * and post stages, and the device's notch is designed again for the new
+ * rate. The notch and common average settings are kept, and so is the
+ * measured mains frequency, since none of them depend on the rate - and so
+ * is everything set on the AFE: channel gains and inputs, bias drive,
+ * lead-off.
  *
  * `sps` is the real rate, not a register code; 250 to 1000 are supported
  * over BLE, higher needs USB. Returns 0, or a negative errno.
@@ -88,15 +90,27 @@ uint16_t pipeline_rate(void);
  */
 
 /*
- * Set the device's own mains notch: 50, 60, or 0 to remove it.
- *
- * Replaces the pre stage with that single notch, including any sections a
- * host loaded there, and starts it again, primed on its next sample.
+ * The device's mains notch: nominal frequency 50, 60, or 0 to remove it; its
+ * Q; whether a second section takes out the harmonic, where the rate leaves
+ * room for one; and whether it follows the mains frequency the device
+ * measures. Following, it starts at the last measurement - kept across
+ * restarts, forgotten when the nominal frequency changes - and moves to each
+ * new one in place. A change of settings is applied in place too, wherever
+ * the number of sections allows. Returns -EINVAL for a frequency other than
+ * 0, 50 or 60, or a Q of 0.
  */
-int pipeline_set_notch(uint8_t hz);
+int pipeline_set_notch(uint8_t hz, uint8_t q, bool harmonic, bool track,
+		       uint32_t *applied_seq);
 
-/* The device notch's frequency, or 0 when the pre stage holds something else. */
-uint8_t pipeline_notch(void);
+/*
+ * Called from the DSP thread when the mains tracker agrees on a frequency:
+ * `hz`, the sequence number of the first sample processed after the
+ * measurement, and whether the notch moved to it. Keep it short: it runs in
+ * the acquisition path.
+ */
+typedef void (*pipeline_mains_sink_t)(float hz, uint32_t seq, bool moved);
+
+void pipeline_set_mains_sink(pipeline_mains_sink_t sink);
 
 #define PIPELINE_STAGE_PRE  0u /* before the common average */
 #define PIPELINE_STAGE_POST 1u /* after it */
@@ -121,9 +135,11 @@ int pipeline_set_car(bool enable, uint8_t mask, uint32_t *applied_seq);
 int pipeline_reset_chain(uint32_t *applied_seq);
 
 /*
- * Take every channel's gain from what the AFE driver last wrote, and scale
- * the chain to match. Call after anything that changes a gain, or microvolts
- * from the chain are wrong by the ratio of the old gain to the new.
+ * Take every channel's gain and input from what the AFE driver last wrote:
+ * scale the chain to match, and measure the mains only on channels that are
+ * on their electrodes. Call after anything that changes a channel, or
+ * microvolts from the chain are wrong by the ratio of the old gain to the
+ * new.
  */
 int pipeline_sync_gains(void);
 
@@ -133,9 +149,14 @@ struct pipeline_filters {
 	dsp_section_t post[DSP_MAX_SECTIONS];
 	uint8_t pre_count;
 	uint8_t post_count;
-	bool    pre_is_notch; /* the pre stage is the device's own notch */
 	bool    car;
 	uint8_t car_mask;
+	uint8_t notch_hz;       /* nominal: 0, 50 or 60 */
+	uint8_t notch_q;
+	bool    notch_harmonic;
+	bool    notch_track;
+	float   mains_hz;       /* the last agreed measurement; 0 before one */
+	float   notch_aim_hz;   /* where the notch is now; 0 when it is off */
 };
 
 void pipeline_get_filters(struct pipeline_filters *out);

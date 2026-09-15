@@ -156,10 +156,19 @@ class Cascade:
         zero = F32(0.0)
         self.ic1 = [[zero] * MAX_SECTIONS for _ in range(self.channels)]
         self.ic2 = [[zero] * MAX_SECTIONS for _ in range(self.channels)]
+        self.pending = [True] * self.channels
 
     def apply(self, ch: int, x):
         x = F32(x)
         ic1, ic2 = self.ic1[ch], self.ic2[ch]
+        if self.pending[ch]:
+            # Primed on this sample, as dsp_cascade_apply primes.
+            v = x
+            for i, (_, _, _, m0, _, m2) in enumerate(self._run):
+                ic1[i] = F32(0.0)
+                ic2[i] = v
+                v = (m0 + m2) * v
+            self.pending[ch] = False
         for i, (a1, a2, a3, m0, m1, m2) in enumerate(self._run):
             v3 = x - ic2[i]
             v1 = a1 * ic1[i] + a2 * v3
@@ -184,7 +193,7 @@ class Cascade:
 
 
 def cascade_apply(sections, x):
-    """Sections in series over one channel, from rest."""
+    """Sections in series over one channel, primed on the first sample."""
     c = Cascade(1)
     if not c.set(sections):
         raise ValueError("invalid section")
@@ -268,10 +277,12 @@ def _self_test() -> None:
     assert abs(butterworth_qs(4)[1] - 1.3066) < 1e-3
 
     # The transfer function the formulas claim is the one the loop runs:
-    # an impulse through the float32 loop, against the formula.
+    # an impulse through the float32 loop, against the formula. The impulse
+    # comes one sample in: a cascade primes on its first sample, and primed
+    # on the impulse itself it would see a step down instead.
     for s in (n, lp, hp, design_notch(250.0, 50.0, 12.0)):
         imp = np.zeros(4096)
-        imp[0] = 1.0
+        imp[1] = 1.0
         h = np.abs(np.fft.rfft(cascade_apply([s], imp).astype(float)))
         freqs = np.fft.rfftfreq(len(imp), 1.0 / fs)
         err = np.abs(h - response(s, fs, freqs)).max()
@@ -328,6 +339,14 @@ def _self_test() -> None:
     c.set([n])
     expect = 4.6 * 30.0 / (math.pi * 50.0) * fs
     assert abs(c.settle_samples() - expect) / expect < 0.05, c.settle_samples()
+
+    # A restart primes on its next input: a high-pass fed a constant gives
+    # nothing from the very first sample, and a low-pass gives the constant.
+    c = Cascade(1)
+    c.set([design_highpass(fs, 0.5, q)])
+    assert all(abs(float(c.apply(0, 1000.0))) < 1e-3 for _ in range(20))
+    c.set([lp])
+    assert all(abs(float(c.apply(0, 1000.0)) - 1000.0) < 1e-2 for _ in range(20))
 
     # DC blocker: priming means the very first output is exactly zero, and a
     # constant input stays at zero rather than ramping.

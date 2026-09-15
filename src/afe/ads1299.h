@@ -210,6 +210,18 @@ bool ads1299_start_pin_stuck_high(void);
 int ads1299_configure(uint8_t rate);
 
 /*
+ * Change only the data rate, leaving every other setting as it is: channel
+ * gains and inputs, bias drive, lead-off. For a restart at a new rate on a
+ * part already configured. ads1299_configure() would put every channel back
+ * to gain 24 on the electrodes and switch the bias drive off for over 150 ms
+ * while the reference settles - on a head, a common-mode step that every
+ * electrode sees.
+ *
+ * Expects the part stopped, as ads1299_stream_stop() leaves it.
+ */
+int ads1299_set_data_rate(uint8_t rate);
+
+/*
  * Set every channel's gain and input mux. SRB2 is left open: the negative
  * inputs come from SRB1 instead, which is how this board is wired.
  */

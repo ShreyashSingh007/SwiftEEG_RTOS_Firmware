@@ -68,7 +68,8 @@ void pipeline_stop(void);
  * designed at, so carrying the old coefficients over would quietly move it.
  * Sections a host loaded are dropped for the same reason: the pre stage goes
  * back to the device's own notch and the post stage empties. The common
- * average settings are kept, since they do not depend on the rate.
+ * average settings are kept, since they do not depend on the rate, and so is
+ * everything set on the AFE: channel gains and inputs, bias drive, lead-off.
  *
  * `sps` is the real rate, not a register code; 250 to 1000 are supported
  * over BLE, higher needs USB. Returns 0, or a negative errno.
@@ -90,7 +91,7 @@ uint16_t pipeline_rate(void);
  * Set the device's own mains notch: 50, 60, or 0 to remove it.
  *
  * Replaces the pre stage with that single notch, including any sections a
- * host loaded there, and starts it from rest.
+ * host loaded there, and starts it again, primed on its next sample.
  */
 int pipeline_set_notch(uint8_t hz);
 
@@ -103,8 +104,8 @@ uint8_t pipeline_notch(void);
 /*
  * Load a stage with sections a host designed. With `keep_state` and the
  * same number of sections, the filter is retuned in place; otherwise it
- * starts from rest. Returns -EINVAL, changing nothing, for an invalid
- * section.
+ * starts again, primed on its next sample. Returns -EINVAL, changing
+ * nothing, for an invalid section.
  */
 int pipeline_set_stage(uint8_t stage, const dsp_section_t *sections,
 		       uint8_t count, bool keep_state, uint32_t *applied_seq);
@@ -113,8 +114,8 @@ int pipeline_set_stage(uint8_t stage, const dsp_section_t *sections,
 int pipeline_set_car(bool enable, uint8_t mask, uint32_t *applied_seq);
 
 /*
- * Restart the chain from the next sample: the DC estimate re-primes and every
- * filter starts from rest. What a host needs to run its own copy of the chain
+ * Restart the chain from the next sample: the DC estimate and every filter
+ * re-prime on it. What a host needs to run its own copy of the chain
  * from exactly the same starting point.
  */
 int pipeline_reset_chain(uint32_t *applied_seq);

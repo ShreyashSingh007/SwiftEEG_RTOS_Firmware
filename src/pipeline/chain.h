@@ -69,8 +69,8 @@ bool chain_process(chain_t *c, const uint8_t *frame, int32_t *raw_out,
 
 /*
  * Make the pre stage a single mains notch, or a pass-through when
- * `notch_hz` is 0. Its state starts from rest; the DC state is kept, since
- * the offset has not changed.
+ * `notch_hz` is 0. It starts again, primed on its next sample; the DC state
+ * is kept, since the offset has not changed.
  */
 int chain_set_notch(chain_t *c, float fs_hz, float notch_hz, float notch_q);
 
@@ -78,9 +78,9 @@ int chain_set_notch(chain_t *c, float fs_hz, float notch_hz, float notch_q);
  * Load sections into one stage - CHAIN_STAGE_PRE or CHAIN_STAGE_POST.
  *
  * With `keep_state`, and the same number of sections as the stage holds, the
- * filter is retuned in place; otherwise it starts from rest. `kept` (may be
- * NULL) says which happened. Returns -EINVAL, changing nothing, for a bad
- * stage, too many sections or an invalid one.
+ * filter is retuned in place; otherwise it starts again, primed on its next
+ * sample. `kept` (may be NULL) says which happened. Returns -EINVAL,
+ * changing nothing, for a bad stage, too many sections or an invalid one.
  */
 int chain_set_stage(chain_t *c, uint8_t stage, const dsp_section_t *sections,
 		    uint8_t count, bool keep_state, bool *kept);
@@ -97,8 +97,8 @@ void chain_set_car(chain_t *c, bool enable, uint8_t mask);
 int chain_set_gain(chain_t *c, uint8_t ch, uint8_t gain);
 
 /*
- * Start again from the next frame: the DC estimate re-primes on it and
- * every filter starts from rest. Sections and settings are kept.
+ * Start again from the next frame: the DC estimate and every filter
+ * re-prime on it. Sections and settings are kept.
  */
 void chain_reset(chain_t *c);
 

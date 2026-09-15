@@ -107,14 +107,16 @@ typedef struct {
 	dsp_section_state_t state[DSP_MAX_CHANNELS][DSP_MAX_SECTIONS];
 	uint8_t count;
 	uint8_t channels;
+	uint8_t prime_mask; /* channels that prime on their next sample */
 } dsp_cascade_t;
 
 void dsp_cascade_init(dsp_cascade_t *c, uint8_t channels);
 
 /*
- * Load sections and start them from rest. A count of 0, with `sections`
- * allowed to be NULL, leaves a pass-through. Returns false, changing nothing,
- * for too many sections or an invalid one.
+ * Load sections and start them again, each channel primed on its next
+ * sample. A count of 0, with `sections` allowed to be NULL, leaves a
+ * pass-through. Returns false, changing nothing, for too many sections or an
+ * invalid one.
  */
 bool dsp_cascade_set(dsp_cascade_t *c, const dsp_section_t *sections,
 		     uint8_t count);
@@ -129,6 +131,12 @@ bool dsp_cascade_set(dsp_cascade_t *c, const dsp_section_t *sections,
 bool dsp_cascade_retune(dsp_cascade_t *c, const dsp_section_t *sections,
 			uint8_t count);
 
+/*
+ * Start again: each channel primes on its next sample, as if that sample had
+ * always been its input. Started from rest instead, a filter takes its first
+ * sample as a step from zero, and after a restart mid-stream that is a
+ * transient the size of the signal.
+ */
 void dsp_cascade_reset_state(dsp_cascade_t *c);
 float dsp_cascade_apply(dsp_cascade_t *c, uint8_t channel, float x);
 

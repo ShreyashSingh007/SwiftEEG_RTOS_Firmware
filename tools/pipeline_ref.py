@@ -286,6 +286,7 @@ def full_config() -> dict:
         "retune_at": 256,
         "car_at": 384,
         "reset_at": 448,
+        "restart_post_at": 320,
     }
 
 
@@ -305,6 +306,8 @@ def run_full(frames, cfg: dict, events: bool = True):
     for i, f in enumerate(frames):
         if events and i == cfg["retune_at"]:
             assert c.set_stage(STAGE_PRE, cfg["pre_retuned"], keep_state=True)
+        if events and i == cfg["restart_post_at"]:
+            assert not c.set_stage(STAGE_POST, cfg["post"])
         if events and i == cfg["car_at"]:
             c.set_car(True, cfg["mask_later"])
         if events and i == cfg["reset_at"]:
@@ -520,6 +523,7 @@ def _emit() -> None:
     A("/*")
     A(" * B: the host application's chain loaded onto the device, channel 2 at")
     A(" * gain 12. At RETUNE_AT the notch pair moves 0.2 Hz keeping its state;")
+    A(" * at RESTART_POST_AT the low-pass restarts, priming on its next input;")
     A(" * at CAR_AT the average takes in channel 7; at RESET_AT the chain")
     A(" * restarts.")
     A(" */")
@@ -532,6 +536,7 @@ def _emit() -> None:
     A(f"#define GOLDEN_B_RETUNE_AT     {cfg['retune_at']}")
     A(f"#define GOLDEN_B_CAR_AT        {cfg['car_at']}")
     A(f"#define GOLDEN_B_RESET_AT      {cfg['reset_at']}")
+    A(f"#define GOLDEN_B_RESTART_POST_AT {cfg['restart_post_at']}")
     A("")
     A("static const uint8_t golden_b_gains[GOLDEN_PIPE_CHANNELS] = { "
       + ", ".join(str(g) for g in cfg["gains"]) + " };")

@@ -69,6 +69,9 @@ static k_tid_t dsp_tid;
 
 static volatile bool running;
 static uint8_t current_rate_code;
+
+/* The AFE has had its full configuration once. */
+static bool afe_configured;
 static struct k_sem frame_ready;
 
 /*
@@ -470,11 +473,23 @@ int pipeline_start(uint8_t rate)
 
 	k_sem_init(&frame_ready, 0, K_SEM_MAX_LIMIT);
 
-	int err = ads1299_configure(rate);
+	/*
+	 * A restart at a new rate changes the rate and nothing else. The full
+	 * configuration would put every channel back to gain 24 on the
+	 * electrodes, lose the bias and lead-off settings, and switch the bias
+	 * drive off for over 150 ms - on a head, a common-mode step that every
+	 * electrode sees. It runs at the first start, and a restart falls back
+	 * on it if the lighter change fails.
+	 */
+	int err = afe_configured ? ads1299_set_data_rate(rate) : -EAGAIN;
 
+	if (err) {
+		err = ads1299_configure(rate);
+	}
 	if (err) {
 		return err;
 	}
+	afe_configured = true;
 
 	err = build_chain();
 	if (err) {

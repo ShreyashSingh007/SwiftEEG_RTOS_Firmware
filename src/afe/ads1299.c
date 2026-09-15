@@ -383,6 +383,38 @@ int ads1299_configure(uint8_t rate)
 	return 0;
 }
 
+int ads1299_set_data_rate(uint8_t rate)
+{
+	/* Registers are only writable outside continuous-read mode. */
+	int err = afe_cmd(ADS1299_CMD_SDATAC);
+
+	if (err) {
+		return err;
+	}
+	k_busy_wait(10);
+
+	const uint8_t want = ADS1299_CONFIG1_BASE | (rate & 0x07u);
+
+	err = afe_write_reg(ADS1299_REG_CONFIG1, want);
+	if (err) {
+		return err;
+	}
+
+	uint8_t back = 0;
+
+	err = afe_read_reg(ADS1299_REG_CONFIG1, &back);
+	if (err) {
+		return err;
+	}
+	if (back != want) {
+		LOG_ERR("CONFIG1 readback %02x, wanted %02x", back, want);
+		return -EIO;
+	}
+
+	LOG_INF("AFE data rate changed (CONFIG1 %02x), other settings kept", back);
+	return 0;
+}
+
 /*
  * Registers are only writable in command mode. While acquiring, the part is
  * in RDATAC and silently ignores WREG, so a change made without dropping out
@@ -983,6 +1015,11 @@ int ads1299_stream_start(ads1299_frame_cb_t cb)
 
 	afe_streaming = true;
 
+	/* DRDY may start transfers again: ads1299_stream_stop() took that away. */
+	if (afe_gate != NULL) {
+		afe_gate(true);
+	}
+
 	/* Conversions last: everything must be ready before the first DRDY. */
 	err = ads1299_start_conversions();
 	if (err) {
@@ -999,19 +1036,33 @@ void ads1299_stream_stop(void)
 		return;
 	}
 
-	(void)ads1299_stop_conversions();
+	/*
+	 * Leave continuous read the way afe_enter_command_mode() does, and for
+	 * its reasons. STOP used to go out first, with DRDY still starting
+	 * transfers: one already running when the command was sent could
+	 * swallow it or leave SPIM3 stuck, as it did for register access - and
+	 * a rate change sends its register writes straight after this.
+	 */
+	if (afe_gate != NULL) {
+		afe_gate(false);
+	}
+	k_busy_wait(AFE_XFER_SETTLE_US);
 
 	nrf_spim_int_disable(AFE_SPIM, NRF_SPIM_INT_END_MASK);
 	irq_disable(DT_IRQN(AFE_SPI_NODE));
 	afe_irq_on = false;
 
+	nrf_spim_frequency_set(AFE_SPIM, AFE_FREQ_REGS);
 	afe_cs_held = false;
 	nrf_gpio_pin_set(afe_cs_pin());
-	nrf_spim_frequency_set(AFE_SPIM, AFE_FREQ_REGS);
+	k_busy_wait(20);
+
+	/* SDATAC is the one command continuous-read mode honours; then STOP. */
+	(void)afe_cmd(ADS1299_CMD_SDATAC);
+	k_busy_wait(20);
+	(void)ads1299_stop_conversions();
+	k_busy_wait(20);
 
 	afe_streaming = false;
 	afe_cb = NULL;
-
-	/* Back to command mode so registers can be written again. */
-	(void)afe_cmd(ADS1299_CMD_SDATAC);
 }

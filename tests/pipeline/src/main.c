@@ -159,6 +159,15 @@ ZTEST(pipeline, test_full_chain_matches_reference)
 						   &kept));
 			zassert_true(kept, "a same-size retune restarted");
 		}
+		if (i == GOLDEN_B_RESTART_POST_AT) {
+			bool kept = true;
+
+			zassert_ok(chain_set_stage(&chain, CHAIN_STAGE_POST,
+						   golden_b_post,
+						   GOLDEN_B_POST_COUNT, false,
+						   &kept));
+			zassert_false(kept, "a restart kept its state");
+		}
 		if (i == GOLDEN_B_CAR_AT) {
 			chain_set_car(&chain, true, GOLDEN_B_CAR_MASK_LATER);
 		}

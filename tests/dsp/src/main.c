@@ -318,6 +318,33 @@ ZTEST(dsp, test_retune_keeps_state)
 	zassert_equal(retuned.count, 2, "a refused retune changed the cascade");
 }
 
+ZTEST(dsp, test_restart_primes_on_next_input)
+{
+	/*
+	 * A restart mid-stream starts as if its next sample had always been the
+	 * input: a high-pass fed a constant gives nothing from the first sample,
+	 * and a low-pass gives the constant. From rest, both would ring.
+	 */
+	dsp_cascade_t c;
+
+	dsp_cascade_init(&c, 1);
+	zassert_true(dsp_cascade_set(&c, &golden_hp01, 1), NULL);
+	for (int i = 0; i < 32; i++) {
+		const float y = dsp_cascade_apply(&c, 0, 1000.0f);
+
+		zassert_within(y, 0.0f, 1e-3f, "high-pass gave %f at %d",
+			       (double)y, i);
+	}
+
+	zassert_true(dsp_cascade_set(&c, &golden_lp40, 1), NULL);
+	for (int i = 0; i < 32; i++) {
+		const float y = dsp_cascade_apply(&c, 0, 1000.0f);
+
+		zassert_within(y, 1000.0f, 1e-2f, "low-pass gave %f at %d",
+			       (double)y, i);
+	}
+}
+
 ZTEST(dsp, test_settle_samples_are_sane)
 {
 	dsp_cascade_t c;

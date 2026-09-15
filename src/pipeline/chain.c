@@ -126,7 +126,8 @@ int chain_set_stage(chain_t *c, uint8_t stage, const dsp_section_t *sections,
 
 	/*
 	 * A retune keeps the state only when it can - the same number of
-	 * sections. Anything else is a different filter and starts from rest.
+	 * sections. Anything else is a different filter and starts again,
+	 * primed on its next sample.
 	 */
 	if (keep_state && dsp_cascade_retune(cas, sections, count)) {
 		if (kept != NULL) {

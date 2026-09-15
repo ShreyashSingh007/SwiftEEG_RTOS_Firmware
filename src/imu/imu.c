@@ -93,6 +93,19 @@ static bool present;
 /*
  * `active` is written only by the IMU thread and read elsewhere under the
  * lock; `requested` is the reverse.
+ *
+ * The defaults, from the datasheet (DS13510) and the job - a head-worn
+ * reference for motion artifacts, and later the machine learning core:
+ *
+ *   240 Hz      the machine learning core's highest rate (MLC_ODR), so one
+ *               stream can feed both. High-performance mode keeps the sensor's
+ *               anti-aliasing filter at ODR/2, so 120 Hz of motion is sampled
+ *               honestly.
+ *   +/-8 g      head acceleration walking, running and jumping, with room for
+ *               knocks. Noise density is the same at every range (60 ug/rtHz),
+ *               so the wider range costs nothing: noise is still ~3 counts.
+ *   +/-2000 dps fast head shakes reach several hundred degrees a second.
+ *               Rate noise (2.8 mdps/rtHz) is range-independent up to here.
  */
 static struct imu_config active = {
 	.enabled = true,
@@ -219,12 +232,23 @@ static int gyro_fs_code(uint16_t dps)
 }
 
 /*
- * Samples per watermark, and how often to look for it. A late look adds
- * samples to the batch, and a batch has to stay within one frame's 17.
+ * Samples per watermark, and how often to look for it.
+ *
+ * About 20 ms of samples a batch at every rate. A batch is also how long its
+ * newest sample waits before it is sent, and at 12 a batch - 50 ms at 240 Hz
+ * - the motion trace in the app fell short of the EEG's and caught up in
+ * jumps. A late look adds samples to a batch, which has to stay within one
+ * frame's 17, so 960 Hz keeps 8 and a faster look.
  */
 static uint8_t batch_for(uint16_t hz)
 {
-	return (hz >= 960) ? 8 : (hz >= 480) ? 10 : 12;
+	switch (hz) {
+	case 60:  return 2;  /* 33 ms */
+	case 120: return 3;  /* 25 ms */
+	case 240: return 5;  /* 21 ms */
+	case 480: return 10; /* 21 ms */
+	default:  return 8;  /* 960 Hz, 8 ms */
+	}
 }
 
 static int32_t poll_ms_for(uint16_t hz)

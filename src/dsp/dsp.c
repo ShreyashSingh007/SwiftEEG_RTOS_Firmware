@@ -133,10 +133,13 @@ bool dsp_cascade_retune(dsp_cascade_t *c, const dsp_section_t *sections,
 	return true;
 }
 
+_Static_assert(DSP_MAX_CHANNELS <= 8, "prime_mask holds one bit per channel");
+
 void dsp_cascade_reset_state(dsp_cascade_t *c)
 {
 	if (c != NULL) {
 		memset(c->state, 0, sizeof(c->state));
+		c->prime_mask = (uint8_t)((1u << c->channels) - 1u);
 	}
 }
 
@@ -144,6 +147,22 @@ float dsp_cascade_apply(dsp_cascade_t *c, uint8_t channel, float x)
 {
 	if (c == NULL || channel >= c->channels) {
 		return x;
+	}
+
+	if ((c->prime_mask & (1u << channel)) != 0u) {
+		/*
+		 * For a steady input the band-pass integrator holds nothing and
+		 * the low-pass one holds the input itself, and a section's output
+		 * - the next one's input - is (m0 + m2) times it.
+		 */
+		float in = x;
+
+		for (uint8_t i = 0; i < c->count; i++) {
+			c->state[channel][i].ic1 = 0.0f;
+			c->state[channel][i].ic2 = in;
+			in = (c->run[i].m0 + c->run[i].m2) * in;
+		}
+		c->prime_mask &= (uint8_t)~(1u << channel);
 	}
 
 	for (uint8_t i = 0; i < c->count; i++) {

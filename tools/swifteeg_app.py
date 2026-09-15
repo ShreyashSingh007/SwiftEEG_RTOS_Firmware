@@ -29,7 +29,6 @@ Three decisions worth knowing:
 
 from __future__ import annotations
 
-import collections
 import csv
 import ctypes
 import math
@@ -198,12 +197,10 @@ class App(tk.Tk):
         # (sample number in the EEG stream, device time of that sample)
         self.eeg_anchor: tuple[int, float] | None = None
 
-        # Recent unfiltered samples, kept only so the mains frequency can be
-        # measured. Grid frequency is never exactly 50 or 60 Hz - measured
-        # 49.6 here - and a notch narrow enough to spare the EEG is too
-        # narrow to hit by guesswork.
-        self.mains_buf: collections.deque = collections.deque(maxlen=4000)
-        self.mains_next = 0.0
+        # The notch settings the device was last sent. The device designs its
+        # notch itself and aims it at the mains frequency it measures; the
+        # chain here aims where the device says its notch is.
+        self._notch_sent: tuple | None = None
 
         self.samples = 0
         self.frames = 0
@@ -543,6 +540,7 @@ class App(tk.Tk):
             self.link.close()
             self.link = None
             self._dev_sent = {}
+            self._notch_sent = None
             self._rate_change = None
             self.btn_conn.config(text="Connect")
             self.status.config(text="not connected", fg=DIM)
@@ -584,8 +582,8 @@ class App(tk.Tk):
     def _forget_samples(self) -> None:
         """
         Drop everything taken from the stream so far, wherever it breaks - a
-        start, a rate change - so nothing from before the break is plotted,
-        counted, or used to measure the mains.
+        start, a rate change - so nothing from before the break is plotted or
+        counted.
         """
         self._reset_traces()
         self._reset_imu()
@@ -593,7 +591,6 @@ class App(tk.Tk):
         self.frames = 0
         self.last_seq = None
         self.gaps = 0
-        self.mains_buf.clear()
         self.started_at = time.time()
 
     def _reset_traces(self) -> None:
@@ -710,6 +707,7 @@ class App(tk.Tk):
         self.btn_stream.config(text="Start streaming")
         self._was_connected = False
         self._dev_sent = {}
+        self._notch_sent = None
         self._rate_change = None
         self.chain.reset()
         self._forget_samples()
@@ -772,12 +770,22 @@ class App(tk.Tk):
             self._dev_sent["car"] = car
 
     def _restore_device_chain(self) -> None:
-        """The device's own default: its mains notch, no average, no low-pass."""
-        hz = {"off": 0, "50 Hz": 50, "60 Hz": 60}[self.hnotch_var.get()]
-        self._send(link.CMD_SET_FILTER,
-                   *link.filter_args(link.STAGE_POST, [], self.rate))
-        self._send(link.CMD_SET_NOTCH, hz)
+        """The device's own default: its mains notch alone, no average."""
+        for stage in (link.STAGE_PRE, link.STAGE_POST):
+            self._send(link.CMD_SET_FILTER,
+                       *link.filter_args(stage, [], self.rate))
         self._send(link.CMD_SET_CAR, 0, 0xFF)
+
+    def _send_notch(self) -> None:
+        """
+        The notch settings, to the device, when they differ from what it has
+        - wherever the filters run. The device measures the mains either way,
+        and the chain here follows where the device aims its notch.
+        """
+        settings = self.chain.device_notch()
+        if self._notch_sent != settings and self.link and self.link.connected:
+            self._send(link.CMD_SET_NOTCH, *link.notch_args(*settings))
+            self._notch_sent = settings
 
     def _back_to_pc(self, why: str) -> None:
         """Filters back on the PC, saying why - never a silently wrong plot."""
@@ -794,8 +802,6 @@ class App(tk.Tk):
                "Test signal": link.MUX_TEST}[self.src_var.get()]
         self._send(link.CMD_SET_INPUT, mux, 0)
         self.chain.reset()
-        # Samples from the old input say nothing about the mains on the new.
-        self.mains_buf.clear()
 
     def _set_gain(self) -> None:
         self.gain = int(self.gain_var.get())
@@ -804,8 +810,6 @@ class App(tk.Tk):
                "Test signal": link.MUX_TEST}[self.src_var.get()]
         self._send(link.CMD_SET_CHANNEL, 0xFF, link.GAIN_CODES[self.gain],
                    mux, 0, 0)
-        # Samples at the old gain are scaled wrongly from here on.
-        self.mains_buf.clear()
 
     def _set_bias(self) -> None:
         # Both masks: SRB1 sits on the negative inputs and has to be inside
@@ -836,6 +840,7 @@ class App(tk.Tk):
         nz = self.hnotch_var.get()
 
         was_hp = self.chain.highpass_hz
+        was_notch = self.chain.notch_hz
         self.chain.highpass_hz = 0.0 if hp == "off" else float(hp)
         self.chain.lowpass_hz = 0.0 if lp == "off" else float(lp)
         self.chain.notch_hz = {"off": 0.0, "50 Hz": 50.0, "60 Hz": 60.0}[nz]
@@ -843,8 +848,13 @@ class App(tk.Tk):
         self.chain.car = self.car_var.get()
         self.chain.notch_q = float(self.q_var.get().split()[0])
         self.chain.notch_track = self.track_var.get()
+        if self.chain.notch_hz != was_notch:
+            # A measurement near 50 Hz says nothing about 60, and the device
+            # forgets it too.
+            self.chain.forget_mains()
         self.chain.rebuild()
         self._push_device_chain()
+        self._send_notch()
         self._show_car_hint()
 
         # Every change applies from the next sample. After a new drift cut,
@@ -1011,8 +1021,6 @@ class App(tk.Tk):
 
                 if self.last_seq is not None and seq != self.last_seq:
                     self.gaps += 1
-                    # The mains buffer has to be one unbroken stretch.
-                    self.mains_buf.clear()
                 self.last_seq = seq + len(counts)
 
                 if f.flags & link.FLAG_SETTLING:
@@ -1023,6 +1031,11 @@ class App(tk.Tk):
                 got = link.decode_imu(f.payload)
                 if got is not None:
                     imu_raw.append(got)
+            elif f.type == link.TYPE_EVT:
+                event = link.decode_event(bytes(f.payload))
+                if event is not None and event["event"] == "mains":
+                    self.chain.follow_mains(
+                        event["hz"], event["hz"] if event["moved"] else None)
             elif f.type == link.TYPE_RSP:
                 self._on_response(bytes(f.payload))
 
@@ -1117,6 +1130,15 @@ class App(tk.Tk):
             self.imu_acc_var.set(str(cfg["imu_accel_g"]))
             self.imu_gyro_var.set(str(cfg["imu_gyro_dps"]))
 
+        # The notch. The device designs it and aims it at the mains it
+        # measures; its settings are this app's, and the chain here aims where
+        # the device reports its notch is.
+        if "notch_q" in cfg:
+            self._notch_sent = (cfg["notch"], cfg["notch_q"],
+                                cfg["notch_harmonic"], cfg["notch_track"])
+            self._send_notch()
+            self.chain.follow_mains(cfg["mains_hz"], cfg["notch_aim_hz"])
+
         if self.filters_on_device:
             if "pre_crc" not in cfg:
                 self._back_to_pc("this firmware cannot run the filters")
@@ -1183,19 +1205,6 @@ class App(tk.Tk):
             self.dc_mv[ch] = float(np.mean(counts[:, ch])) * scale / 1000.0
 
         uv = counts.astype(np.float64) * scale
-
-        # Re-aim the notch from what the mains is actually doing, using
-        # unfiltered samples - the notch has already removed the evidence
-        # from anything downstream of it. The chain keeps its state through
-        # a re-aim; restarting it here was putting each electrode's whole
-        # offset back through the high-pass every few seconds. On the device
-        # the notch is retuned the same way.
-        self.mains_buf.extend(uv.mean(axis=1))
-        now = time.time()
-        if now >= self.mains_next and len(self.mains_buf) >= self.rate * 4:
-            self.mains_next = now + 5.0
-            if self.chain.update_mains(np.array(self.mains_buf)):
-                self._push_device_chain()
 
         # The device's own output when it is filtering; this chain otherwise,
         # and for any batch still arriving in the old form just after a
@@ -1664,13 +1673,16 @@ class App(tk.Tk):
         self._stats_next = now + 0.2
 
         m = self.chain.measured_mains
-        if m and self.chain.notch_track:
-            self.mains_label.config(
-                text=f"mains measured at {m:.2f} Hz")
-        elif self.chain.notch_hz:
-            self.mains_label.config(text="mains: using nominal")
-        else:
+        aim = self.chain.notch_aim
+        if not self.chain.notch_hz:
             self.mains_label.config(text="")
+        elif m:
+            where = (f"notch at {aim:.2f}" if self.chain.notch_track and aim
+                     else "notch at nominal")
+            self.mains_label.config(
+                text=f"mains {m:.2f} Hz on the device, {where}")
+        else:
+            self.mains_label.config(text="mains not measured yet - notch at nominal")
 
         el = max(1e-3, time.time() - self.started_at)
         rec = f"  rec {self.rec_rows}" if self.recorder else ""

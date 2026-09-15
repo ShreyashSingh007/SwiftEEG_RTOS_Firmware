@@ -54,6 +54,12 @@ CMD_RESET_CHAIN = 0x12
 # Status byte of a response.
 STATUS_OK, STATUS_BADARG, STATUS_FAILED, STATUS_UNKNOWN = 0, 1, 2, 3
 
+# Unsolicited events. The device measures the mains frequency and says so.
+EVT_MAINS = 0x01
+
+# The mains notch's flags, in CMD_SET_NOTCH and GET_CONFIG.
+NOTCH_HARMONIC, NOTCH_TRACK, NOTCH_MEASURED = 0x01, 0x02, 0x04
+
 # Raw counts in 32 or 24 bits; microvolts after the device's chain; or both
 # side by side for every channel, so a host can record the one and show the
 # other.
@@ -115,6 +121,12 @@ UUID_EVENT = f"57724504-4700-4000-8000-{_NODE}"
 
 DEVICE_NAME = "SwiftEEG"
 USB_VID, USB_PID = 0x2FE3, 0x0001
+
+# Commands go out as writes without a response. Tried the other way, under a
+# 1000 SPS stream: acknowledged writes doubled the reply time, 36 to 73 ms
+# median over 252 commands, and replies still went missing - so what loses
+# them is not the write.
+BLE_WRITE_WITH_RESPONSE = False
 
 
 def _i24(raw: np.ndarray) -> np.ndarray:
@@ -179,6 +191,29 @@ def sections_crc(sections) -> int:
     return proto_ref.crc16(pack_sections(sections))
 
 
+def notch_args(hz: int, q: int, harmonic: bool, track: bool) -> list[int]:
+    """
+    Arguments for CMD_SET_NOTCH: the nominal frequency (0, 50 or 60), Q, and
+    whether to notch the harmonic and follow the mains the device measures.
+    """
+    return [int(hz), int(q),
+            (NOTCH_HARMONIC if harmonic else 0) | (NOTCH_TRACK if track else 0)]
+
+
+def decode_event(payload: bytes) -> dict | None:
+    """
+    An EVT payload as a dict, or None for one this host does not know.
+
+    EVT_MAINS: the mains frequency the device agreed on, the first sample
+    processed after it, and whether its notch moved there.
+    """
+    if len(payload) >= 10 and payload[0] == EVT_MAINS:
+        seq, hz = struct.unpack_from("<If", payload, 2)
+        return {"event": "mains", "hz": hz, "seq": seq,
+                "moved": bool(payload[1] & 0x01)}
+    return None
+
+
 def response_seq(payload: bytes) -> int | None:
     """The sample a filter change applies from, read from its OK response."""
     if len(payload) >= 6 and payload[1] == STATUS_OK:
@@ -214,10 +249,18 @@ def decode_config(p: bytes) -> dict | None:
         cfg["pre_count"] = p[21]
         cfg["post_count"] = p[22]
         cfg["car"] = bool(p[23] & 0x01)
-        cfg["pre_is_notch"] = bool(p[23] & 0x02)
         cfg["car_mask"] = p[24]
         cfg["pre_crc"] = p[25] | (p[26] << 8)
         cfg["post_crc"] = p[27] | (p[28] << 8)
+
+    if len(p) >= 39:
+        flags = p[30]
+        measured, aim = struct.unpack_from("<ff", p, 31)
+        cfg["notch_q"] = p[29]
+        cfg["notch_harmonic"] = bool(flags & NOTCH_HARMONIC)
+        cfg["notch_track"] = bool(flags & NOTCH_TRACK)
+        cfg["mains_hz"] = measured if flags & NOTCH_MEASURED else None
+        cfg["notch_aim_hz"] = aim
 
     return cfg
 
@@ -374,8 +417,7 @@ class BleLink(Link):
             return
 
         def on_notify(_, data: bytearray) -> None:
-            for f in self.parser.feed(bytes(data)):
-                self.frames.put(f)
+            self._take_notification(bytes(data))
 
         dropped = asyncio.Event()
 
@@ -393,7 +435,8 @@ class BleLink(Link):
                     continue
 
                 try:
-                    await c.write_gatt_char(UUID_CONTROL, frame, response=False)
+                    await c.write_gatt_char(UUID_CONTROL, frame,
+                                            response=BLE_WRITE_WITH_RESPONSE)
                 except Exception as exc:  # noqa: BLE001
                     self.status.put(f"BLE write failed: {exc}")
                     break
@@ -401,6 +444,19 @@ class BleLink(Link):
             self.connected = False
             if dropped.is_set():
                 self.status.put("BLE link dropped")
+
+    def _take_notification(self, data: bytes) -> None:
+        """
+        One notification's frames. The device sends whole frames, one to a
+        notification, so bytes left over can only be a damaged frame - and
+        kept, they would take the next notification, a reply perhaps, as
+        their missing part. Both characteristics come through here.
+        """
+        for f in self.parser.feed(data):
+            self.frames.put(f)
+        if self.parser.buf:
+            self.parser.buf.clear()
+            self.parser.bad += 1
 
     def send(self, opcode: int, *args: int) -> None:
         self._out.put(self._encode(opcode, args))

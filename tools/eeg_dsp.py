@@ -53,6 +53,10 @@ DEFAULT_NOTCH_HZ = 50.0
 # wide, which covers the drift and still leaves alpha and beta untouched.
 DEFAULT_NOTCH_Q = 12.0
 
+# The device's rule for a measured mains frequency: it aims the notch only
+# when the measurement is this close to nominal. Grids keep well inside it.
+MAINS_ACCEPT_HZ = 1.0
+
 
 def butterworth_qs(order: int) -> list[float]:
     """
@@ -106,50 +110,6 @@ def response(sections, fs, freqs):
         h *= num / den
 
     return np.abs(h)
-
-
-def find_mains(block, fs: float, nominal: float = 50.0) -> float | None:
-    """
-    Find the actual mains frequency near `nominal`.
-
-    Grid frequency is never exactly 50 or 60 Hz and moves around by a few
-    tenths. A notch narrow enough to spare the EEG either side is too narrow
-    to hit a moving target by guesswork, so it gets aimed instead.
-
-    Returns None when there is not enough data to be confident, in which case
-    the caller should keep whatever it had.
-    """
-    x = np.asarray(block, dtype=float)
-    if x.ndim > 1:
-        x = x.mean(axis=1)
-
-    n = len(x)
-    # Resolution is fs/n, so a 0.1 Hz answer needs about 10 seconds.
-    if n < int(fs * 4):
-        return None
-
-    w = np.hanning(n)
-    sp = np.abs(np.fft.rfft((x - x.mean()) * w))
-    fr = np.fft.rfftfreq(n, 1.0 / fs)
-
-    lo, hi = nominal - 3.0, nominal + 3.0
-    m = (fr >= lo) & (fr <= hi)
-    if not np.any(m):
-        return None
-
-    idx = np.flatnonzero(m)
-    k = idx[int(np.argmax(sp[m]))]
-
-    # Parabolic interpolation across the peak: the true frequency sits
-    # between bins, and at 4 s of data a bin is 0.25 Hz wide.
-    if 0 < k < len(sp) - 1:
-        a, b, c = sp[k - 1], sp[k], sp[k + 1]
-        denom = a - 2 * b + c
-        if denom != 0:
-            k_off = 0.5 * (a - c) / denom
-            return float(fr[k] + k_off * (fr[1] - fr[0]))
-
-    return float(fr[k])
 
 
 class Sections:
@@ -264,10 +224,11 @@ class Chain:
         # re-referenced and still shown.
         self.car_mask = np.ones(channels, dtype=bool)
 
-        # When set, the notch is aimed at the measured mains frequency
-        # rather than the nominal one.
+        # When set, the notch is aimed where the device aims its own: at the
+        # mains frequency it measures, rather than the nominal one.
         self.notch_track = True
         self.measured_mains: float | None = None
+        self.notch_aim: float | None = None
 
         self._hp = Sections(channels)
         self._notch = Sections(channels)
@@ -304,13 +265,13 @@ class Chain:
         if not (self.notch_hz and self.notch_hz > 0):
             return []
 
-        # Aim at the measured frequency when there is one. Mains is not
-        # where the nameplate says: measured 49.6 Hz against a nominal
-        # 50, which a narrow notch misses entirely.
+        # Aim where the device aims. Mains is not where the nameplate says:
+        # measured 49.6 Hz against a nominal 50, which a narrow notch misses
+        # entirely.
         f0 = self.notch_hz
-        if self.notch_track and self.measured_mains:
-            if abs(self.measured_mains - self.notch_hz) < 3.0:
-                f0 = self.measured_mains
+        if (self.notch_track and self.notch_aim
+                and abs(self.notch_aim - self.notch_hz) <= MAINS_ACCEPT_HZ):
+            f0 = self.notch_aim
 
         freqs = [f0]
 
@@ -326,50 +287,54 @@ class Chain:
 
     def device_stages(self) -> tuple[list, list]:
         """
-        This chain as the device runs it: the sections before its common
-        average and those after, each (g, k, m0, m1, m2).
+        This chain's sections as the device takes them: the high-pass before
+        its common average and the low-pass after, each (g, k, m0, m1, m2).
 
-        The very sections this chain runs. The device keeps its own 0.08 Hz
-        DC removal in front of them, which this chain has no need of, so the
-        two differ below about 0.3 Hz - by 3 % at 0.3 Hz, and by less than
-        1 % from 0.6 Hz up.
+        The notch is not among them - the device designs its own, to follow
+        the mains it measures; see device_notch(). The device also keeps its
+        own 0.08 Hz DC removal in front, which this chain has no need of, so
+        the two differ below about 0.3 Hz - by 3 % at 0.3 Hz, and by less
+        than 1 % from 0.6 Hz up.
         """
-        return (self._hp.sections + self._notch.sections,
-                list(self._lp.sections))
+        return list(self._hp.sections), list(self._lp.sections)
+
+    def device_notch(self) -> tuple[int, int, bool, bool]:
+        """The notch settings for the device: nominal Hz, Q, harmonic, track."""
+        return (int(self.notch_hz or 0), int(round(self.notch_q)),
+                bool(self.notch_harmonic), bool(self.notch_track))
 
     @property
     def car_bits(self) -> int:
         """car_mask as the device takes it: bit n for channel n + 1."""
         return sum(1 << i for i, on in enumerate(self.car_mask) if on)
 
-    def update_mains(self, block) -> bool:
+    def follow_mains(self, measured: float | None, aim: float | None) -> bool:
         """
-        Re-aim the notch from a recent block of data. Returns True if it moved.
+        Take what the device reports: the mains frequency it measured, and
+        where it has aimed its notch. Returns True if this chain's notch
+        moved.
 
-        Only the notch changes, and it keeps its state. This used to rebuild
-        and restart the whole chain - several times a minute as the grid
-        wandered - and every restart put each electrode's whole DC offset
-        back through the high-pass, fading over seconds at a 1 Hz corner and
-        over most of a minute at 0.1 Hz.
-
-        `block` must be recent, unbroken, and at the current rate: samples from
-        before a rate change or a pause would aim the notch at a frequency
-        that is not there. The caller keeps it so.
+        The device measures the mains on live samples (src/dsp/mains.h) and
+        aims its own notch by it, so this chain aims where the device does
+        rather than measuring for itself - the same notch, on the PC or on
+        the device. The notch is retuned in place, keeping its state: a
+        restart here once put each electrode's whole offset back through the
+        high-pass, several times a minute.
         """
-        if not (self.notch_track and self.notch_hz):
+        if measured:
+            self.measured_mains = float(measured)
+        if (not aim or not self.notch_hz
+                or abs(aim - self.notch_hz) > MAINS_ACCEPT_HZ
+                or aim == self.notch_aim):
             return False
+        self.notch_aim = float(aim)
+        return self._notch.set(self._notch_sections()) != "same"
 
-        found = find_mains(block, self.fs, self.notch_hz)
-        if found is None:
-            return False
-
-        # Only redesign when it has actually moved.
-        if self.measured_mains and abs(found - self.measured_mains) < 0.05:
-            return False
-
-        self.measured_mains = found
+    def forget_mains(self) -> None:
+        """Back to nominal: for a new nominal frequency, or another device."""
+        self.measured_mains = None
+        self.notch_aim = None
         self._notch.set(self._notch_sections())
-        return True
 
     def set_rate(self, fs: float) -> None:
         if abs(fs - self.fs) < 1e-6:
@@ -571,7 +536,8 @@ def _self_test() -> None:
     assert err[int(fs * 2):].max() < 1.0, \
         f"a drift cut change left {err[int(fs * 2):].max():.1f} uV after 2 s"
 
-    # Re-aiming the notch mid-stream must leave the rest of the chain alone.
+    # Following the device's aim mid-stream must leave the rest of the chain
+    # alone - and a report the device would not act on moves nothing.
     steady = Chain(fs, 8)
     steady.highpass_hz = 0.1
     steady.rebuild()
@@ -581,15 +547,19 @@ def _self_test() -> None:
     half = len(t2) // 2
     ref = steady.process(sig2)
     first = moved.process(sig2[:half])
-    assert moved.update_mains(sig2[:half]), "the notch did not re-aim"
+    assert moved.follow_mains(49.9, 49.9), "the notch did not follow"
+    assert not moved.follow_mains(49.9, 49.9), "the same aim moved it again"
+    assert not moved.follow_mains(51.5, 51.5), "an aim 1.5 Hz off was followed"
+    assert moved.measured_mains == 51.5
     second = moved.process(sig2[half:])
     jump = np.abs(np.vstack((first, second))[half:] - ref[half:]).max()
-    assert jump < 5.0, f"re-aiming the notch disturbed the output by {jump:.0f} uV"
+    assert jump < 5.0, f"following the mains disturbed the output by {jump:.0f} uV"
 
-    # The device is sent this chain's own sections.
+    # The device is sent this chain's own sections, and its notch settings.
     c = Chain(fs, 8)
     pre, post = c.device_stages()
-    assert pre == c._hp.sections + c._notch.sections and post == c._lp.sections
+    assert pre == c._hp.sections and post == c._lp.sections
+    assert c.device_notch() == (50, 12, True, True), c.device_notch()
 
     print("eeg_dsp self-test: OK")
     print(f"  settling at {DEFAULT_HIGHPASS_HZ} Hz high-pass: "

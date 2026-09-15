@@ -90,7 +90,7 @@ class Session:
 
     def config(self) -> dict:
         cfg = L.decode_config(self.ok(L.CMD_GET_CONFIG))
-        if cfg is None or "pre_crc" not in cfg:
+        if cfg is None or "notch_q" not in cfg:
             raise Fail("this firmware does not report its filter chain - "
                        "flash the current build")
         return cfg
@@ -128,7 +128,10 @@ def connect(usb: bool) -> L.Link:
 
 
 def design(rate: int):
-    """The chain as the application would send it: 1 Hz, 50 Hz + 100 Hz, 45 Hz."""
+    """
+    The sections the application would send: a 1 Hz high-pass and a 45 Hz
+    low-pass. The notch is the device's own, set up separately.
+    """
     chain = eeg_dsp.Chain(rate, L.CHANNELS)
     chain.highpass_hz = 1.0
     chain.lowpass_hz = 45.0
@@ -177,6 +180,9 @@ def run(s: Session, rep: Report, rate: int, seconds: float) -> None:
     s.ok(L.CMD_SET_FILTER, *L.filter_args(L.STAGE_PRE, pre, rate))
     s.ok(L.CMD_SET_FILTER, *L.filter_args(L.STAGE_POST, post, rate))
     s.ok(L.CMD_SET_CAR, 1, 0xFF)
+    # 50 Hz and its harmonic, held at nominal: a notch following the mains
+    # would move partway through, where the reference could not follow it.
+    s.ok(L.CMD_SET_NOTCH, *L.notch_args(50, 12, True, False))
 
     cfg = s.config()
     rep.check(cfg["pre_count"] == len(pre) and cfg["post_count"] == len(post),
@@ -184,8 +190,12 @@ def run(s: Session, rep: Report, rate: int, seconds: float) -> None:
     rep.check(cfg["pre_crc"] == L.sections_crc(pre)
               and cfg["post_crc"] == L.sections_crc(post),
               "section CRCs match what was sent")
-    rep.check(cfg["car"] and cfg["car_mask"] == 0xFF and not cfg["pre_is_notch"],
+    rep.check(cfg["car"] and cfg["car_mask"] == 0xFF,
               "common average on, all channels")
+    rep.check(cfg["notch"] == 50 and cfg["notch_q"] == 12 and cfg["notch_harmonic"]
+              and not cfg["notch_track"] and cfg["notch_aim_hz"] == 50.0,
+              "device notch at 50 Hz and its harmonic, Q 12, held at nominal",
+              f"aimed at {cfg['notch_aim_hz']} Hz")
 
     print(f"\ncapture, {seconds:.0f} s")
     s.data.clear()
@@ -219,7 +229,7 @@ def run(s: Session, rep: Report, rate: int, seconds: float) -> None:
               f"{n / elapsed:.1f} SPS delivered at {rate} SPS")
 
     print("\ncomparison")
-    ref = pipeline_ref.Chain(rate, notch_hz=0.0)
+    ref = pipeline_ref.Chain(rate, notch_hz=50.0, notch_q=12.0, harmonic=True)
     for ch, g in enumerate(gains):
         ref.set_gain(ch, g)
     ref.set_stage(pipeline_ref.STAGE_PRE, [tuple(F32(v) for v in p) for p in pre])
@@ -264,7 +274,7 @@ def run(s: Session, rep: Report, rate: int, seconds: float) -> None:
 def restore(s: Session, rate_before: int | None) -> None:
     for op, *args in ((L.CMD_STREAM_STOP,),
                       (L.CMD_SET_CAR, 0, 0xFF),
-                      (L.CMD_SET_NOTCH, 50),
+                      (L.CMD_SET_NOTCH, *L.notch_args(50, 12, True, True)),
                       (L.CMD_SET_INPUT, L.MUX_NORMAL, 0),
                       (L.CMD_SET_ENCODING, L.ENC_RAW_I24)):
         try:
@@ -273,7 +283,8 @@ def restore(s: Session, rate_before: int | None) -> None:
             pass
     try:
         cfg = s.config()
-        s.cmd(L.CMD_SET_FILTER, *L.filter_args(L.STAGE_POST, [], cfg["rate"]))
+        for stage in (L.STAGE_PRE, L.STAGE_POST):
+            s.cmd(L.CMD_SET_FILTER, *L.filter_args(stage, [], cfg["rate"]))
         if rate_before and cfg["rate"] != rate_before:
             s.cmd(L.CMD_SET_RATE, rate_before & 0xFF, rate_before >> 8)
             # The restart takes about a second; stay connected through it.

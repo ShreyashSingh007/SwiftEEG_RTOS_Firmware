@@ -79,6 +79,8 @@ NEAR_COUNTS = int((1 << 23) * 0.95)
 LIMIT_HOLD_S = 1.0
 # How long a channel sits near its limit before it leaves the average.
 AUTO_OUT_S = 2.0
+# How long to wait for the device to answer a rate change before asking again.
+RATE_ANSWER_S = 3.0
 
 
 class FramePacer:
@@ -164,8 +166,9 @@ class App(tk.Tk):
         self._reset_traces()
         self.enabled = [tk.BooleanVar(value=True) for _ in range(link.CHANNELS)]
         # Whether each channel helps make the common average - see
-        # Chain.car_mask for why a bad electrode must not.
-        self.in_avg = [tk.BooleanVar(value=True) for _ in range(link.CHANNELS)]
+        # Chain.car_mask for why a bad electrode must not. None to start
+        # with, like the average itself.
+        self.in_avg = [tk.BooleanVar(value=False) for _ in range(link.CHANNELS)]
 
         # Input limits, per channel. At gain 24 the input range is only
         # +/-187.5 mV, and an electrode offset near that leaves no room.
@@ -220,6 +223,10 @@ class App(tk.Tk):
         self._dev_settle_t = -math.inf
         self._dev_applied_seq: int | None = None
 
+        # A rate change in progress, finished by the device's answer; see
+        # _set_rate.
+        self._rate_change: dict | None = None
+
         # Display state.
         self.pacer = FramePacer()
         self._lay: dict | None = None
@@ -232,6 +239,14 @@ class App(tk.Tk):
         self._last_data_t = 0.0
         self._gap_peak = 0.0
         self._latency = 0.1
+        # How far the newest motion sample trails the newest EEG sample, and
+        # the recent peak of that; see _note_arrival.
+        self._imu_behind: float | None = None
+        self._imu_peak = 0.0
+        self._imu_newest_us: float | None = None
+        self._imu_seen_t = 0.0
+        # When the filters will have settled after the last change to them.
+        self._settle_until = 0.0
         self._work = 0.0
         self._pix_per_pt = 1.0
         self._stats_next = 0.0
@@ -241,6 +256,10 @@ class App(tk.Tk):
         self._error_next = 0.0
 
         self._build()
+        # The chain takes its settings from the controls, so the two agree
+        # from the start rather than only after the first change.
+        self._rebuild_chain()
+        self._set_car_mask()
         self.after(1, self._frame)
         self.protocol("WM_DELETE_WINDOW", self._close)
 
@@ -399,8 +418,8 @@ class App(tk.Tk):
         self.site_label = self._label(f, "", fg=DIM, font=("Consolas", 8))
         self.site_label.pack(fill=tk.X, pady=(0, 4))
 
-        self.hp_var = tk.StringVar(value="0.5")
-        self.lp_var = tk.StringVar(value="45")
+        self.hp_var = tk.StringVar(value=f"{eeg_dsp.DEFAULT_HIGHPASS_HZ:.1f}")
+        self.lp_var = tk.StringVar(value=f"{eeg_dsp.DEFAULT_LOWPASS_HZ:.0f}")
         self.hnotch_var = tk.StringVar(value="50 Hz")
         self._combo_row(f, "drift cut", self.hp_var,
                         ["off", "0.1", "0.3", "0.5", "1.0", "2.0"],
@@ -416,11 +435,15 @@ class App(tk.Tk):
                         ["30 (narrow)", "12", "6 (wide)"],
                         self._rebuild_chain, "")
 
-        self.car_var = tk.BooleanVar(value=True)
+        self.car_var = tk.BooleanVar(value=False)
         self.harm_var = tk.BooleanVar(value=True)
         self.track_var = tk.BooleanVar(value=True)
         self._check(f, "Common average (shared zero)", self.car_var,
                     self._rebuild_chain)
+        # The average needs two or more channels ticked "in average", and
+        # none are to start with.
+        self.car_hint = self._label(f, "", fg="#ffd866", font=("Consolas", 8))
+        self.car_hint.pack(fill=tk.X)
         self._check(f, "Also notch the harmonic", self.harm_var,
                     self._rebuild_chain)
         self._check(f, "Track real mains frequency", self.track_var,
@@ -460,12 +483,12 @@ class App(tk.Tk):
         # checkbox. The two-control version was ambiguous: picking a range
         # while auto was still ticked did nothing visible, which reads as a
         # broken control.
-        self.scale_var = tk.StringVar(value="auto")
+        self.scale_var = tk.StringVar(value="200")
         self._combo_row(f, "range +/-", self.scale_var,
                         ["auto", "10", "25", "50", "100", "200", "500",
                          "2000", "200000"], None, "uV")
 
-        self.window_var = tk.StringVar(value="5")
+        self.window_var = tk.StringVar(value="3")
         self._combo_row(f, "time window", self.window_var,
                         ["1", "2", "3", "5", "10"], None, "s")
 
@@ -520,6 +543,7 @@ class App(tk.Tk):
             self.link.close()
             self.link = None
             self._dev_sent = {}
+            self._rate_change = None
             self.btn_conn.config(text="Connect")
             self.status.config(text="not connected", fg=DIM)
             return
@@ -538,20 +562,39 @@ class App(tk.Tk):
         self._was_connected = False
 
     def _toggle_stream(self) -> None:
-        if self.btn_stream["text"].startswith("Start"):
-            self._reset_traces()
-            self._reset_imu()
-            self.samples = 0
-            self.frames = 0
-            self.last_seq = None
-            self.gaps = 0
-            self.chain.reset()
-            self.started_at = time.time()
-            self._send(link.CMD_STREAM_START)
-            self.btn_stream.config(text="Stop streaming")
+        start = self.btn_stream["text"].startswith("Start")
+        self.btn_stream.config(text="Stop streaming" if start
+                               else "Start streaming")
+        if self._rate_change is not None:
+            # The stream is stopped for the change, which starts it again
+            # when it finishes - or now does not.
+            self._rate_change["resume"] = start
+        elif start:
+            self._begin_stream()
         else:
             self._send(link.CMD_STREAM_STOP)
-            self.btn_stream.config(text="Start streaming")
+
+    def _begin_stream(self) -> None:
+        """Start the stream afresh: nothing from before it is kept."""
+        self._forget_samples()
+        self.chain.reset()
+        self._settle_until = time.time() + self.chain.settling_seconds
+        self._send(link.CMD_STREAM_START)
+
+    def _forget_samples(self) -> None:
+        """
+        Drop everything taken from the stream so far, wherever it breaks - a
+        start, a rate change - so nothing from before the break is plotted,
+        counted, or used to measure the mains.
+        """
+        self._reset_traces()
+        self._reset_imu()
+        self.samples = 0
+        self.frames = 0
+        self.last_seq = None
+        self.gaps = 0
+        self.mains_buf.clear()
+        self.started_at = time.time()
 
     def _reset_traces(self) -> None:
         """
@@ -591,48 +634,67 @@ class App(tk.Tk):
 
     def _set_rate(self) -> None:
         """
-        Changing rate restarts acquisition on the device, which takes about a
-        second. Everything held here belongs to the old rate: the filter
-        coefficients, the samples already plotted, and the sequence counter.
-        Carrying any of it across is what made a rate change look like the
-        stream had died.
+        Changing rate restarts acquisition on the device. Everything held here
+        belongs to the old rate: the filter coefficients, the samples already
+        plotted, the sequence counter, the mains buffer. The device drops the
+        sections it was sent too: designed for the old rate, they would be
+        different filters at the new one.
+
+        The change finishes on the device's answer, not on a timer. Commands
+        run in order there, so a GET_CONFIG sent after SET_RATE is answered
+        only once the restart is done. Until then every EEG frame is dropped:
+        each was sampled at the old rate, or before the restart. Then the
+        filters go back, and only after them the stream, so the first sample
+        at the new rate is already filtered. A fixed two-second wait used to
+        stand in for all of this: frames from before the change could reach
+        the new filters, and two quick changes overlapped.
         """
-        was_streaming = self.btn_stream["text"].startswith("Stop")
+        new = int(self.rate_var.get())
+        change = self._rate_change
+        if change is None and new == self.rate:
+            return
 
-        if was_streaming:
-            self._send(link.CMD_STREAM_STOP)
-
-        self.rate = int(self.rate_var.get())
-        self.chain.set_rate(self.rate)
-        self.chain.reset()
-        self._reset_traces()
-        self._reset_imu()
-        self.last_seq = None
-        self.samples = 0
-        self.frames = 0
-        self.started_at = time.time()
-
-        self._send(link.CMD_SET_RATE, self.rate & 0xFF, self.rate >> 8)
-        self.status.config(text=f"switching to {self.rate} SPS...",
-                           fg="#ffd866")
-
-        # The device drops any sections it was sent: designed for the old
-        # rate, they would be different filters at the new one.
+        self.rate = new
+        self.chain.set_rate(new)
+        self._forget_samples()
         self._dev_sent = {}
 
-        if was_streaming:
-            # The device is stopping a thread and reconfiguring the AFE.
-            # Asking it to stream again before that finishes is ignored.
-            self.after(2000, self._resume_after_rate)
-        elif self.filters_on_device:
-            self.after(2000, self._push_device_chain)
+        if not (self.link and self.link.connected):
+            return  # the device's own rate is taken when it connects
 
-    def _resume_after_rate(self) -> None:
-        self._send(link.CMD_STREAM_START)
+        streaming = self.btn_stream["text"].startswith("Stop")
+        if change is None and streaming:
+            self._send(link.CMD_STREAM_STOP)
+
+        self._send(link.CMD_SET_RATE, new & 0xFF, new >> 8)
         self._send(link.CMD_GET_CONFIG)
-        self._push_device_chain()
-        self.started_at = time.time()
-        self.status.config(text=f"streaming at {self.rate} SPS", fg="#5ed18b")
+        self._rate_change = {
+            "rate": new,
+            "resume": change["resume"] if change else streaming,
+            # One answer per GET_CONFIG sent; the last one decides.
+            "answers": (change["answers"] if change else 0) + 1,
+            "retries": 0,
+            "since": time.perf_counter(),
+        }
+        self.status.config(text=f"switching to {new} SPS...", fg="#ffd866")
+
+    def _rate_change_overdue(self, now: float) -> None:
+        """Ask again if the device has not answered; give up after a while."""
+        change = self._rate_change
+        if change is None or now - change["since"] < RATE_ANSWER_S:
+            return
+        if change["retries"] < 2:
+            change["retries"] += 1
+            change["answers"] = 1
+            change["since"] = now
+            self._send(link.CMD_GET_CONFIG)
+            return
+        self._rate_change = None
+        if change["resume"]:
+            self._begin_stream()
+        self.status.config(text="no answer to the rate change - press Reset "
+                                "if the stream does not come back",
+                           fg="#ff6b6b")
 
     def _reset_link(self) -> None:
         """Stop everything and reconnect, without restarting the app."""
@@ -648,10 +710,9 @@ class App(tk.Tk):
         self.btn_stream.config(text="Start streaming")
         self._was_connected = False
         self._dev_sent = {}
+        self._rate_change = None
         self.chain.reset()
-        self._reset_traces()
-        self._reset_imu()
-        self.last_seq = None
+        self._forget_samples()
         self.status.config(text="link reset - press Connect", fg="#ffd866")
 
     def _set_filter_site(self) -> None:
@@ -679,15 +740,16 @@ class App(tk.Tk):
             self._restore_device_chain()
             self.site_label.config(text="", fg=DIM)
 
-    def _push_device_chain(self, keep_state: bool = False) -> None:
+    def _push_device_chain(self) -> None:
         """
         Send the device whatever part of the chain it does not already have.
 
-        A stage whose sections are unchanged is not sent, so changing the
-        low-pass does not restart the high-pass - the rule the chain here
-        follows too. `keep_state` is for the notch following the mains: a
-        retune small enough that restarting for it would only add a
-        transient.
+        By the rules the chain here follows. A stage whose sections are
+        unchanged is not sent, so a new low-pass does not restart the
+        high-pass. One with as many sections as the device holds is retuned in
+        place, keeping its state - a new drift cut, the notch following the
+        mains. Only a stage that gains or loses sections starts again, primed
+        on its next sample.
         """
         if not (self.filters_on_device and self.link and self.link.connected):
             return
@@ -698,7 +760,7 @@ class App(tk.Tk):
             previous = self._dev_sent.get(stage)
             if previous == key:
                 continue
-            keep = (keep_state and previous is not None
+            keep = (previous is not None and previous[0] == self.rate
                     and len(previous[1]) == len(sections))
             self._send(link.CMD_SET_FILTER,
                        *link.filter_args(stage, sections, self.rate, keep))
@@ -732,6 +794,8 @@ class App(tk.Tk):
                "Test signal": link.MUX_TEST}[self.src_var.get()]
         self._send(link.CMD_SET_INPUT, mux, 0)
         self.chain.reset()
+        # Samples from the old input say nothing about the mains on the new.
+        self.mains_buf.clear()
 
     def _set_gain(self) -> None:
         self.gain = int(self.gain_var.get())
@@ -740,6 +804,8 @@ class App(tk.Tk):
                "Test signal": link.MUX_TEST}[self.src_var.get()]
         self._send(link.CMD_SET_CHANNEL, 0xFF, link.GAIN_CODES[self.gain],
                    mux, 0, 0)
+        # Samples at the old gain are scaled wrongly from here on.
+        self.mains_buf.clear()
 
     def _set_bias(self) -> None:
         # Both masks: SRB1 sits on the negative inputs and has to be inside
@@ -759,13 +825,17 @@ class App(tk.Tk):
         dps = int(self.imu_gyro_var.get())
         self._send(link.CMD_SET_IMU, 1 if on else 0, hz & 0xFF, hz >> 8,
                    g, dps & 0xFF, dps >> 8)
-        self._reset_imu()
+        # Motion already received stays: every frame carries its own period,
+        # ranges and times, so old and new samples are each drawn right.
+        # Clearing it blanked the lane until the new setting filled it again.
+        self.imu_flags_seen = 0
 
     def _rebuild_chain(self) -> None:
         hp = self.hp_var.get()
         lp = self.lp_var.get()
         nz = self.hnotch_var.get()
 
+        was_hp = self.chain.highpass_hz
         self.chain.highpass_hz = 0.0 if hp == "off" else float(hp)
         self.chain.lowpass_hz = 0.0 if lp == "off" else float(lp)
         self.chain.notch_hz = {"off": 0.0, "50 Hz": 50.0, "60 Hz": 60.0}[nz]
@@ -775,11 +845,25 @@ class App(tk.Tk):
         self.chain.notch_track = self.track_var.get()
         self.chain.rebuild()
         self._push_device_chain()
+        self._show_car_hint()
+
+        # Every change applies from the next sample. After a new drift cut,
+        # though, the high-pass still has to settle at its new corner - about
+        # two seconds at 1 Hz, half a minute at 0.1 Hz - and the plot says so
+        # rather than looking slow to respond.
+        if self.chain.highpass_hz != was_hp:
+            self._settle_until = time.time() + self.chain.settling_seconds
 
     def _set_car_mask(self) -> None:
         self.chain.car_mask = np.array([v.get() for v in self.in_avg],
                                        dtype=bool)
         self._push_device_chain()
+        self._show_car_hint()
+
+    def _show_car_hint(self) -> None:
+        few = np.count_nonzero(self.chain.car_mask) < 2
+        self.car_hint.config(text="tick 'in average' on 2 or more channels"
+                             if self.chain.car and few else "")
 
     # ---------------------------------------------------------- recording --
 
@@ -819,10 +903,12 @@ class App(tk.Tk):
         self.imu_recorder = csv.writer(self._imu_file)
         self.imu_recorder.writerow(
             ["# SwiftEEG motion", "accel in g, gyro in degrees/s",
-             "ts_us on the same clock as the EEG file"])
+             "ts_us on the same clock as the EEG file",
+             "flags: 1 time from a poll, not the sensor's interrupt; "
+             "2 samples lost just before"])
         self.imu_recorder.writerow(
             ["ts_us", "seq", "ax_g", "ay_g", "az_g", "gx_dps", "gy_dps",
-             "gz_dps"])
+             "gz_dps", "flags"])
         self.imu_rows = 0
 
         self.btn_rec.config(text="Stop rec")
@@ -891,6 +977,8 @@ class App(tk.Tk):
         elif not self.link.connected:
             self._was_connected = False
 
+        self._rate_change_overdue(now)
+
         while True:
             try:
                 msg = self.link.status.get_nowait()
@@ -909,6 +997,8 @@ class App(tk.Tk):
                 break
 
             if f.type == link.TYPE_DATA:
+                if self._rate_change is not None:
+                    continue  # sampled at the old rate, or before the restart
                 got = link.decode_data(f.payload)
                 if got is None:
                     continue
@@ -921,6 +1011,8 @@ class App(tk.Tk):
 
                 if self.last_seq is not None and seq != self.last_seq:
                     self.gaps += 1
+                    # The mains buffer has to be one unbroken stretch.
+                    self.mains_buf.clear()
                 self.last_seq = seq + len(counts)
 
                 if f.flags & link.FLAG_SETTLING:
@@ -934,24 +1026,38 @@ class App(tk.Tk):
             elif f.type == link.TYPE_RSP:
                 self._on_response(bytes(f.payload))
 
+        # Motion first, so the EEG that came with it is measured against it
+        # rather than against the batch before.
+        if imu_raw:
+            self._consume_imu(imu_raw)
         if block_raw:
             self._consume(block_raw)
             self._note_arrival(now)
-        if imu_raw:
-            self._consume_imu(imu_raw)
 
     def _note_arrival(self, now: float) -> None:
         """
         Trail the newest sample by a little more than the longest recent gap
         between deliveries. Less, and the trace stalls waiting for the next
         burst; more, and it lags for nothing.
+
+        The motion lanes share the time axis but arrive in batches of their
+        own, so the newest motion sample can be well behind the newest EEG.
+        The display trails that too, while motion is shown and arriving - or
+        the motion trace stops short of the edge and catches up in jumps.
         """
         if self._last_data_t:
             gap = now - self._last_data_t
             if gap < 1.0:  # a pause in streaming is not link jitter
-                self._gap_peak = max(gap, self._gap_peak * math.exp(-gap / 3.0))
+                decay = math.exp(-gap / 3.0)
+                self._gap_peak = max(gap, self._gap_peak * decay)
+                need = self._gap_peak * 1.5
+                if (self._imu_behind is not None and self.motion_var.get()
+                        and now - self._imu_seen_t < 1.0):
+                    self._imu_peak = max(self._imu_behind,
+                                         self._imu_peak * decay)
+                    need = max(need, self._imu_peak * 1.2)
                 self._latency = min(LATENCY_MAX_S, max(
-                    LATENCY_MIN_S, self._gap_peak * 1.5 + 1.0 / self.pacer.hz))
+                    LATENCY_MIN_S, need + 1.0 / self.pacer.hz))
         self._last_data_t = now
 
     def _on_response(self, p: bytes) -> None:
@@ -965,12 +1071,25 @@ class App(tk.Tk):
         if cfg is None:
             return
 
+        change = self._rate_change
+        if change is not None:
+            change["answers"] -= 1
+            if change["answers"] > 0:
+                return  # from before a later restart; the last answer decides
+            if cfg["rate"] != change["rate"] and change["retries"] < 2:
+                change["retries"] += 1
+                change["answers"] = 1
+                change["since"] = time.perf_counter()
+                self._send(link.CMD_GET_CONFIG)
+                return
+            self._rate_change = None
+
         sps = cfg["rate"]
         if sps in (250, 500, 1000):
             self.rate_var.set(str(sps))
             if sps != self.rate:
                 self.rate = sps
-                self._reset_traces()
+                self._forget_samples()
                 self._dev_sent = {}
             self.chain.set_rate(sps)
 
@@ -1011,6 +1130,16 @@ class App(tk.Tk):
                         or cfg["post_count"] != len(post)):
                     self._dev_sent = {}
                     self._push_device_chain()
+
+        if change is not None:
+            # The filters before the stream: the device runs commands in
+            # order, so its first sample at the new rate is already filtered.
+            self._push_device_chain()
+            if change["resume"]:
+                self._begin_stream()
+            state = "streaming" if change["resume"] else "ready"
+            self.status.config(text=f"{state} at {sps} SPS", fg="#5ed18b")
+            return
 
         self.status.config(text=f"connected - {sps} SPS, gain {self.gain}",
                            fg="#5ed18b")
@@ -1066,7 +1195,7 @@ class App(tk.Tk):
         if now >= self.mains_next and len(self.mains_buf) >= self.rate * 4:
             self.mains_next = now + 5.0
             if self.chain.update_mains(np.array(self.mains_buf)):
-                self._push_device_chain(keep_state=True)
+                self._push_device_chain()
 
         # The device's own output when it is filtering; this chain otherwise,
         # and for any batch still arriving in the old form just after a
@@ -1083,6 +1212,10 @@ class App(tk.Tk):
         self.eeg_anchor = (self.n_total + len(counts) - len(last_vals),
                            float(last_ts))
         self._ring_write(out.T)
+
+        if self._imu_newest_us is not None:
+            newest = last_ts + (len(last_vals) - 1) * 1e6 / self.rate
+            self._imu_behind = (newest - self._imu_newest_us) / 1e6
 
     def _check_limits(self, counts: np.ndarray) -> None:
         """
@@ -1126,6 +1259,9 @@ class App(tk.Tk):
         self.imu_last_seq = None
         self.imu_gaps = 0
         self.imu_flags_seen = 0
+        self._imu_newest_us = None
+        self._imu_behind = None
+        self._imu_peak = 0.0
 
     def _consume_imu(self, frames) -> None:
         for ts, seq, period_us, counts, accel_g, gyro_dps, flags in frames:
@@ -1148,10 +1284,13 @@ class App(tk.Tk):
                     self.imu_recorder.writerow(
                         [round(times[i]), seq + i,
                          f"{a[0]:.5f}", f"{a[1]:.5f}", f"{a[2]:.5f}",
-                         f"{a[3]:.3f}", f"{a[4]:.3f}", f"{a[5]:.3f}"])
+                         f"{a[3]:.3f}", f"{a[4]:.3f}", f"{a[5]:.3f}", flags])
                 self.imu_rows += n
 
             self._imu_write(scaled.T, times)
+            if n:
+                self._imu_newest_us = float(times[-1])
+                self._imu_seen_t = time.perf_counter()
 
     def _imu_write(self, block: np.ndarray, times: np.ndarray) -> None:
         """block is (6, samples); times are device microseconds."""
@@ -1214,15 +1353,16 @@ class App(tk.Tk):
         self._draw_traces(lay, window, now)
         self._draw_motion(lay, window)
 
+        left = self._settle_until - time.time()
         if self.filters_on_device:
-            # The device flags the samples inside its filters' settling time.
-            settling = now - self._dev_settle_t < 0.5
+            # The device flags the samples inside its filters' settling time
+            # after a restart. A retune it does not flag, so that is timed
+            # here, as on the PC.
+            settling = now - self._dev_settle_t < 0.5 or left > 0
             text = "device filters settling" if settling and self.samples else ""
         else:
-            settled = ((time.time() - self.started_at)
-                       > self.chain.settling_seconds)
-            text = (f"filters settling ({self.chain.settling_seconds:.0f} s)"
-                    if not settled and self.samples else "")
+            text = (f"filters settling ({math.ceil(left)} s)"
+                    if left > 0 and self.samples else "")
         self._cfg(lay["settle"], text=text)
 
         clipping = sum(1 for ch in shown
@@ -1405,7 +1545,7 @@ class App(tk.Tk):
                 warn, colour = "CLIPPING", "#ff6b6b"
             elif now - self.near_t[ch] < LIMIT_HOLD_S:
                 warn, colour = "near limit", "#ffd866"
-            elif not self.chain.car_mask[ch]:
+            elif self.chain.car and not self.chain.car_mask[ch]:
                 warn, colour = "not in average", DIM
             else:
                 warn, colour = "", DIM

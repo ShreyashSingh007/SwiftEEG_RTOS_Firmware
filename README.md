@@ -66,7 +66,8 @@ straight over a noisy front end.
 - Lock-free ring from the interrupt to a DSP thread; 0 drops up to 1 kSPS
 - Chain: 24-bit decode, integer DC removal, per-channel microvolt scaling,
   then two host-programmable stages either side of a common average - the
-  Windows app's whole filter chain can run on the device (M6)
+  Windows app's whole filter chain can run on the device (M6) - and a mains
+  notch that follows the mains frequency the device measures itself
 - Binary protocol, byte-identical over BLE and USB, 6 samples a frame,
   packed 24-bit by default
 - Every device control over either link, answered while streaming: rate
@@ -516,8 +517,22 @@ that is a common-mode step on every channel at once - a likely part of the
 burst seen after changing rate. A restart now rewrites only the data rate,
 and runs the full configuration only if that fails. Stopping acquisition
 also gates DRDY and waits out a running transfer before its commands, as
-register access does. Built and checked in simulation; not yet measured on
-the board.
+register access does. On the board, gains, inputs and bias read back
+unchanged after every rate change, with no sample lost or repeated, and the
+device answers 40-110 ms after the rate command.
+
+**Replies went missing around stream starts and stops.** Now and then a
+command's reply never arrived. At 1000 SPS it was 6 commands in 504 over two
+runs, every one a STREAM_START or STREAM_STOP - never a ping, a register read
+or a configuration read. Stopping the stream flushed the half-built batch
+from the command thread while the DSP thread could still be writing it, and
+starting cleared it under the same race. A frame damaged that way can take
+the reply behind it down with it, since the host reads the stream and the
+replies as one run of bytes. The batch now has a lock: 0 in 504, with the
+device's own log showing every reply sent at the first try. Acknowledged
+writes from the host, tried first, doubled the reply time and lost replies
+just the same. The host also reads each notification on its own now, so a
+damaged frame can no longer take the next one with it.
 
 ### M5 — Windows application  (built)
 
@@ -630,9 +645,9 @@ once the restart is done, and until then every EEG frame is dropped. Then the
 filters are sent, and only then the stream is started, so the first sample at
 the new rate is already filtered. Two quick changes end at the last one.
 
-The mains frequency is measured only from an unbroken stretch of live
-samples: its buffer is emptied wherever the stream breaks - a start, a rate
-change, a new input or gain, a sequence gap.
+The mains frequency is no longer measured on the PC at all. The device
+measures it on live samples and reports it, and the app aims its notch where
+the device aims its own - see M6.
 
 Recordings also had wrong timestamps: every row of a delivery was stamped
 from its first batch, a microsecond apart, tens of milliseconds out. Each
@@ -698,6 +713,17 @@ samples up to 25 ms out. The FIFO is now read in one transfer, an edge that
 lands during a read is discarded, and a batch without an edge of its own is
 placed from the last good one at the measured period.
 
+A second fault showed only as a step in the timestamps: now and then about
+ten samples went missing with no gap in the sequence numbers - a step of
+exactly 10.00 samples at 960 Hz, about 8 at 480 Hz. The accelerometer and
+gyroscope words of one time slot leave the FIFO one after the other. A read
+that ended between them left the next read starting on the second half, and
+every word of it was then paired with the wrong partner and thrown away. A
+word now waits for its partner across reads, a mismatch drops only the
+orphan, and a loss is flagged on the next frame. Since then: 76 s across
+240, 480 and 960 Hz with no jump, no lost sample and no loss flag, every
+timestamp within 7 us of a straight line.
+
 #### Rate and ranges, and why
 
 The board wires the LSM6DSV16X in the datasheet's mode 1 (DS13510, Table 2):
@@ -738,7 +764,8 @@ u32 period_us_q8  sample period, 1/256 us
 u16 accel_g       full scale; one count = accel_g / 32768 g
 u16 gyro_dps      full scale; one count = gyro_dps / 32768 deg/s
 u8  axes          6: accel x y z, then gyro x y z, int16 each
-u8  flags         0x01 timed from the poll (no edge yet), 0x02 FIFO overrun
+u8  flags         0x01 timed from the poll (no edge yet), 0x02 samples lost
+                  before this batch
 u16 count         samples that follow, at most 17 - one BLE notification
 ```
 
@@ -758,24 +785,26 @@ the motion half waits for the cleanup to exist.
 
 **In the app:** *filters (display) - run on: device.* The app sends the chain
 it designed and switches the stream to raw and filtered side by side: the
-plot shows what the device computed, and the recording stays raw. Settings,
-the "in average" ticks and the mains tracking follow onto the device as they
-change. Only a stage that changed is sent, and one with as many sections as
-before is retuned in place, so moving the low-pass does not restart the
-high-pass, nor a new drift cut the notch. If the device refuses anything, the filters go
+plot shows what the device computed, and the recording stays raw. Settings
+and the "in average" ticks follow onto the device as they change. Only a
+stage that changed is sent, and one with as many sections as before is
+retuned in place, so moving the low-pass does not restart the high-pass.
+The notch is the device's own: the app sends its settings, and the device
+aims it at the mains it measures. If the device refuses anything, the filters go
 back to the PC and the panel says why.
 
 #### The chain on the device
 
 ```
 raw counts -> integer DC removal, 0.08 Hz -> microvolts at each channel's gain
-           -> pre sections: high-pass, notch and its harmonic
+           -> pre sections: high-pass
+           -> mains notch and its harmonic, the device's own
            -> common average over the ticked channels
            -> post sections: low-pass
 ```
 
-Up to eight sections a stage. Left alone, the pre stage is the device's own
-50 Hz notch and the post stage is empty, as before.
+Up to eight sections in each host stage. Left alone both are empty, and the
+notch sits at 50 Hz with its harmonic, following the mains.
 
 A filter change lands between two samples, never inside one: the command
 thread hands it to the DSP thread, which applies it at the top of the next
@@ -814,6 +843,45 @@ the output mixes the input, band-pass and low-pass (`m0 m1 m2`). With `g` and
 `k` positive a section is stable whatever its mix, so the device can check
 what it is sent. Any stable biquad converts: `dsp_ref.from_biquad`.
 
+#### The notch follows the mains, measured on the device
+
+Grid frequency is never where the nameplate says - 49.6 Hz measured here -
+and a notch narrow enough to spare the EEG has to be aimed. The app used to
+measure it with an FFT on the PC and send the device a retuned notch. The
+device now measures it itself, on every live sample, and aims its own notch:
+no host needed, and nothing measured on old or recorded samples.
+
+A frequency-locked loop on the mean of the channels on their electrodes
+(`src/dsp/mains.c`): mix down by the current estimate, low-pass to 1.5 Hz,
+average to ten values a second, and read the error from how far that slow
+tone turns over a second. An estimate needs two answers in a row that
+agree. Shorted inputs and the test signal are left out: the test signal's
+square wave has a harmonic at 49.8 Hz.
+
+In simulation at 250 and 1000 SPS, with EEG-like noise, alpha and drift: the
+first estimate comes about 10 s after a start, and the RMS error after it
+is 0.3-4 mHz with 40 uV of mains, 3-5 mHz at 5 uV, 7-14 mHz at 2 uV and
+9-27 mHz at 1 uV. With no mains at all there was no estimate in any of
+twelve 90 s runs. A Q 12 notch 50 mHz off still takes 32 dB off. On the
+chip it costs 2.6 us a sample - about 0.26 % of the processor at 1000 SPS -
+and under 200 bytes of RAM.
+
+On the board, nothing worn, with floating inputs picking up the room's
+mains: an estimate every 4 s, the first 9 s after a rate change. The last
+agreed with an FFT of the raw counts over the 20 s before it to 9 mHz at
+250 SPS and to 0.5 mHz at 1000 SPS, while the grid itself drifted from 49.84
+to 49.81 Hz.
+
+The notch follows an estimate within 1 Hz of nominal once it has moved
+30 mHz, retuned in place, so following adds no transient. The last estimate
+survives a rate change. The app aims its own notch where the device reports
+its notch is, so the plot is the same wherever the filters run.
+
+The first build found 50.00 Hz in a signal with no mains in it. At ten
+values a second, anything 50 Hz from the mixer - electrode drift - folds
+onto the very tone being measured. A tenth-second average has a null
+exactly there, and the false estimates went with it.
+
 #### On the wire
 
 `CMD_SET_FILTER` (`0x10`): stage (0 before the average, 1 after), flags (bit 0
@@ -830,10 +898,21 @@ Encoding `3`, raw and filtered: for every channel, three bytes of counts then
 four of microvolts. Three samples a frame, so a frame still fits one
 notification.
 
-`CMD_GET_CONFIG` appends sections per stage; flags (bit 0 average on, bit 1
-the pre stage is the device's notch); the average's mask; and a CRC-16 of
-each stage's sections, so a host can tell whether the device still holds
-what it sent. A rate change drops sections designed for the old rate.
+`CMD_GET_CONFIG` appends sections per stage; flags (bit 0 average on); the
+average's mask; a CRC-16 of each stage's sections, so a host can tell
+whether the device still holds what it sent; then the notch - Q, flags
+(bit 0 harmonic, bit 1 following the mains, bit 2 measured), and as float32
+the measured mains frequency and where the notch is aimed. Its nominal
+frequency is byte 4, as before. A rate change drops sections designed for
+the old rate.
+
+`CMD_SET_NOTCH` (`0x0C`): nominal frequency (0, 50 or 60), Q, flags (bit 0
+harmonic, bit 1 follow the measured mains). Answers with the sequence
+number it applies from.
+
+Event `0x01`, sent while streaming: the mains frequency the device agreed
+on, as float32; the first sample processed after it; and flags, bit 0 set
+when the notch moved there.
 
 #### Verified
 
@@ -855,17 +934,21 @@ what it sent. A rate change drops sections designed for the old rate.
   channel 7 at gain 6, no electrodes.
 
   ```
-   250 SPS   3004 samples x 8 ch   worst 0.00 uV   0 gaps   250.3 SPS delivered
-   500 SPS   4004 samples x 8 ch   worst 0.00 uV   0 gaps   500.2 SPS delivered
-  1000 SPS   8136 samples x 8 ch   worst 0.00 uV   0 gaps  1014.7 SPS delivered
+   250 SPS   2016 samples x 8 ch   worst 0.0009 uV   0 gaps   251.6 SPS delivered
+   500 SPS   4012 samples x 8 ch   worst 0.0007 uV   0 gaps   501.1 SPS delivered
+  1000 SPS   8002 samples x 8 ch   worst 0.00 uV     0 gaps   999.0 SPS delivered
   ```
 
-  Bit for bit. Also checked there: sections for the wrong rate and unstable
+  Within a thousandth of a microvolt. The sections a host sends match bit
+  for bit; the notch, designed on the chip in float32 now that it follows
+  the mains, lands within the last bit of the reference's. Also checked there: sections for the wrong rate and unstable
   sections refused; section CRCs read back; the common average moving 1.4 mV
   of test square wave onto the shorted channels; settling flagged for 787
-  samples against 785 expected. On-target suites: dsp 22/22, with the 0.1 Hz
-  high-pass 0.00 uV from its reference, and pipeline 13/13, with the whole
-  host chain 0.00 uV.
+  samples against 785 expected. On-target suites: dsp 21/21, with the 0.1 Hz
+  high-pass 0.00 uV from its reference and the mains tracker agreeing with
+  its reference at every estimate; ringbuf 5/5; and pipeline 13/13, with the
+  whole chain within 0.002 uV of its reference - the notch is designed on
+  the chip in float32, and in NumPy by the reference.
 
 #### Found along the way
 

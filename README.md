@@ -509,6 +509,16 @@ ever sticks, and a failed restart is retried rather than parked. The chain
 also takes channel gains from what the driver wrote, instead of reading them
 back after every change.
 
+**A rate change reset the AFE.** Every restart ran the full configuration:
+every channel back to gain 24 on the electrodes, whatever it had been set to,
+and the bias drive off for 150 ms while the reference settled. On a headset
+that is a common-mode step on every channel at once - a likely part of the
+burst seen after changing rate. A restart now rewrites only the data rate,
+and runs the full configuration only if that fails. Stopping acquisition
+also gates DRDY and waits out a running transfer before its commands, as
+register access does. Built and checked in simulation; not yet measured on
+the board.
+
 ### M5 — Windows application  (built)
 
 ```bash
@@ -560,10 +570,13 @@ what every channel has in common, which is where mains and body potential
 live - and those are not reachable by any per-channel filter, because they
 are not per channel.
 
-Defaults are 0.5 Hz, 45 Hz, 50 Hz notch, CAR on. The 0.5 Hz high-pass is a
-viewing choice: it makes a trace look clean and it distorts slow ERP
-components. The device still records at 0.08 Hz, so the recording keeps what
-the display throws away.
+Defaults are a 1 Hz drift cut, smoothing above 100 Hz, a 50 Hz notch with its
+harmonic, and no common average - with no channel ticked "in average", since
+an average needs at least two channels chosen for it. The display starts at
++/-200 uV over 3 s. The 1 Hz high-pass is a viewing choice: it settles the
+baseline within seconds and it distorts slow ERP components, so ERP work
+wants 0.1 Hz. The recording is raw either way, and keeps what the display
+throws away.
 
 #### Three things that made a low drift cut look unusable
 
@@ -580,6 +593,46 @@ the display throws away.
   in simulation. Each channel now has an "in average" tick, and a channel
   pinned near the converter limit for 2 s leaves the average on its own -
   still drawn in colour, labelled "near limit" or "CLIPPING".
+
+#### Settings apply from the next sample
+
+A setting change used to rebuild the whole chain and restart every stage in
+it: a new low-pass restarted the high-pass too, and the restart put every
+electrode's offset back through it. Now a stage whose sections are unchanged
+is left alone; one with as many sections as before is retuned in place - its
+state is integrators of the signal, which stay right when a corner moves -
+and only a stage that gains or loses sections starts again, primed on its
+next sample. The device follows the same rules. Measured on synthetic EEG
+with electrode offsets, drift and 49.7 Hz mains, the change made mid-stream
+(worst error, then time until it stays under 1 uV):
+
+```
+                        before              now
+smoothing 45 -> 100 Hz  93 uV, 4.5 s        8.3 uV, 0.03 s
+notch off               93 uV, 4.5 s        1.3 uV, 0.01 s
+drift cut 0.5 -> 1 Hz   48 uV, 2.1 s        70 uV, 2.2 s
+drift cut 1 -> 0.1 Hz   1234 uV, 33 s       1172 uV, 33 s
+```
+
+A new drift cut still takes seconds, and that part is the filter, not the
+software: a high-pass needs a few of its own time constants to settle at a
+new corner. The plot counts it down as "filters settling" rather than looking
+slow to respond.
+
+#### A rate change waits for the device
+
+Changing rate restarts acquisition on the device. The app used to wait a
+fixed two seconds and start streaming again; frames sampled before the change
+could still reach filters redesigned for the new rate, and two quick changes
+overlapped. It now asks the device for its configuration straight after the
+rate command. The device runs commands in order, so the answer comes only
+once the restart is done, and until then every EEG frame is dropped. Then the
+filters are sent, and only then the stream is started, so the first sample at
+the new rate is already filtered. Two quick changes end at the last one.
+
+The mains frequency is measured only from an unbroken stretch of live
+samples: its buffer is emptied wherever the stream breaks - a start, a rate
+change, a new input or gain, a sequence gap.
 
 Recordings also had wrong timestamps: every row of a delivery was stamped
 from its first batch, a microsecond apart, tens of milliseconds out. Each
@@ -603,7 +656,8 @@ removal, and an R&D phase to find the method.
 1. **IMU streaming. DONE**, tested on the board over BLE (below).
 2. **In the app. DONE.** Motion lanes under the EEG, placed by device time;
    rate and range controls; motion recorded to `<name>_motion.csv` beside
-   the EEG file, on the same clock.
+   the EEG file, on the same clock, with a flags column (1: timed from a
+   poll, 2: samples lost just before).
 3. **Recordings, headset on.** A still baseline, head turns and nods,
    walking, chewing.
 4. **Cleanup built on the host** and judged on those recordings. Candidates:
@@ -644,6 +698,35 @@ samples up to 25 ms out. The FIFO is now read in one transfer, an edge that
 lands during a read is discarded, and a batch without an edge of its own is
 placed from the last good one at the measured period.
 
+#### Rate and ranges, and why
+
+The board wires the LSM6DSV16X in the datasheet's mode 1 (DS13510, Table 2):
+primary SPI, the analog hub and Qvar pins grounded, the auxiliary SPI pins
+unconnected. The machine learning core therefore has the accelerometer and
+gyroscope to work on, and no external sensors. The defaults:
+
+- **240 Hz**, the machine learning core's highest rate, so one stream can
+  feed it and the host alike. In high-performance mode the sensor's own
+  anti-aliasing filter sits at half the rate, so motion above 120 Hz is
+  filtered out rather than folded back - far above head movement anyway.
+- **+/-8 g**: walking, running and jumping, with room for knocks. Noise
+  density is the same at every range, 60 ug/rtHz, so the wider range costs
+  nothing.
+- **+/-2000 deg/s**: fast head shakes reach several hundred degrees a second.
+  Gyroscope noise, 2.8 mdps/rtHz, does not depend on the range up to here.
+
+Motion keeps its own rate. Nothing is repeated, interpolated or averaged to
+line it up with the EEG: every motion sample carries its own time on the
+EEG's clock, and the app draws and records it at that time.
+
+Batches are about 20 ms at every rate - 5 samples at 240 Hz, where they were
+12 - and a batch is also how long its newest sample waits on the device. At
+12 the motion lane fell short of the plot's right edge and caught up in
+jumps: on 4.6 % of redraws at 1000 SPS, by up to 26 ms, in a simulation of
+the app with Bluetooth-like delays. The app now also trails the newest motion
+sample, not only the newest EEG. With both: 0.0-0.1 % of redraws, the
+display 50-66 ms behind.
+
 #### On the wire
 
 A new frame type, `0x05`, device to host. Little-endian payload:
@@ -677,8 +760,9 @@ the motion half waits for the cleanup to exist.
 it designed and switches the stream to raw and filtered side by side: the
 plot shows what the device computed, and the recording stays raw. Settings,
 the "in average" ticks and the mains tracking follow onto the device as they
-change, and only a stage that changed is sent, so moving the low-pass does
-not restart the high-pass. If the device refuses anything, the filters go
+change. Only a stage that changed is sent, and one with as many sections as
+before is retuned in place, so moving the low-pass does not restart the
+high-pass, nor a new drift cut the notch. If the device refuses anything, the filters go
 back to the PC and the panel says why.
 
 #### The chain on the device
@@ -759,9 +843,10 @@ what it sent. A rate change drops sections designed for the old rate.
   through. The on-target suites run the firmware's own code against them.
 - **The app against a simulated device** running the reference chain: the
   plot is the device's output to 0.00 uV, the recording is the raw counts, a
-  low-pass change sends only the post stage, a mains re-aim retunes in place,
-  a rate change re-sends for the new rate, and a refusal falls back to the
-  PC. The older app checks still pass: 144 fps at 250-1000 SPS, bad-channel
+  low-pass change retunes only the post stage in place, a mains re-aim
+  retunes in place, a rate change sends the filters before the stream starts
+  again, two quick rate changes end at the last, and a refusal falls back to
+  the PC. The older app checks still pass: 144 fps at 250-1000 SPS, bad-channel
   handling, motion lanes.
 - **On the chip,** over Bluetooth, with `python tools/verify_chain.py`: a
   chain loaded, restarted at a sample the device reported, and the device's
@@ -796,6 +881,9 @@ what it sent. A rate change drops sections designed for the old rate.
   0.08 Hz at every rate.
 - **The device notch was Q 30,** 1.7 Hz wide, aimed at 50.0 Hz against mains
   measured at 49.6 - about 7 dB of rejection. It is Q 12 now, like the app's.
+- **A stage restarted mid-stream started from rest** on the device, where the
+  host chain primed: its first sample was a step the size of the signal. It
+  primes on its next sample now, as the host chain does.
 - **Register access during streaming** slipped an old sample in each time,
   and could wedge the SPI bus. Both are older than M6; see *Mistakes worth
   keeping* under M4.

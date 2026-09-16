@@ -16,6 +16,7 @@
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/bluetooth/uuid.h>
 #include <zephyr/kernel.h>
+#include <zephyr/sys/atomic.h>
 #include <zephyr/logging/log.h>
 
 LOG_MODULE_REGISTER(ble, CONFIG_LOG_DEFAULT_LEVEL);
@@ -49,6 +50,7 @@ static const struct bt_uuid_128 uuid_event =
 
 static struct bt_conn *current_conn;
 static bool stream_subscribed;
+
 static bool event_subscribed;
 static ble_control_cb_t control_cb;
 
@@ -124,6 +126,35 @@ BT_GATT_SERVICE_DEFINE(swifteeg_svc,
 
 /* --- Connection handling ---------------------------------------------- */
 
+/*
+ * Ask for a short connection interval. Everything the host sends or receives
+ * waits for the next connection event, so the interval sets both the command
+ * round-trip and how much stream data can be moved.
+ *
+ * 7.5-15 ms is the tightest a central will normally grant. Windows and
+ * Android allow 7.5 ms; iOS refuses anything under 15 ms, which is a platform
+ * limit and not something firmware can work around. The request is advisory -
+ * the central decides - so nothing here depends on it being honoured.
+ */
+static const struct bt_le_conn_param fast_param = {
+	.interval_min = 6,   /* units of 1.25 ms -> 7.5 ms */
+	.interval_max = 12,  /* -> 15 ms */
+	.latency = 0,        /* no skipped events: this is a live link */
+	.timeout = 400,      /* units of 10 ms -> 4 s */
+};
+
+/*
+ * A central may move the interval after connecting: Windows sat at 45 ms for
+ * a third of one three-minute run. At 45 ms the link cannot carry 1000 SPS
+ * with raw and microvolt samples, and the stream starts shedding batches, so
+ * it is worth asking again. A central that means to refuse will keep
+ * refusing, so the asking stops rather than becoming a loop.
+ */
+#define FAST_INTERVAL_UNITS 12 /* 15 ms, in units of 1.25 ms */
+#define SLOW_LINK_MAX_ASKS  3
+
+static uint8_t slow_link_asks;
+
 static void connected(struct bt_conn *conn, uint8_t err)
 {
 	if (err) {
@@ -145,24 +176,8 @@ static void connected(struct bt_conn *conn, uint8_t err)
 	};
 	(void)bt_conn_le_phy_update(conn, &phy);
 
-	/*
-	 * Ask for a short connection interval. Everything the host sends or
-	 * receives waits for the next connection event, so the interval sets
-	 * both the command round-trip and how much stream data can be moved.
-	 *
-	 * 7.5-15 ms is the tightest a central will normally grant. Windows and
-	 * Android allow 7.5 ms; iOS refuses anything under 15 ms, which is a
-	 * platform limit and not something firmware can work around. The
-	 * request is advisory - the central decides - so nothing here depends
-	 * on it being honoured.
-	 */
-	const struct bt_le_conn_param param = {
-		.interval_min = 6,   /* units of 1.25 ms -> 7.5 ms */
-		.interval_max = 12,  /* -> 15 ms */
-		.latency = 0,        /* no skipped events: this is a live link */
-		.timeout = 400,      /* units of 10 ms -> 4 s */
-	};
-	(void)bt_conn_le_param_update(conn, &param);
+	slow_link_asks = 0;
+	(void)bt_conn_le_param_update(conn, &fast_param);
 }
 
 static int start_advertising(void);
@@ -210,10 +225,16 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 static void le_param_updated(struct bt_conn *conn, uint16_t interval,
 			     uint16_t latency, uint16_t timeout)
 {
-	ARG_UNUSED(conn);
 	/* Interval is in 1.25 ms units; report it in microseconds. */
 	LOG_INF("conn params: interval %u us, latency %u, timeout %u ms",
 		interval * 1250U, latency, timeout * 10U);
+
+	if (interval > FAST_INTERVAL_UNITS && slow_link_asks < SLOW_LINK_MAX_ASKS) {
+		slow_link_asks++;
+		LOG_INF("interval is slow; asking for a shorter one (try %u)",
+			slow_link_asks);
+		(void)bt_conn_le_param_update(conn, &fast_param);
+	}
 }
 
 BT_CONN_CB_DEFINE(conn_callbacks) = {
@@ -297,6 +318,11 @@ int ble_transport_send_stream(const void *data, uint16_t len)
 		return -ENOTCONN;
 	}
 
+	/*
+	 * This waits for a transmit buffer while the link is saturated, so
+	 * only the stream's own transmit thread may call it. Nothing on the
+	 * acquisition path can afford the wait - see stream.c.
+	 */
 	return bt_gatt_notify(current_conn, &swifteeg_svc.attrs[3], data, len);
 }
 

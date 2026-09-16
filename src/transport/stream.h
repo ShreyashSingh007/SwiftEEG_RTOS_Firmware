@@ -32,6 +32,7 @@ struct stream_stats {
 	uint32_t bytes_dropped; /* USB buffer was full */
 	uint32_t ble_dropped;   /* notification refused, usually no buffers */
 	uint32_t ble_too_big;   /* frame exceeded the negotiated MTU */
+	uint32_t queue_dropped; /* the transmit queue was full */
 };
 
 /*

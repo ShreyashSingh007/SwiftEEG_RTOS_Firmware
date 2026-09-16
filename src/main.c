@@ -289,10 +289,11 @@ static void report_health(void)
 		pipeline_get_filters(&pf);
 
 		LOG_INF("health: %u samples, %u dropped, %u bad; stream %u frames, "
-			"%u samples, %u bytes lost; DSP %u us; mains %u mHz, "
-			"notch at %u mHz",
+			"%u samples, %u queued out, %u link lost; DSP %u us; "
+			"mains %u mHz, notch at %u mHz",
 			ps.processed, ps.ring_drops, ps.bad_status,
-			ss.frames_sent, ss.samples_sent, ss.bytes_dropped,
+			ss.frames_sent, ss.samples_sent, ss.queue_dropped,
+			ss.ble_dropped,
 			ps.dsp_mean_us, (uint32_t)(pf.mains_hz * 1000.0f),
 			(uint32_t)(pf.notch_aim_hz * 1000.0f));
 	}

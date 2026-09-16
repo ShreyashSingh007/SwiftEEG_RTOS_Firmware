@@ -123,6 +123,12 @@ static uint32_t settle_left;
 static volatile uint32_t st_frames;
 static volatile uint32_t st_processed;
 static volatile uint32_t st_bad_status;
+
+/*
+ * Ring drops already reported to a host. The DSP thread owns this: it marks
+ * the first sample after a loss and remembers where the count stood.
+ */
+static uint32_t ring_drops_seen;
 static volatile uint32_t st_dsp_total_us;
 static volatile uint32_t st_dsp_max_us;
 static volatile float st_ch1_min;
@@ -462,6 +468,22 @@ static void process(const struct raw_frame *rf)
 		st_bad_status++;
 		st_seq--; /* it never became a sample */
 		return;
+	}
+
+	/*
+	 * Frames the ring refused while this thread was behind. They are gone
+	 * - nothing brings them back - but the host is told here, on the first
+	 * sample after the loss. Without this the loss is invisible: a frame
+	 * that never reached this function never took a sequence number, so
+	 * the numbering stays unbroken across it and only the hardware
+	 * timestamps show the hole. That cost 107 samples at 1000 SPS on
+	 * 2026-09-16 with nothing to say so.
+	 */
+	const uint32_t drops = spsc_dropped(&raw_ring);
+
+	if (drops != ring_drops_seen) {
+		ring_drops_seen = drops;
+		out.flags |= EEG_FLAG_OVERRUN;
 	}
 
 	if (settle_left != 0u) {
@@ -893,6 +915,7 @@ void pipeline_reset_stats(void)
 	st_ch1_min = 1e30f;
 	st_ch1_max = -1e30f;
 	st_seq = 0;
+	ring_drops_seen = spsc_dropped(&raw_ring);
 }
 
 void pipeline_get_stats(struct pipeline_stats *out)

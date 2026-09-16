@@ -141,18 +141,48 @@ static inline void put_f32(uint8_t *p, float v)
 	put_u32(p, bits);
 }
 
-bool stream_send(const uint8_t *frame, size_t len)
-{
-	bool delivered = false;
+/*
+ * Frames waiting for the radio.
+ *
+ * bt_gatt_notify() waits for a transmit buffer when the link is saturated,
+ * and it was the DSP thread that called it: at 1000 SPS with raw and
+ * microvolt samples that wait let the acquisition ring fill until the
+ * interrupt began dropping frames - 107 samples in 20 s, with nothing to say
+ * so (2026-09-16). Refusing to wait instead only moved the loss: a refused
+ * frame is a frame thrown away, and delivery fell at every rate.
+ *
+ * So a finished frame is copied here, and a thread of its own does the
+ * waiting. Acquisition never blocks, and the radio stays as full as the link
+ * allows. A queue that fills drops the newest frame and counts it, which
+ * costs a batch rather than a sample and shows up as a gap in the sequence
+ * numbers a host is already checking.
+ */
+#define TX_QUEUE_FRAMES 32
+#define TX_FRAME_BYTES  244 /* one notification at a 247-byte ATT MTU */
+#define TX_STACK_SIZE   2048
+#define TX_PRIORITY     4   /* below the DSP thread, above the command one */
 
-	/*
-	 * Both links carry byte-identical frames, and both are fed: a host on
-	 * either one sees the same stream, and unplugging USB mid-session does
-	 * not interrupt BLE. The USB transport counts its own drops.
-	 */
-	if (usb_transport_is_connected() &&
-	    usb_transport_write(frame, len) == len) {
-		delivered = true;
+struct tx_frame {
+	uint16_t len;
+	uint8_t  data[TX_FRAME_BYTES];
+};
+
+BUILD_ASSERT(PROTO_OVERHEAD + DATA_HDR_LEN + BATCH_BYTES <= TX_FRAME_BYTES,
+	     "a data frame does not fit the transmit queue");
+
+K_MSGQ_DEFINE(tx_queue, sizeof(struct tx_frame), TX_QUEUE_FRAMES, 4);
+
+static atomic_t tx_dropped;
+
+/*
+ * Both links carry byte-identical frames, and both are fed: a host on either
+ * one sees the same stream, and unplugging USB mid-session does not
+ * interrupt BLE. The USB transport counts its own drops.
+ */
+static void deliver(const uint8_t *frame, size_t len)
+{
+	if (usb_transport_is_connected()) {
+		(void)usb_transport_write(frame, len);
 	}
 
 	if (ble_transport_is_streaming()) {
@@ -162,14 +192,48 @@ bool stream_send(const uint8_t *frame, size_t len)
 			/* Would be dropped by the stack; count it here instead
 			 * of losing it silently. */
 			atomic_inc(&ble_too_big);
-		} else if (ble_transport_send_stream(frame, (uint16_t)len) == 0) {
-			delivered = true;
-		} else {
+		} else if (ble_transport_send_stream(frame, (uint16_t)len) != 0) {
 			atomic_inc(&ble_dropped);
 		}
 	}
+}
 
-	return delivered;
+static void tx_entry(void *a, void *b, void *c)
+{
+	ARG_UNUSED(a);
+	ARG_UNUSED(b);
+	ARG_UNUSED(c);
+
+	while (1) {
+		struct tx_frame tx;
+
+		if (k_msgq_get(&tx_queue, &tx, K_FOREVER) == 0) {
+			deliver(tx.data, tx.len);
+		}
+	}
+}
+
+K_THREAD_DEFINE(stream_tx, TX_STACK_SIZE, tx_entry, NULL, NULL, NULL,
+		TX_PRIORITY, 0, 0);
+
+bool stream_send(const uint8_t *frame, size_t len)
+{
+	struct tx_frame tx;
+
+	if (len > sizeof(tx.data)) {
+		atomic_inc(&ble_too_big);
+		return false;
+	}
+
+	tx.len = (uint16_t)len;
+	memcpy(tx.data, frame, len);
+
+	if (k_msgq_put(&tx_queue, &tx, K_NO_WAIT) != 0) {
+		atomic_inc(&tx_dropped);
+		return false;
+	}
+
+	return true;
 }
 
 static void flush(void)
@@ -334,6 +398,7 @@ void stream_get_stats(struct stream_stats *out)
 	out->bytes_dropped = usb_transport_dropped();
 	out->ble_dropped = (uint32_t)atomic_get(&ble_dropped);
 	out->ble_too_big = (uint32_t)atomic_get(&ble_too_big);
+	out->queue_dropped = (uint32_t)atomic_get(&tx_dropped);
 }
 
 void stream_reset_stats(void)
@@ -341,4 +406,5 @@ void stream_reset_stats(void)
 	memset(&stats, 0, sizeof(stats));
 	atomic_set(&ble_dropped, 0);
 	atomic_set(&ble_too_big, 0);
+	atomic_set(&tx_dropped, 0);
 }

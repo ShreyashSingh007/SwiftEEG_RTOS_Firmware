@@ -27,5 +27,7 @@ Thumbs.db
 # Local-only
 *.local
 
-# Recordings made by the app - data, not source.
+# Recordings - data, not source. Sessions from the headset live in
+# recordings/, the application's exports alongside whatever made them.
 swifteeg_*.csv
+recordings/

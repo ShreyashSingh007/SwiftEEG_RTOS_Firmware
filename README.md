@@ -534,6 +534,42 @@ writes from the host, tried first, doubled the reply time and lost replies
 just the same. The host also reads each notification on its own now, so a
 damaged frame can no longer take the next one with it.
 
+**Acquisition waited for the radio.** `bt_gatt_notify()` blocks when the link
+is saturated, and it was the DSP thread that called it. At 1000 SPS, sending
+raw counts and microvolts together - 56 bytes a sample - with the motion lane
+sharing the same buffers, that wait let the raw ring fill until the
+acquisition interrupt began dropping frames. Nothing said so: a frame dropped
+before the DSP thread never takes a sequence number, so the numbering stays
+unbroken across the hole and only the hardware timestamps show it. Fitting
+sample numbers against their DRDY timestamps found 107 samples missing in
+20 s (0.53 %) on the bench, and 2.8 % on a worn recording made as the battery
+went flat. The device's health line settled which of the two silent paths it
+was - 107 dropped, 0 bad - a frame the ring refused, not one rejected for a
+bad status word. Three things came out of it:
+
+- The first sample after a loss now carries `EEG_FLAG_OVERRUN`, a flag the
+  protocol always had and nothing ever set. The application counts them and
+  says *samples lost on the device*.
+- Sending moved off the acquisition path. `stream.c` copies each finished
+  frame into a 32-deep queue and a thread of its own does the waiting, so the
+  radio can stall without the pipeline noticing. A full queue drops a batch
+  and counts it, which a host sees as a gap in the sequence numbers.
+- **Refusing to wait is not the same as not waiting.** The first attempt kept
+  the send on the DSP thread and refused whenever the stack had no buffer
+  free. Acquisition stopped losing samples and the link started losing them
+  instead: delivery fell from 1000 to 700 SPS at 1000 SPS, 500 to 422 at 500,
+  and 250 to 236 at 250. A refused frame is a thrown-away frame; a queued one
+  is not.
+
+**A central can move the connection interval, and 45 ms is not enough.**
+Windows granted 15 ms at connect and then sat at 45 ms for a third of one
+three-minute run. At 45 ms the link cannot carry 1000 SPS with raw and
+microvolt samples, so the stream shed batches - 285 samples missing of 7678
+through `verify_chain`, with the arriving data still bit-exact. The device now
+asks again whenever it is told an interval slower than 15 ms, three times at
+most per connection, rather than only at connect. After that: 0 missing of
+8027, 1003.3 SPS delivered, and 252 commands answered with none lost.
+
 ### M5 — Windows application  (built)
 
 ```bash
@@ -777,6 +813,46 @@ Motion frames flow while the stream is enabled, like the EEG's.
 Zephyr's own LSM6DSV16X driver is switched off in `prj.conf`; `src/imu` owns
 the chip.
 
+#### First session on a head
+
+Sitting, eyes open, occasional head movement; dry electrodes, on battery,
+nothing wired to the PC. Three minutes at 250 SPS, then rate changes, then
+settings changes, every frame kept (`scratchpad/worn_session.py`, analysed by
+`worn_report.py`; recordings under `recordings/`, which git ignores).
+
+- 45083 samples, 0 missing, 0 repeated, 0 stale. All eight channels live:
+  12.7-32.3 uV of 1-40 Hz signal on clean seconds, electrode offsets -90.8 to
+  +31.5 mV.
+- **Mains, on a head:** 7-15 uV a channel raw, 0.26-0.54 uV after the device
+  notch - about 36 dB. The tracker produced 32 estimates in three minutes,
+  followed the grid down from 49.968 to 49.890 Hz, and agreed with an FFT of
+  the same raw counts to a median 3.3 mHz on clean stretches. Through an
+  eleven-second head movement it stopped updating for 21 s rather than follow
+  a disturbed signal, which is what the coherence gate is for.
+- **Rate changes while streaming:** answered in 58-150 ms, the configuration
+  148-240 ms after that, streaming again inside a second. No samples lost
+  across any change, motion continuous through all of them, EEG and motion
+  ending within 22 ms of each other on the device clock.
+- **Settings while streaming,** replayed exactly from the raw counts (worst
+  disagreement 0.003 uV over 27227 samples): smoothing, notch and average
+  changes are under 1 uV within 0.02-0.26 s; a drift-cut change takes 1.5-2.7
+  s, which is the new filter settling rather than anything the device does.
+- **The motion sensor's own clock runs 1.8 % slow:** 235.6 Hz where 240 is
+  asked for. The device measures the period - 4244.7 us - and timestamps every
+  sample against TIMER1, so alignment holds and nothing is resampled.
+- **What this recording cannot show.** Only 54 % of its seconds are clean:
+  18 % head motion, and 28 % body or muscle the motion sensor cannot see -
+  yawns and shoulder movement. Every signal-dependent number above was
+  recomputed on clean seconds only (`scratchpad/clean_check.py`). Two that it
+  cannot answer are the size of the restart transient at a rate change and the
+  exact settings transients, because body noise landed in the windows they are
+  measured in. Both want a still recording.
+- **For the motion cleanup to come:** 1-5 Hz sits at 11.9 uV quiet and 28.5 uV
+  while moving, peaking at 2.3 mV; a 233 deg/s turn put 345 uV on the trace,
+  101 deg/s put 102 uV, and turns under about 40 deg/s barely show. Level
+  tracks turn rate with a correlation of 0.57 at 1-5 Hz, 0.50 against
+  acceleration.
+
 ### M6 — push the validated chain into the firmware  (filters: built)
 
 The settings found in M5, and the motion cleanup, become the device's own,
@@ -938,6 +1014,10 @@ when the notch moved there.
    500 SPS   4012 samples x 8 ch   worst 0.0007 uV   0 gaps   501.1 SPS delivered
   1000 SPS   8002 samples x 8 ch   worst 0.00 uV     0 gaps   999.0 SPS delivered
   ```
+
+  Re-checked after sending moved to its own thread (see *Mistakes worth
+  keeping*): 1000 SPS, 0 missing of 8027, 1003.3 SPS delivered, still
+  0.00 uV.
 
   Within a thousandth of a microvolt. The sections a host sends match bit
   for bit; the notch, designed on the chip in float32 now that it follows

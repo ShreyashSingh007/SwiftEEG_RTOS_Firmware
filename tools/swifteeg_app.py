@@ -206,6 +206,8 @@ class App(tk.Tk):
         self.frames = 0
         self.last_seq: int | None = None
         self.gaps = 0
+        self.lost = 0            # samples the device dropped before sending
+        self._overrun_t = 0.0
         self.leadoff = 0
         self.started_at = 0.0
         self.recorder: csv.writer | None = None
@@ -591,6 +593,8 @@ class App(tk.Tk):
         self.frames = 0
         self.last_seq = None
         self.gaps = 0
+        self.lost = 0
+        self._overrun_t = 0.0
         self.started_at = time.time()
 
     def _reset_traces(self) -> None:
@@ -1026,6 +1030,14 @@ class App(tk.Tk):
                 if f.flags & link.FLAG_SETTLING:
                     self._dev_settle_t = now
 
+                # Frames the device threw away before this sample, because it
+                # could not hand them over in time. They are gone; without
+                # this the trace carries on as though nothing happened, a
+                # little shorter than the clock says it should be.
+                if f.flags & link.FLAG_OVERRUN:
+                    self.lost += 1
+                    self._overrun_t = now
+
                 block_raw.append((ts, seq, counts, uv))
             elif f.type == link.TYPE_IMU:
                 got = link.decode_imu(f.payload)
@@ -1376,7 +1388,10 @@ class App(tk.Tk):
 
         clipping = sum(1 for ch in shown
                        if now - self.clip_t[ch] < LIMIT_HOLD_S)
-        if clipping:
+        if now - self._overrun_t < LIMIT_HOLD_S:
+            text = (f"samples lost on the device ({self.lost} times) - it "
+                    f"could not keep up; use a lower rate, or counts only")
+        elif clipping:
             # Full-scale differential input is VREF/gain, so 187.5 mV at
             # gain 24. An electrode that is not touching skin floats well
             # past that, which is the usual reason a channel clips.
@@ -1711,7 +1726,8 @@ class App(tk.Tk):
 
         self.stats.config(text="\n".join([
             f"{self.samples} samples  {self.samples / el:6.1f} SPS",
-            f"{self.frames} frames  {bad} bad  {self.gaps} gaps{rec}",
+            f"{self.frames} frames  {bad} bad  {self.gaps} gaps  "
+            f"{self.lost} lost{rec}",
             f"DC mV: {dc}",
             motion,
             site,

@@ -13,6 +13,7 @@ was relaxed by the owner on 2026-09-16 for exactly this.)
 ## Resume here
 
 - **Work on:** `m1-bringup` - the milestone line.
+- **Review status:** wave 1 of 2 running (see the 2026-09-17 log entry).
 - **In progress:** deep review of the firmware, the desktop app and the link
   between them, plus whether the foundation supports native apps on Windows,
   macOS, iOS and Android with shared native libraries. Verified findings land
@@ -49,6 +50,24 @@ was relaxed by the owner on 2026-09-16 for exactly this.)
 ---
 
 ## Log
+
+### 2026-09-17 - review relaunched
+
+- The first review run was lost: the usage limit cut every reviewer off
+  before any report was written. The two runs of `arm-cortex-expert` never
+  worked at all - its plugin definition has `tools: []`, so it cannot read a
+  file, and one run printed several hundred fake tool calls as plain text,
+  which likely ate a large share of the usage. Fix on the owner's side:
+  delete that line in
+  `~/.claude/plugins/cache/claude-code-workflows/arm-cortex-microcontrollers/1.2.1/agents/arm-cortex-expert.md`.
+  Firmware reviews use **Embedded Firmware Engineer** (nRF Connect SDK / Zephyr).
+- Relaunched in two waves of four instead of eight at once. Every reviewer
+  now writes its report file first and appends each finding the moment it is
+  confirmed, so an interruption loses at most one finding. Reports live in
+  the session scratchpad `review/` folder next to the shared `BRIEF.md`.
+  - Wave 1 (running): R1 acquisition, R2 IMU + transports, R3 DSP / codec /
+    commands, R4 desktop app.
+  - Wave 2 (next): R5 contract, R6 architecture, R7 performance, R8 security.
 
 ### 2026-09-16 - review before resuming the plan
 

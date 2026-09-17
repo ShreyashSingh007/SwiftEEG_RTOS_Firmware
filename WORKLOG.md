@@ -13,14 +13,13 @@ was relaxed by the owner on 2026-09-16 for exactly this.)
 ## Resume here
 
 - **Work on:** `m1-bringup` - the milestone line.
-- **Review status:** wave 1 done and verified (44 findings, below). Wave 2: protocol contract done and verified (7 findings); architecture / multiplatform running. Full reports with file:line evidence: `docs/review/2026-09-17/`.
-- **In progress:** deep review of the firmware, the desktop app and the link
-  between them, plus whether the foundation supports native apps on Windows,
-  macOS, iOS and Android with shared native libraries. Verified findings land
-  in the log below; nothing is fixed until the owner picks what to fix.
+- **Review:** COMPLETE (2026-09-17). 58 findings, every critical and high one
+  verified against the code. Verdict, fix plan and the owner's decisions are
+  in *Verdict and path* below; evidence in `docs/review/2026-09-17/`.
+- **Next:** the owner picks from *Decisions for the owner*. Nothing is fixed
+  until then.
 - **Parked:** `feature/bcg-vitals` - heart rate, breathing and HRV from head
   motion. Works, not on the plan.
-- **Waiting on the owner:** see *Open decisions*.
 
 ## Branches
 
@@ -30,6 +29,22 @@ was relaxed by the owner on 2026-09-16 for exactly this.)
 | `feature/bcg-vitals` | BCG vitals, `10ec2ab`, branched from `6a094b6` | parked |
 
 ## Open decisions (owner)
+
+**From the review (see *Verdict and path*):**
+
+A. Fix the data-integrity bugs (phase A) before any more recordings?
+   Recommended: yes.
+B. Shared core language: the firmware's own C for the codec and DSP, plus a
+   Rust session layer with generated Swift/Kotlin/Python bindings
+   (recommended), or all C.
+C. Apple at 1 kSPS cannot carry raw + filtered side by side. Stream raw only
+   and have the apps replay the device's exact filters (recommended), or keep
+   the device-filtered stream and accept lower rates on Apple.
+D. Protocol v2, pairing/bonding and MCUboot in ONE firmware release, so each
+   board needs a single SWD reflash. Recommended: yes.
+
+**Carried over:**
+
 
 1. **Re-seat CH8, CH2, CH4** before the next recording. CH8 sat on the rail
    (187.5 mV, full scale at gain 24) and carried nothing; CH2 and CH4 were
@@ -136,6 +151,102 @@ GET_CONFIG reply and the SET_FILTER upload.
 | 06 | low | | A command with an empty payload gets no reply at all instead of bad-argument. |
 | 07 | low | | Sample flags are defined twice (pipeline.h, proto.h) with equal values but no compile-time check tying them. |
 
+### Architecture and the multiplatform path (R6-ARCH, architect-review)
+
+| ID | Sev | V | Finding |
+|---|---|---|---|
+| 01 | high | V | Host logic has no UI-independent home: the filter design exists in both `eeg_dsp.py` (app) and `dsp_ref.py` (oracle), the chain in `eeg_dsp.py` and `pipeline_ref.py`, the LSB in three files. The device is tested against one copy while the app designs with another. |
+| 02 | high | V | DATA frames are not self-describing: the header is time, seq, channels, encoding, count - no rate, no configuration generation, no per-sample flags, though the plan specified them. |
+| 03 | high | V | No identity, firmware version, capabilities, boot id or link state on the wire (GET_INFO is 4 bytes; no Device Information Service). Apple apps cannot even tell two headsets apart. |
+| 04 | high | | Raw + filtered side by side cannot fit Apple at 1 kSPS (64.7 kB/s; ~10 notifications a connection event at 30 ms). |
+| 05 | medium | | Sharing C source is not enough for bit-identical output: compilers may fuse float operations and each platform's maths library rounds differently. Needs explicit float flags and a vendored libm. |
+| 06 | medium | | The protocol has no single definition and has already drifted (event characteristic, gain code vs value, planned vs built header). |
+| 07 | medium | V | No host time-sync or marker command, though the plan committed to one: stimulus timing can only use notification arrival, off by up to a connection interval. |
+
+## Verdict and path
+
+**Can today's foundation carry native apps on Windows, macOS, iOS and Android,
+sharing one native core with no bottleneck? Not as it stands - yes after a
+protocol v2 and a core extraction.** The base is right: DRDY-latched timing,
+one codec over BLE and USB, bit-exact on-device DSP, and codec/DSP/chain C
+(`proto.c`, `dsp.c`, `mains.c`, `chain.c`) that already compiles without
+Zephyr. What is not ready is the wire contract four apps would freeze, and the
+host logic, which lives inside a Tk script. An app built before both are fixed
+gets rewritten.
+
+**Bluetooth budget** (details and assumptions: R6-ARCH.md section 2). Windows
+and Android carry every mode today except 1000 SPS raw+uV, which is marginal
+(measured OK on Windows). Apple today carries only raw 24-bit, up to 500 SPS
+with motion. Apple at 1000 SPS + motion needs MTU-sized frames, an interval
+request Apple accepts, raw-only streaming, and lossless packing for headroom.
+The Apple figures rest on assumed packets per connection event: measure a real
+iPhone before freezing v2.
+
+**Target architecture** (R6-ARCH.md section 3):
+- **L0 `lib/swifteeg` - C17**, no heap/I/O/threads, compiled from the SAME
+  files into the firmware and every host: codec + schema, DSP sections, chain,
+  mains tracker, filter design (moved out of numpy), timing maths, recording
+  encoder.
+- **L1 `swifteeg-core` - Rust**, no I/O of its own, C ABI: request matching,
+  device mirror, connect / rate change / reconnect, loss accounting, clock
+  sync, replay chain, recorder, LSL. Bindings generated (UniFFI) for Swift,
+  Kotlin and Python; a C header for Windows.
+- **Per platform:** BLE/USB I/O (CoreBluetooth, BluetoothGatt, WinRT),
+  pairing UI, permissions, storage, UI.
+- **Conformance:** golden vectors become shared data files replayed by every
+  binding's tests.
+
+**Protocol v2** (13 changes, R6-ARCH.md section 4), from one schema file that
+generates the C header, Python constants and README tables: versioned GET_INFO
+with identity and capabilities; replies echo the command seq and heavy
+commands report completion by event; frames sized to the MTU; seq counts
+conversions so every loss is a gap; config generation, rate and per-sample
+flags in DATA/IMU; delays and stats readable; every event on the event
+characteristic; time sync and markers; raw 24-bit for production, lossless
+packing capability-gated; stream stops on disconnect; USB flush + hello.
+
+**Security baseline before anyone else wears it:** pairing with LE Secure
+Connections inside a pairing window, encrypted writes, per-link rate caps,
+watchdog, codec fix and range checks; MCUboot + SMP firmware update; lock SWD
+only after updates work.
+
+### Proposed fix order
+
+**Phase A - data integrity, current protocol, then resume recordings.**
+Small, testable, no protocol change:
+- R3-DSP-01 codec payload overwrite (+ distinct-frames test); R1-ACQ-01
+  timestamp wrap (+ pre-wrap test).
+- R1-ACQ-07/08 register access all-or-nothing, start-path buffer order.
+- R3-DSP-02/07/09, R5-CONTRACT-02/06: validate before OK, range checks,
+  failed readback, reply size, empty payload.
+- R3-DSP-03 + R1-ACQ-09: rate cap per link, DSP thread yields when behind,
+  watchdog, reset on fatal with the cause reported.
+- R3-DSP-04/06/10/12, R1-ACQ-11: re-prime on input change, section bounds,
+  settling formula, table CRC, anomaly-198 workaround + readback.
+- App: R4-HOST-01..07 - parser hardening, recording sidecar with full
+  metadata and a new segment on any config change, loss column from
+  timestamp continuity, per-frame error isolation, link-lost state, rate
+  confirmation, BLE close ordering.
+- Then the original plan resumes: still recording, motion recordings, motion
+  cleanup.
+
+**Phase B - shared core groundwork, no device change** (can run beside the
+motion work): extract `lib/swifteeg/` with a host test runner and explicit
+float flags; write the v1 schema + generator; start the core behind
+`swifteeg_link.Link`, switched over only when its output matches today's on
+captured byte streams.
+
+**Phase C - one firmware release, one SWD pass per board:** protocol v2,
+MTU-adaptive batching, Apple-compliant link parameters and PPCP, USB/BLE
+transmit decoupling and USB flush, pairing/bonding, MCUboot + SMP. Measure an
+iPhone first.
+
+**Phase D - native apps:** macOS + iOS first (hardest radio budget, one
+CoreBluetooth adapter), then Android, then native Windows; Tk retired last.
+
+**Deferred unless rates above 1 kSPS are needed:** R1-ACQ-02/10 (acquisition
+ceilings), R3-DSP-05 (float32 high-pass at high rates).
+
 ### Corrections made during verification
 
 - **R3-DSP-03:** the Bluetooth host threads are cooperative and keep running;
@@ -150,6 +261,15 @@ GET_CONFIG reply and the SET_FILTER upload.
 ---
 
 ## Log
+
+### 2026-09-17 - review complete
+
+- Wave 2 done: R5 contract (7 findings, 2 verified) and R6 architecture
+  (7 findings, 4 verified; its claims about duplicated logic, the DATA header,
+  missing sync/marker commands and Zephyr-free shared C all checked).
+- Synthesis written: *Verdict and path*, proposed phases A-D, four decisions
+  for the owner. Reports R5 and R6 added to `docs/review/2026-09-17/`.
+- Totals: 58 findings - 2 critical, 13 high, 27 medium, 16 low.
 
 ### 2026-09-17 - wave 1 results verified
 

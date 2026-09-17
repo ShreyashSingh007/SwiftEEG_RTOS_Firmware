@@ -29,11 +29,16 @@ Three decisions worth knowing:
 
 from __future__ import annotations
 
+import collections
 import csv
 import ctypes
+import datetime
+import json
 import math
 import pathlib
+import platform
 import queue
+import statistics
 import sys
 import time
 import tkinter as tk
@@ -80,6 +85,65 @@ LIMIT_HOLD_S = 1.0
 AUTO_OUT_S = 2.0
 # How long to wait for the device to answer a rate change before asking again.
 RATE_ANSWER_S = 3.0
+# The rates this app can time, filter and plot.
+RATES = (250, 500, 1000)
+# How often to ask for the device's configuration until it answers, and how
+# many unanswered asks before that is said in red.
+SYNC_RETRY_S = 1.0
+SYNC_TRIES = 5
+# The sample period is measured: the median of the last PERIOD_WINDOW
+# batch-to-batch periods, used once there are PERIOD_MIN of them, and flagged
+# once half the window sits further than PERIOD_TOLERANCE from the rate the
+# device reports.
+PERIOD_WINDOW = 64
+PERIOD_MIN = 8
+PERIOD_TOLERANCE = 0.02
+# How long a closing link may take to write what it was given and
+# disconnect, before the app goes on without it.
+LINK_CLOSE_S = 3.0
+
+# Commands that change what the device measures or how it sends it. Each one
+# sent while recording ends the segment: one file never mixes two settings.
+CONFIG_COMMANDS = {
+    link.CMD_SET_ENCODING: "encoding",
+    link.CMD_TEST_SIGNAL: "test signal",
+    link.CMD_SET_INPUT: "input",
+    link.CMD_SET_RATE: "rate",
+    link.CMD_SET_CHANNEL: "gain",
+    link.CMD_SET_BIAS: "bias drive",
+    link.CMD_SET_NOTCH: "device notch",
+    link.CMD_SET_LEADOFF: "lead-off detection",
+    link.CMD_SET_IMU: "motion sensor",
+    link.CMD_SET_FILTER: "device filters",
+    link.CMD_SET_CAR: "device common average",
+    link.CMD_RESET_CHAIN: "device filter reset",
+}
+MUX_NAMES = {link.MUX_NORMAL: "electrodes", link.MUX_SHORTED: "shorted",
+             link.MUX_TEST: "test signal"}
+ENCODING_NAMES = {link.ENC_RAW_I32: "RAW_I32", link.ENC_UV_F32: "UV_F32",
+                  link.ENC_RAW_I24: "RAW_I24", link.ENC_RAW_UV: "RAW_UV"}
+
+
+def _utc(t: float | None = None) -> str:
+    """Host wall-clock time, ISO 8601 in UTC, to the microsecond."""
+    return datetime.datetime.fromtimestamp(
+        time.time() if t is None else t, datetime.timezone.utc
+    ).isoformat(timespec="microseconds")
+
+
+def _jsonable(value):
+    """A value as JSON holds it: bytes as hex, numpy scalars as numbers, no NaN."""
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, np.ndarray)):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).hex()
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
 
 
 class FramePacer:
@@ -161,6 +225,8 @@ class App(tk.Tk):
         self.rate = 250
         self.chain = eeg_dsp.Chain(self.rate, link.CHANNELS)
         self.gain = 24
+        self.gains = [24] * link.CHANNELS
+        self.sources = [link.MUX_NORMAL] * link.CHANNELS
 
         self._reset_traces()
         self.enabled = [tk.BooleanVar(value=True) for _ in range(link.CHANNELS)]
@@ -206,13 +272,71 @@ class App(tk.Tk):
         self.frames = 0
         self.last_seq: int | None = None
         self.gaps = 0
-        self.lost = 0            # samples the device dropped before sending
+        self.lost = 0            # samples the device lost, by seq and by time
+        self._lost_last = 0
         self._overrun_t = 0.0
         self.leadoff = 0
         self.started_at = 0.0
+
+        # Continuity: the batch before, and the sample period as measured
+        # from batch timestamps rather than taken from the nominal rate.
+        self._prev_batch: tuple[int, int, int] | None = None
+        self._last_sample_ts: float | None = None
+        self._periods: collections.deque = collections.deque(maxlen=PERIOD_WINDOW)
+        self.period_us = 1e6 / self.rate
+        # Set by a stream start, whose first batch may follow a hole in time
+        # that lost nothing: the device kept sampling while stopped.
+        self._restarted = False
+
+        # Recording. `_rec` is the recording in progress - its segments and
+        # the settings the open one was made under - and the writers belong
+        # to its open segment, None between segments.
         self.recorder: csv.writer | None = None
         self._rec_file = None
         self.rec_rows = 0
+        self._rec: dict | None = None
+        self._flush_t = 0.0
+        self._version = {
+            "app": "SwiftEEG",
+            "python": platform.python_version(),
+            "platform": platform.platform(),
+        }
+
+        # What the app knows of the device's configuration, and whether that
+        # is current. Every command that changes the configuration moves the
+        # epoch on, and only an answer to a GET_CONFIG asked at the latest
+        # epoch describes the device as it is. Until the first answer the app
+        # is unsynchronised: it does not know the rate that times and filters
+        # the samples, so it takes none of them.
+        self._synced = False
+        self.device_config: tuple[bytes, dict] | None = None
+        self.device_info: bytes | None = None
+        self._cfg_epoch = 0
+        self._cfg_confirmed = -1
+        self._cfg_asks: collections.deque = collections.deque()
+        self._cfg_need_ask = False
+        self._cfg_ask_t = -math.inf
+        self._cfg_tries = 0
+        # The arguments of the last command of each kind sent on this
+        # connection, for the settings the device does not report back.
+        self._sent: dict = {}
+
+        # The link's last message, a link still shutting down, and whether
+        # the window is on its way out.
+        self._link_msg = ""
+        self._closing: link.Link | None = None
+        self._closing_until = 0.0
+        self._closing_app = False
+
+        # Failures that stay on screen until dealt with; see _alert. A key
+        # dismissed by the user stays quiet only while its condition is the
+        # same one they dismissed - a fresh occurrence (cleared, then raised
+        # again) is not something they have seen yet, and is shown again.
+        self._alerts: dict[str, str] = {}
+        self._dismissed: set = set()
+        self._errors = 0
+        self._malformed_frames = 0
+        self._buttons: tuple | None = None
 
         # Where the filters run. On the device, what it was last sent is
         # kept per stage, so an unchanged stage is never sent - and so never
@@ -259,6 +383,7 @@ class App(tk.Tk):
         # from the start rather than only after the first change.
         self._rebuild_chain()
         self._set_car_mask()
+        self._update_buttons()
         self.after(1, self._frame)
         self.protocol("WM_DELETE_WINDOW", self._close)
 
@@ -336,6 +461,15 @@ class App(tk.Tk):
         self.status = self._label(f, "not connected", fg=DIM)
         self.status.pack(fill=tk.X, pady=(6, 0))
 
+        # Failures that the next message must not replace: a lost link, a
+        # recording that stopped, a device that does not answer. Each stays
+        # until what raised it is over or dealt with, or it is clicked away.
+        # Packed only while there is something to say.
+        self.alert = self._label(f, "", fg="#ff6b6b", justify=tk.LEFT,
+                                 wraplength=300, cursor="hand2",
+                                 font=("Segoe UI", 9, "bold"))
+        self.alert.bind("<Button-1>", lambda e: self._dismiss_alerts())
+
         # -- acquisition --
         f = self._section(inner, "acquisition")
         row = tk.Frame(f, bg=PANEL)
@@ -352,7 +486,10 @@ class App(tk.Tk):
         self.btn_stream = tk.Button(row, text="Start streaming", width=16,
                                     command=self._toggle_stream)
         self.btn_stream.pack(side=tk.LEFT)
+        # Disabled until the device's settings are confirmed; see
+        # _update_buttons.
         self.btn_rec = tk.Button(row, text="Record", width=10,
+                                 state=tk.DISABLED,
                                  command=self._toggle_record)
         self.btn_rec.pack(side=tk.LEFT, padx=6)
 
@@ -533,19 +670,105 @@ class App(tk.Tk):
 
     # ----------------------------------------------------------- device --
 
-    def _send(self, opcode: int, *args: int) -> None:
+    def _mark_config_change(self, opcode: int) -> None:
+        if self.recorder is not None:
+            self._end_segment(CONFIG_COMMANDS[opcode])
+        self._cfg_epoch += 1
+        self._cfg_confirmed = -1
+        self._synced = False
+        self._cfg_need_ask = True
+        self._cfg_ask_t = -math.inf
+        self._update_buttons()
+
+    def _mark_host_change(self, reason: str) -> None:
+        if self.recorder is not None:
+            self._end_segment(reason)
         if self.link and self.link.connected:
+            self._cfg_epoch += 1
+            self._cfg_confirmed = -1
+            self._synced = False
+            self._cfg_need_ask = True
+            self._cfg_ask_t = -math.inf
+            self._update_buttons()
+
+    def _send(self, opcode: int, *args: int) -> bool:
+        if not (self.link and self.link.connected):
+            return False
+        if opcode in CONFIG_COMMANDS:
+            self._mark_config_change(opcode)
+        try:
             self.link.send(opcode, *args)
+            self._sent[opcode] = list(args)
+            return True
+        except Exception as exc:  # noqa: BLE001 - shown as a link failure
+            self._errors += 1
+            self._alert("link", f"command send failed: {exc}")
+            return False
+
+    def _ask_config(self) -> bool:
+        """GET_CONFIG, remembering which epoch of commands it will confirm."""
+        epoch = self._cfg_epoch
+        self._cfg_asks.append(epoch)
+        if not self._send(link.CMD_GET_CONFIG):
+            self._cfg_asks.pop()
+            return False
+        self._cfg_need_ask = False
+        return True
+
+    def _close_link(self, old: link.Link) -> bool:
+        try:
+            done = old.close(timeout=LINK_CLOSE_S)
+        except Exception as exc:  # noqa: BLE001 - shutdown must continue
+            self._errors += 1
+            self._alert("link", f"link close failed: {exc}")
+            done = False
+        if not done or not old.finished:
+            self._closing = old
+            self._closing_until = time.perf_counter() + LINK_CLOSE_S
+            self.after(50, self._poll_closing)
+        return done and old.finished
+
+    def _poll_closing(self) -> None:
+        old = self._closing
+        if old is None:
+            return
+        if old.finished:
+            self._closing = None
+            if self._closing_app:
+                self._finish_close()
+            return
+        if time.perf_counter() < self._closing_until:
+            self.after(50, self._poll_closing)
+            return
+        self._alert("link", "link close is still pending")
+        if self._closing_app:
+            # The link is already CLOSED and its worker is a daemon. Do not
+            # hold the window open forever for a transport that is wedged.
+            self._closing = None
+            self._finish_close()
+            return
+        self.after(100, self._poll_closing)
 
     def _toggle_conn(self) -> None:
         if self.link:
-            self.link.close()
+            old = self.link
+            self._send(link.CMD_STREAM_STOP)
+            self._finish_recording("disconnect")
+            self._close_link(old)
             self.link = None
             self._dev_sent = {}
             self._notch_sent = None
             self._rate_change = None
+            self._synced = False
+            self._forget_samples()
             self.btn_conn.config(text="Connect")
             self.status.config(text="not connected", fg=DIM)
+            self._update_buttons()
+            return
+
+        if self._closing is not None and not self._closing.finished:
+            self.status.config(text="previous link is still closing",
+                               fg="#ff6b6b")
             return
 
         try:
@@ -563,23 +786,30 @@ class App(tk.Tk):
 
     def _toggle_stream(self) -> None:
         start = self.btn_stream["text"].startswith("Start")
-        self.btn_stream.config(text="Stop streaming" if start
-                               else "Start streaming")
+        if start and not (self.link and self.link.connected and self._synced
+                          and self.rate in RATES
+                          and self._rate_change is None):
+            return
         if self._rate_change is not None:
             # The stream is stopped for the change, which starts it again
             # when it finishes - or now does not.
             self._rate_change["resume"] = start
         elif start:
+            self.btn_stream.config(text="Stop streaming")
             self._begin_stream()
         else:
+            self.btn_stream.config(text="Start streaming")
             self._send(link.CMD_STREAM_STOP)
+            self._end_segment("stream stopped")
+        self._update_buttons()
 
     def _begin_stream(self) -> None:
         """Start the stream afresh: nothing from before it is kept."""
         self._forget_samples()
         self.chain.reset()
         self._settle_until = time.time() + self.chain.settling_seconds
-        self._send(link.CMD_STREAM_START)
+        if self._send(link.CMD_STREAM_START):
+            self._open_segment("stream started")
 
     def _forget_samples(self) -> None:
         """
@@ -596,6 +826,17 @@ class App(tk.Tk):
         self.lost = 0
         self._overrun_t = 0.0
         self.started_at = time.time()
+
+        # The break itself is not a loss - the device was stopped, not
+        # dropping samples - so the next batch is never diffed against the
+        # one before the gap. Old-rate measurements do not belong in a new
+        # rate's window either.
+        self._prev_batch = None
+        self._last_sample_ts = None
+        self._periods.clear()
+        self.period_us = 1e6 / self.rate
+        self._restarted = True
+        self._clear_alert("timing")
 
     def _reset_traces(self) -> None:
         """
@@ -655,28 +896,30 @@ class App(tk.Tk):
         if change is None and new == self.rate:
             return
 
-        self.rate = new
-        self.chain.set_rate(new)
-        self._forget_samples()
-        self._dev_sent = {}
-
         if not (self.link and self.link.connected):
+            self.rate = new
+            self.chain.set_rate(new)
+            self._forget_samples()
+            self._dev_sent = {}
             return  # the device's own rate is taken when it connects
 
         streaming = self.btn_stream["text"].startswith("Stop")
         if change is None and streaming:
             self._send(link.CMD_STREAM_STOP)
+            self._end_segment("rate change")
 
-        self._send(link.CMD_SET_RATE, new & 0xFF, new >> 8)
-        self._send(link.CMD_GET_CONFIG)
+        if not self._send(link.CMD_SET_RATE, new & 0xFF, new >> 8):
+            return
+        self._forget_samples()
+        self._dev_sent = {}
         self._rate_change = {
             "rate": new,
             "resume": change["resume"] if change else streaming,
-            # One answer per GET_CONFIG sent; the last one decides.
-            "answers": (change["answers"] if change else 0) + 1,
-            "retries": 0,
+            "epoch": self._cfg_epoch,
+            "retries": change["retries"] if change else 0,
             "since": time.perf_counter(),
         }
+        self._ask_config()
         self.status.config(text=f"switching to {new} SPS...", fg="#ffd866")
 
     def _rate_change_overdue(self, now: float) -> None:
@@ -686,36 +929,98 @@ class App(tk.Tk):
             return
         if change["retries"] < 2:
             change["retries"] += 1
-            change["answers"] = 1
             change["since"] = now
-            self._send(link.CMD_GET_CONFIG)
+            self._ask_config()
             return
         self._rate_change = None
-        if change["resume"]:
-            self._begin_stream()
-        self.status.config(text="no answer to the rate change - press Reset "
-                                "if the stream does not come back",
+        self._synced = False
+        self._cfg_need_ask = True
+        self._cfg_ask_t = -math.inf
+        self.btn_stream.config(text="Start streaming")
+        self._alert("rate", "rate change was not confirmed; streaming stopped")
+        self.status.config(text="no answer to the rate change - press Reset",
                            fg="#ff6b6b")
+        self._update_buttons()
+
+    def _begin_sync(self) -> None:
+        """
+        A fresh link answers for nothing yet: the rate that times and filters
+        every sample, and everything else this app shows, is still whatever
+        was last known, or the app's defaults. Nothing is trusted - and no
+        EEG sample taken - until the device itself confirms it (R4-HOST-07).
+        """
+        self._synced = False
+        self._cfg_tries = 0
+        self._cfg_ask_t = -math.inf  # ask on the very next _pump
+        self._cfg_epoch = 0
+        self._cfg_confirmed = -1
+        self._cfg_asks.clear()
+        self._cfg_need_ask = True
+        self._sent = {}
+        self._clear_alert("rate")
+        self._clear_alert("link")
+        self._update_buttons()
+
+    def _sync_overdue(self, now: float) -> None:
+        """Retry GET_CONFIG until it is answered; alert once it looks stuck."""
+        if self._synced or not (self.link and self.link.connected):
+            return
+        if now - self._cfg_ask_t < SYNC_RETRY_S:
+            return
+        self._cfg_ask_t = now
+        self._cfg_tries += 1
+        if self._ask_config():
+            self._cfg_need_ask = False
+        if self._cfg_tries >= SYNC_TRIES:
+            self._alert("sync", f"no answer from the device after "
+                                f"{self._cfg_tries} tries - check the "
+                                "connection")
 
     def _reset_link(self) -> None:
         """Stop everything and reconnect, without restarting the app."""
         if self.link:
+            old = self.link
             try:
                 self.link.send(link.CMD_STREAM_STOP)
             except Exception:  # noqa: BLE001
                 pass
-            self.link.close()
+            self._finish_recording("link reset")
+            self._close_link(old)
             self.link = None
 
         self.btn_conn.config(text="Connect")
         self.btn_stream.config(text="Start streaming")
         self._was_connected = False
+        self._synced = False
         self._dev_sent = {}
         self._notch_sent = None
         self._rate_change = None
         self.chain.reset()
         self._forget_samples()
+        self._update_buttons()
         self.status.config(text="link reset - press Connect", fg="#ffd866")
+
+    def _handle_link_lost(self) -> None:
+        """Make an unexpected transport loss a visible, safe stop."""
+        old = self.link
+        reason = getattr(old, "reason", None) or "transport ended"
+        self._link_msg = reason
+        self._finish_recording(f"link lost: {reason}")
+        if old is not None:
+            self._close_link(old)
+            self.link = None
+        self._was_connected = False
+        self._synced = False
+        self._cfg_asks.clear()
+        self._cfg_need_ask = False
+        self._rate_change = None
+        self._dev_sent = {}
+        self._notch_sent = None
+        self._forget_samples()
+        self.btn_conn.config(text="Connect")
+        self.btn_stream.config(text="Start streaming")
+        self._alert("link", f"link lost: {reason}")
+        self._update_buttons()
 
     def _set_filter_site(self) -> None:
         """
@@ -804,11 +1109,13 @@ class App(tk.Tk):
         mux = {"Electrodes": link.MUX_NORMAL,
                "Shorted (noise)": link.MUX_SHORTED,
                "Test signal": link.MUX_TEST}[self.src_var.get()]
+        self.sources = [mux] * link.CHANNELS
         self._send(link.CMD_SET_INPUT, mux, 0)
         self.chain.reset()
 
     def _set_gain(self) -> None:
         self.gain = int(self.gain_var.get())
+        self.gains = [self.gain] * link.CHANNELS
         mux = {"Electrodes": link.MUX_NORMAL,
                "Shorted (noise)": link.MUX_SHORTED,
                "Test signal": link.MUX_TEST}[self.src_var.get()]
@@ -839,6 +1146,7 @@ class App(tk.Tk):
         self.imu_flags_seen = 0
 
     def _rebuild_chain(self) -> None:
+        self._mark_host_change("host filter change")
         hp = self.hp_var.get()
         lp = self.lp_var.get()
         nz = self.hnotch_var.get()
@@ -869,6 +1177,7 @@ class App(tk.Tk):
             self._settle_until = time.time() + self.chain.settling_seconds
 
     def _set_car_mask(self) -> None:
+        self._mark_host_change("host average mask change")
         self.chain.car_mask = np.array([v.get() for v in self.in_avg],
                                        dtype=bool)
         self._push_device_chain()
@@ -879,54 +1188,251 @@ class App(tk.Tk):
         self.car_hint.config(text="tick 'in average' on 2 or more channels"
                              if self.chain.car and few else "")
 
+    # ------------------------------------------------------------ alerts --
+
+    def _alert(self, key: str, message: str) -> None:
+        """
+        Raise a persistent, red alert under `key`. Shown until `_clear_alert`
+        says the condition is over. Clicking the alert away only hides the
+        current wording; if the same key is cleared and then raised again -
+        a new occurrence, not the one the owner already saw - it reappears.
+        """
+        if self._alerts.get(key) != message:
+            self._dismissed.discard(key)
+        self._alerts[key] = message
+        self._show_alerts()
+
+    def _clear_alert(self, key: str) -> None:
+        if self._alerts.pop(key, None) is not None:
+            self._dismissed.discard(key)
+            self._show_alerts()
+
+    def _dismiss_alerts(self) -> None:
+        self._dismissed |= self._alerts.keys()
+        self._show_alerts()
+
+    def _show_alerts(self) -> None:
+        shown = [self._alerts[k] for k in self._alerts if k not in self._dismissed]
+        if shown:
+            self.alert.config(text="\n".join(shown))
+            self.alert.pack(fill=tk.X, pady=(6, 0))
+        else:
+            self.alert.pack_forget()
+
+    def _update_buttons(self) -> None:
+        """
+        Record is only ever meaningful once the device's settings are known:
+        started earlier, the file's header would describe a guess, not the
+        device (R4-HOST-07). Recording in progress is left alone here - it is
+        stopped, loudly, by whatever ends it (see _end_segment).
+        """
+        can_start = self._synced and self.link is not None and self.link.connected
+        can_stream = can_start and self._rate_change is None
+        rec_state = tk.NORMAL if (self._rec is not None or can_start) \
+            else tk.DISABLED
+        stream_start = self.btn_stream["text"].startswith("Start")
+        stream_state = tk.NORMAL if (can_stream if stream_start
+                                     else bool(self.link and self.link.connected)) \
+            else tk.DISABLED
+        key = (rec_state, stream_state)
+        if self._buttons != key:
+            self._buttons = key
+            self.btn_rec.config(state=rec_state)
+            self.btn_stream.config(state=stream_state)
+
     # ---------------------------------------------------------- recording --
 
-    def _toggle_record(self) -> None:
-        if self.recorder is not None:
-            self._rec_file.close()
-            self._imu_file.close()
+    def _config_snapshot(self) -> dict:
+        cfg = self.device_config[1] if self.device_config else None
+        raw_cfg = self.device_config[0].hex() if self.device_config else None
+        return {
+            "captured_at": _utc(),
+            "device": {"raw_response_hex": raw_cfg, "decoded": _jsonable(cfg)},
+            "host": {
+                "version": self._version,
+                "rate": self.rate,
+                "gains": list(self.gains),
+                "sources": list(self.sources),
+                "filters_on_device": self.filters_on_device,
+                "highpass_hz": self.chain.highpass_hz,
+                "lowpass_hz": self.chain.lowpass_hz,
+                "notch_hz": self.chain.notch_hz,
+                "notch_q": self.chain.notch_q,
+                "notch_harmonic": self.chain.notch_harmonic,
+                "notch_track": self.chain.notch_track,
+                "car": self.chain.car,
+                "car_mask": self.chain.car_mask.tolist(),
+                "commands": {str(k): list(v) for k, v in self._sent.items()},
+            },
+        }
+
+    def _write_sidecar(self) -> bool:
+        if self._rec is None:
+            return True
+        try:
+            data = {
+                "format": 1,
+                "started_at": self._rec["started_at"],
+                "first_sample_at": self._rec.get("first_sample_at"),
+                "ended_at": self._rec.get("ended_at"),
+                "end_reason": self._rec.get("end_reason"),
+                "host": self._version,
+                "segments": self._rec["segments"],
+            }
+            self._rec["sidecar"].write_text(
+                json.dumps(_jsonable(data), indent=2) + "\n",
+                encoding="utf-8")
+            return True
+        except (OSError, TypeError, ValueError) as exc:
+            self._errors += 1
+            self._alert("recording", f"recording metadata failed: {exc}")
+            self._rec["metadata_failed"] = True
+            return False
+
+    def _open_segment(self, reason: str) -> bool:
+        if (self._rec is None or self.recorder is not None or not self._synced
+                or self._cfg_confirmed != self._cfg_epoch):
+            return False
+
+        index = self._rec["next_index"]
+        self._rec["next_index"] += 1
+        base = self._rec["base"]
+        csv_path = base.with_name(f"{base.name}_seg{index:03d}.csv")
+        motion_path = base.with_name(f"{base.name}_motion_seg{index:03d}.csv")
+        try:
+            rec_file = csv_path.open("w", newline="", encoding="utf-8")
+            imu_file = motion_path.open("w", newline="", encoding="utf-8")
+        except OSError as exc:
+            for f in locals().get("rec_file", None), locals().get("imu_file", None):
+                if f is not None:
+                    f.close()
+            self._errors += 1
+            self._alert("recording", f"recording could not start: {exc}")
+            return False
+
+        self._rec["current"] = {
+            "index": index,
+            "reason": reason,
+            "started_at": _utc(),
+            "path": str(csv_path),
+            "motion_path": str(motion_path),
+            "config": self._config_snapshot(),
+            "rows": 0,
+            "motion_rows": 0,
+            "start_rows": self.rec_rows,
+            "start_motion_rows": self.imu_rows,
+        }
+        self._rec["open_files"] = (rec_file, imu_file)
+        self._rec_file = rec_file
+        self.recorder = csv.writer(rec_file)
+        self._imu_file = imu_file
+        self.imu_recorder = csv.writer(imu_file)
+        try:
+            self.recorder.writerow(["# SwiftEEG raw counts",
+                                    f"segment={index:03d}",
+                                    f"reason={reason}"])
+            self.recorder.writerow(
+                ["ts_us", "seq", "flags", "missing_before"]
+                + [f"ch{i + 1}_{SITES[i]}" for i in range(link.CHANNELS)])
+            self.imu_recorder.writerow(
+                ["# SwiftEEG motion", f"segment={index:03d}",
+                 f"reason={reason}"])
+            self.imu_recorder.writerow(
+                ["ts_us", "seq", "ax_g", "ay_g", "az_g", "gx_dps",
+                 "gy_dps", "gz_dps", "flags"])
+        except (OSError, ValueError) as exc:
+            self._errors += 1
+            self._alert("recording", f"recording could not start: {exc}")
+            self._rec["current"] = None
+            self._rec.pop("open_files", None)
             self.recorder = None
             self.imu_recorder = None
             self._rec_file = None
             self._imu_file = None
-            self.btn_rec.config(text="Record")
+            for stream_file in (rec_file, imu_file):
+                try:
+                    stream_file.close()
+                except OSError:
+                    pass
+            return False
+
+        if not self._write_sidecar():
+            self._finish_recording("recording metadata I/O error")
+            return False
+        return True
+
+    def _end_segment(self, reason: str) -> None:
+        if self._rec is None:
+            return
+        current = self._rec.get("current")
+        if current is None and self.recorder is None and self.imu_recorder is None:
             return
 
-        stamp = time.strftime("swifteeg_%Y%m%d_%H%M%S")
-        name = stamp + ".csv"
-        self._rec_file = open(pathlib.Path.cwd() / name, "w", newline="",
-                              encoding="utf-8")
-        self.recorder = csv.writer(self._rec_file)
+        self.recorder = None
+        self.imu_recorder = None
+        self._rec_file = None
+        self._imu_file = None
+        files = self._rec.pop("open_files", ())
+        for stream_file in files:
+            try:
+                stream_file.close()
+            except OSError as exc:
+                self._errors += 1
+                self._alert("recording", f"recording close failed: {exc}")
 
-        # Raw counts, not microvolts: the scale depends on the gain, and a
-        # recording that has already been filtered cannot be un-filtered.
-        # With the filters on the device this still holds - it sends raw
-        # alongside, and raw is what is kept.
-        self.recorder.writerow(
-            ["# SwiftEEG raw counts", f"rate={self.rate}", f"gain={self.gain}",
-             f"lsb_uv={link.lsb_uv(self.gain):.9f}"])
-        self.recorder.writerow(
-            ["ts_us", "seq"] + [f"ch{i + 1}_{SITES[i]}"
-                                for i in range(link.CHANNELS)])
+        if current is not None:
+            current["ended_at"] = _utc()
+            current["end_reason"] = reason
+            current["rows"] = self.rec_rows - current.get("start_rows", 0)
+            current["motion_rows"] = self.imu_rows - current.get(
+                "start_motion_rows", 0)
+            self._rec["segments"].append(current)
+            self._rec["current"] = None
+        metadata_ok = self._write_sidecar()
+        if not metadata_ok and reason != "recording metadata I/O error":
+            self._finish_recording("recording metadata I/O error")
+
+    def _finish_recording(self, reason: str) -> None:
+        if self._rec is None:
+            return
+        self._end_segment(reason)
+        if self._rec is None:
+            return
+        self._rec["ended_at"] = _utc()
+        self._rec["end_reason"] = reason
+        self._write_sidecar()
+        self._rec = None
+        self.btn_rec.config(text="Record")
+        self._update_buttons()
+
+    def _toggle_record(self) -> None:
+        if self._rec is not None:
+            self._finish_recording("user stopped")
+            self.status.config(text="recording stopped", fg=DIM)
+            return
+
+        if not (self._synced and self.link and self.link.connected):
+            return  # belt and braces - the button is disabled for this too
+
+        stamp = datetime.datetime.now().strftime(
+            "swifteeg_%Y%m%d_%H%M%S_%f")
+        base = pathlib.Path.cwd() / stamp
+        self._rec = {
+            "base": base,
+            "sidecar": base.with_suffix(".json"),
+            "started_at": _utc(),
+            "first_sample_at": None,
+            "segments": [],
+            "next_index": 1,
+            "current": None,
+        }
         self.rec_rows = 0
-
-        # Motion in a file of its own. ts_us in both files is the device's
-        # TIMER1, so the two line up sample for sample.
-        self._imu_file = open(pathlib.Path.cwd() / (stamp + "_motion.csv"),
-                              "w", newline="", encoding="utf-8")
-        self.imu_recorder = csv.writer(self._imu_file)
-        self.imu_recorder.writerow(
-            ["# SwiftEEG motion", "accel in g, gyro in degrees/s",
-             "ts_us on the same clock as the EEG file",
-             "flags: 1 time from a poll, not the sensor's interrupt; "
-             "2 samples lost just before"])
-        self.imu_recorder.writerow(
-            ["ts_us", "seq", "ax_g", "ay_g", "az_g", "gx_dps", "gy_dps",
-             "gz_dps", "flags"])
         self.imu_rows = 0
-
-        self.btn_rec.config(text="Stop rec")
-        self.status.config(text=f"recording {name}", fg="#5ed18b")
+        if self._open_segment("recording started"):
+            self.btn_rec.config(text="Stop rec")
+            self.status.config(text=f"recording {stamp}", fg="#5ed18b")
+        else:
+            self._rec = None
 
     # -------------------------------------------------------------- loop --
 
@@ -982,24 +1488,35 @@ class App(tk.Tk):
         if not self.link:
             return
 
+        state = getattr(self.link, "state",
+                        link.LINK_CONNECTED if self.link.connected
+                        else link.LINK_CONNECTING)
         # Ask what the device is actually set to the moment the link comes
         # up, not on a timer: a Bluetooth scan takes longer than any fixed
         # delay worth waiting, and a request sent early is simply lost.
         if self.link.connected and not self._was_connected:
             self._was_connected = True
-            self._send(link.CMD_GET_CONFIG)
+            self._link_msg = ""
+            self._begin_sync()
+        elif state == link.LINK_LOST:
+            reason = getattr(self.link, "reason", None) or "transport ended"
+            if self._link_msg != reason:
+                self._handle_link_lost()
         elif not self.link.connected:
             self._was_connected = False
 
         self._rate_change_overdue(now)
+        self._sync_overdue(now)
 
         while True:
             try:
                 msg = self.link.status.get_nowait()
             except queue.Empty:
                 break
-            colour = "#ff6b6b" if "fail" in msg or "not found" in msg \
-                else "#5ed18b"
+            lost = (getattr(self.link, "state", None) == link.LINK_LOST
+                    or "link" in self._alerts)
+            colour = "#ff6b6b" if lost or "fail" in msg \
+                or "not found" in msg else "#5ed18b"
             self.status.config(text=msg, fg=colour)
 
         block_raw = []
@@ -1009,47 +1526,52 @@ class App(tk.Tk):
                 f = self.link.frames.get_nowait()
             except queue.Empty:
                 break
+            try:
+                if f.type == link.TYPE_DATA:
+                    if self._rate_change is not None or not self._synced:
+                        # Sampled at the old rate, before a restart, or
+                        # before the device confirmed its current rate.
+                        continue
+                    got = link.decode_data(f.payload)
+                    if got is None:
+                        raise ValueError("invalid DATA payload")
+                    ts, seq, _, counts, uv = got
+                    if (counts is None or counts.ndim != 2
+                            or counts.shape[1] != link.CHANNELS
+                            or counts.shape[0] == 0):
+                        raise ValueError("invalid DATA sample shape")
+                    self.frames += 1
 
-            if f.type == link.TYPE_DATA:
-                if self._rate_change is not None:
-                    continue  # sampled at the old rate, or before the restart
-                got = link.decode_data(f.payload)
-                if got is None:
-                    continue
-                ts, seq, _, counts, uv = got
-                if counts is None:
-                    # Microvolts alone, left by another host: nothing to
-                    # record or check until the config reply fixes it.
-                    continue
-                self.frames += 1
+                    missing = self._note_data(ts, seq, len(counts), f.flags)
+                    if f.flags & link.FLAG_SETTLING:
+                        self._dev_settle_t = now
+                    if f.flags & link.FLAG_DSP_INVALID:
+                        self._alert("device_dsp",
+                                    "device DSP reported an invalid channel")
 
-                if self.last_seq is not None and seq != self.last_seq:
-                    self.gaps += 1
-                self.last_seq = seq + len(counts)
-
-                if f.flags & link.FLAG_SETTLING:
-                    self._dev_settle_t = now
-
-                # Frames the device threw away before this sample, because it
-                # could not hand them over in time. They are gone; without
-                # this the trace carries on as though nothing happened, a
-                # little shorter than the clock says it should be.
-                if f.flags & link.FLAG_OVERRUN:
-                    self.lost += 1
-                    self._overrun_t = now
-
-                block_raw.append((ts, seq, counts, uv))
-            elif f.type == link.TYPE_IMU:
-                got = link.decode_imu(f.payload)
-                if got is not None:
+                    block_raw.append((ts, seq, counts, uv, f.flags, missing))
+                elif f.type == link.TYPE_IMU:
+                    got = link.decode_imu(f.payload)
+                    if got is None:
+                        raise ValueError("invalid IMU payload")
+                    _, _, imu_period, imu_counts, accel_g, gyro_dps, _ = got
+                    if (imu_counts.ndim != 2 or imu_counts.shape[1] != 6
+                            or imu_counts.shape[0] == 0 or imu_period <= 0
+                            or accel_g <= 0 or gyro_dps <= 0):
+                        raise ValueError("invalid IMU sample shape")
                     imu_raw.append(got)
-            elif f.type == link.TYPE_EVT:
-                event = link.decode_event(bytes(f.payload))
-                if event is not None and event["event"] == "mains":
-                    self.chain.follow_mains(
-                        event["hz"], event["hz"] if event["moved"] else None)
-            elif f.type == link.TYPE_RSP:
-                self._on_response(bytes(f.payload))
+                elif f.type == link.TYPE_EVT:
+                    event = link.decode_event(bytes(f.payload))
+                    if event is not None and event["event"] == "mains":
+                        self.chain.follow_mains(
+                            event["hz"],
+                            event["hz"] if event["moved"] else None)
+                elif f.type == link.TYPE_RSP:
+                    self._on_response(bytes(f.payload))
+            except Exception as exc:  # noqa: BLE001 - isolate one bad frame
+                self._errors += 1
+                self._malformed_frames += 1
+                self._alert("frame", f"ignored malformed frame: {exc}")
 
         # Motion first, so the EEG that came with it is measured against it
         # rather than against the batch before.
@@ -1096,27 +1618,63 @@ class App(tk.Tk):
         if cfg is None:
             return
 
+        asked_epoch = (self._cfg_asks.popleft() if self._cfg_asks
+                       else self._cfg_epoch)
+        if asked_epoch < self._cfg_epoch:
+            # This reply describes the device before a later command. It is
+            # useful only as evidence that the link still answers.
+            return
+
+        self._cfg_confirmed = asked_epoch
+        self.device_config = (bytes(p), cfg)
+        self._cfg_need_ask = False
+        self._cfg_tries = 0
+        self._clear_alert("sync")
+
+        if "chset" not in cfg:
+            self._synced = False
+            self._cfg_need_ask = True
+            self._alert("sync", "device configuration is incomplete")
+            self._update_buttons()
+            return
+
         change = self._rate_change
         if change is not None:
-            change["answers"] -= 1
-            if change["answers"] > 0:
-                return  # from before a later restart; the last answer decides
             if cfg["rate"] != change["rate"] and change["retries"] < 2:
                 change["retries"] += 1
-                change["answers"] = 1
                 change["since"] = time.perf_counter()
-                self._send(link.CMD_GET_CONFIG)
+                self._ask_config()
                 return
-            self._rate_change = None
+            if cfg["rate"] != change["rate"]:
+                self._rate_change = None
+                self._synced = False
+                self.btn_stream.config(text="Start streaming")
+                self._alert("rate", f"device stayed at {cfg['rate']} SPS; "
+                            f"requested {change['rate']} SPS was not applied")
+                self._update_buttons()
+                return
 
         sps = cfg["rate"]
-        if sps in (250, 500, 1000):
-            self.rate_var.set(str(sps))
-            if sps != self.rate:
-                self.rate = sps
-                self._forget_samples()
-                self._dev_sent = {}
-            self.chain.set_rate(sps)
+        if sps not in RATES:
+            # Never silently carry on at the app's last-known rate: nothing
+            # here can time or filter samples correctly at a rate it does not
+            # support, so none are taken until the device reports one it does
+            # (R4-HOST-07).
+            self._synced = False
+            self.btn_stream.config(text="Start streaming")
+            self._alert("rate", f"device is at {sps} SPS - only 250/500/"
+                                "1000 are supported here; streaming refused")
+            self._update_buttons()
+            return
+
+        self._clear_alert("rate")
+        self.rate_var.set(str(sps))
+        if sps != self.rate:
+            self.rate = sps
+            self._forget_samples()
+            self._dev_sent = {}
+        self.chain.set_rate(sps)
+        self._synced = True
 
         # The stream this app needs: raw, plus the device's microvolts when
         # the filters run there. A board left on anything else - an older
@@ -1126,12 +1684,19 @@ class App(tk.Tk):
             self._send(link.CMD_SET_ENCODING, want)
 
         if "gains" in cfg:
-            self.gain = cfg["gains"][0] or 24
+            if any(g is None for g in cfg["gains"]):
+                self._synced = False
+                self._alert("sync", "device reported an invalid channel gain")
+                self._update_buttons()
+                return
+            self.gains = [int(g) for g in cfg["gains"]]
+            self.gain = self.gains[0]
             self.gain_var.set(str(self.gain))
+            self.sources = list(cfg.get("mux", self.sources))
             self.src_var.set({link.MUX_NORMAL: "Electrodes",
                               link.MUX_SHORTED: "Shorted (noise)",
                               link.MUX_TEST: "Test signal"}.get(
-                                  cfg["mux"][0], "Electrodes"))
+                                  self.sources[0], "Electrodes"))
 
         # Motion sensor, from firmware that has one. Older firmware sends
         # none of it.
@@ -1165,16 +1730,38 @@ class App(tk.Tk):
                     self._dev_sent = {}
                     self._push_device_chain()
 
+        # Corrective commands move the configuration epoch. Do not take
+        # samples, open a segment, or resume a rate change until their next
+        # GET_CONFIG confirms the new state.
+        if self._cfg_confirmed != self._cfg_epoch:
+            self._synced = False
+            self._cfg_need_ask = True
+            self._update_buttons()
+            self.status.config(text="applying device configuration...",
+                               fg="#ffd866")
+            return
+
         if change is not None:
             # The filters before the stream: the device runs commands in
             # order, so its first sample at the new rate is already filtered.
             self._push_device_chain()
+            if self._cfg_confirmed != self._cfg_epoch:
+                self._synced = False
+                self._cfg_need_ask = True
+                self._update_buttons()
+                self.status.config(text="applying device configuration...",
+                                   fg="#ffd866")
+                return
+            self._rate_change = None
             if change["resume"]:
                 self._begin_stream()
+            else:
+                self._open_segment("configuration confirmed")
             state = "streaming" if change["resume"] else "ready"
             self.status.config(text=f"{state} at {sps} SPS", fg="#5ed18b")
             return
 
+        self._open_segment("configuration confirmed")
         self.status.config(text=f"connected - {sps} SPS, gain {self.gain}",
                            fg="#5ed18b")
 
@@ -1193,35 +1780,160 @@ class App(tk.Tk):
         what = "filters" if p[0] == link.CMD_SET_FILTER else "common average"
         self._back_to_pc(f"the device refused the {what} - back on the PC")
 
+    def _note_data(self, ts0: float, seq0: int, count: int,
+                   flags: int) -> int:
+        """Record continuity and return samples missing before this batch."""
+        period = self.period_us if self.period_us > 0 else 1e6 / self.rate
+        missing_seq = 0
+        missing_time = 0
+
+        if self.last_seq is not None:
+            delta = (int(seq0) - int(self.last_seq)) & 0xFFFFFFFF
+            if 0 < delta < 0x80000000:
+                missing_seq = delta
+
+        if self._last_sample_ts is not None:
+            dt = float(ts0) - self._last_sample_ts
+            if dt > 1.5 * period:
+                missing_time = max(0, round(dt / period) - 1)
+
+        missing = max(missing_seq, missing_time)
+        if flags & link.FLAG_OVERRUN:
+            self._overrun_t = time.perf_counter()
+            # A flag without a measurable hole still means at least one
+            # sample was lost; keep the count conservative and visible.
+            missing = max(1, missing)
+
+        if missing:
+            self.gaps += 1
+            self.lost += missing
+
+        self.last_seq = (int(seq0) + count) & 0xFFFFFFFF
+        self._last_sample_ts = float(ts0) + (count - 1) * period
+        return missing
+
+    def _track_period(self, ts0: float, seq0: int, count: int,
+                      missing_before: int = 0) -> None:
+        """
+        Measure the real sample period from consecutive batches' device
+        timestamps and sequence numbers, rather than trust the rate the
+        device was last told to run at (R4-HOST-07). The median of a rolling
+        window shrugs off the jitter a single batch gap shows; a nominal
+        period stands in until there are enough measurements, and a stream
+        restart's first batch is never diffed against the one before the gap
+        - see _forget_samples.
+        """
+        if self._restarted:
+            self._restarted = False
+        elif self._prev_batch is not None and missing_before == 0:
+            pts, pseq, _ = self._prev_batch
+            dseq = (int(seq0) - int(pseq)) & 0xFFFFFFFF
+            dt = ts0 - pts
+            # Only a sane, forward gap is a period measurement. A huge one is
+            # a stall (counted as loss elsewhere, not folded into the
+            # median); zero or backward is a duplicate or a corrupt batch.
+            if 0 < dseq < 0x80000000 and 0 < dt <= 5e5 * dseq:
+                self._periods.append(dt / dseq)
+
+        self._prev_batch = (ts0, seq0, count)
+
+        if len(self._periods) >= PERIOD_MIN:
+            self.period_us = statistics.median(self._periods)
+            nominal = 1e6 / self.rate
+            if abs(self.period_us - nominal) > PERIOD_TOLERANCE * nominal:
+                self._alert("timing", "measured sample period "
+                            f"{1e6 / self.period_us:.1f} SPS does not match "
+                            f"the device's reported {self.rate} SPS - "
+                            "timestamps and filters may be wrong")
+            else:
+                self._clear_alert("timing")
+
+    def _recording_io_error(self, exc: Exception) -> None:
+        """Stop only the recording when its storage fails; keep plotting."""
+        self._errors += 1
+        self._alert("recording", f"recording stopped: {exc}")
+        if self._rec is not None:
+            self._finish_recording("recording I/O error")
+        else:
+            self.recorder = None
+            self.imu_recorder = None
+            self._rec_file = None
+            self._imu_file = None
+
+    def _flush_recording(self) -> None:
+        if self._rec_file is None:
+            return
+        now = time.perf_counter()
+        if now < self._flush_t:
+            return
+        try:
+            self._rec_file.flush()
+            self._imu_file.flush()
+            self._flush_t = now + 1.0
+        except (OSError, ValueError) as exc:
+            self._recording_io_error(exc)
+
     def _consume(self, blocks) -> None:
-        counts = np.vstack([c for _, _, c, _ in blocks])
-        scale = link.lsb_uv(self.gain)
+        if not blocks:
+            return
+
+        # Keep compatibility with small host tests using the old tuple, while
+        # the live pump also carries flags and loss before this batch.
+        normalized = []
+        for block in blocks:
+            if len(block) == 4:
+                normalized.append((*block, 0, 0))
+            elif len(block) == 6:
+                normalized.append(block)
+            else:
+                raise ValueError("invalid EEG block")
+        blocks = normalized
+        counts = np.vstack([c for _, _, c, _, _, _ in blocks])
+        scales = np.asarray(
+            [link.lsb_uv(g if g else 24) for g in self.gains],
+            dtype=np.float64)
+
+        if self._rec is not None and self._rec.get("first_sample_at") is None:
+            self._rec["first_sample_at"] = _utc()
 
         self.samples += len(counts)
 
+        for ts0, seq0, vals, _, _, missing in blocks:
+            self._track_period(ts0, seq0, len(vals), missing)
+
         if self.recorder is not None:
             # Each batch carries the hardware timestamp of its own first
-            # sample, and the rest follow at the sample period. Stamping every
-            # row from the first batch of a delivery, a microsecond apart,
-            # put samples tens of milliseconds from where they belong -
-            # enough to smear an ERP.
-            period_us = 1e6 / self.rate
-            for ts0, seq0, vals, _ in blocks:
-                for i, row in enumerate(vals):
-                    self.recorder.writerow(
-                        [round(ts0 + i * period_us), seq0 + i, *row.tolist()])
-            self.rec_rows += len(counts)
+            # sample, and the rest follow at the measured sample period.
+            # Stamping every row from the first batch of a delivery, a
+            # microsecond apart, put samples tens of milliseconds from where
+            # they belong - enough to smear an ERP. The nominal rate is
+            # close but not exact, so rows now follow the period actually
+            # measured from the stream, not the device's rounded-off answer.
+            written = 0
+            try:
+                for ts0, seq0, vals, _, flags, missing in blocks:
+                    for i, row in enumerate(vals):
+                        self.recorder.writerow(
+                            [round(ts0 + i * self.period_us),
+                             (seq0 + i) & 0xFFFFFFFF, flags,
+                             missing if i == 0 else 0, *row.tolist()])
+                        written += 1
+                self.rec_rows += written
+            except (OSError, ValueError) as exc:
+                self.rec_rows += written
+                self._recording_io_error(exc)
 
         self._check_limits(counts)
         for ch in range(link.CHANNELS):
-            self.dc_mv[ch] = float(np.mean(counts[:, ch])) * scale / 1000.0
+            self.dc_mv[ch] = (float(np.mean(counts[:, ch])) * scales[ch]
+                              / 1000.0)
 
-        uv = counts.astype(np.float64) * scale
+        uv = counts.astype(np.float64) * scales
 
         # The device's own output when it is filtering; this chain otherwise,
         # and for any batch still arriving in the old form just after a
         # switch.
-        device = [u for _, _, _, u in blocks]
+        device = [u for _, _, _, u, _, _ in blocks]
         if self.filters_on_device and all(u is not None for u in device):
             out = np.vstack(device).astype(np.float64)
         else:
@@ -1229,14 +1941,15 @@ class App(tk.Tk):
 
         # Where the newest batch sits on the device clock. The motion lanes
         # are placed by time, and this is what gives them the EEG's axis.
-        last_ts, _, last_vals, _ = blocks[-1]
+        last_ts, _, last_vals, _, _, _ = blocks[-1]
         self.eeg_anchor = (self.n_total + len(counts) - len(last_vals),
                            float(last_ts))
         self._ring_write(out.T)
 
         if self._imu_newest_us is not None:
-            newest = last_ts + (len(last_vals) - 1) * 1e6 / self.rate
+            newest = last_ts + (len(last_vals) - 1) * self.period_us
             self._imu_behind = (newest - self._imu_newest_us) / 1e6
+        self._flush_recording()
 
     def _check_limits(self, counts: np.ndarray) -> None:
         """
@@ -1287,9 +2000,13 @@ class App(tk.Tk):
     def _consume_imu(self, frames) -> None:
         for ts, seq, period_us, counts, accel_g, gyro_dps, flags in frames:
             n = len(counts)
-            if self.imu_last_seq is not None and seq != self.imu_last_seq:
-                self.imu_gaps += 1
-            self.imu_last_seq = seq + n
+            if self._rec is not None and self._rec.get("first_sample_at") is None:
+                self._rec["first_sample_at"] = _utc()
+            if self.imu_last_seq is not None:
+                delta = (int(seq) - int(self.imu_last_seq)) & 0xFFFFFFFF
+                if delta:
+                    self.imu_gaps += 1
+            self.imu_last_seq = (int(seq) + n) & 0xFFFFFFFF
             self.imu_period_us = period_us
             self.imu_flags_seen |= flags
 
@@ -1300,18 +2017,26 @@ class App(tk.Tk):
             times = ts + np.arange(n) * period_us
 
             if self.imu_recorder is not None:
-                for i in range(n):
-                    a = scaled[i]
-                    self.imu_recorder.writerow(
-                        [round(times[i]), seq + i,
-                         f"{a[0]:.5f}", f"{a[1]:.5f}", f"{a[2]:.5f}",
-                         f"{a[3]:.3f}", f"{a[4]:.3f}", f"{a[5]:.3f}", flags])
-                self.imu_rows += n
+                written = 0
+                try:
+                    for i in range(n):
+                        a = scaled[i]
+                        self.imu_recorder.writerow(
+                            [round(times[i]), (seq + i) & 0xFFFFFFFF,
+                             f"{a[0]:.5f}", f"{a[1]:.5f}",
+                             f"{a[2]:.5f}", f"{a[3]:.3f}",
+                             f"{a[4]:.3f}", f"{a[5]:.3f}", flags])
+                        written += 1
+                    self.imu_rows += written
+                except (OSError, ValueError) as exc:
+                    self.imu_rows += written
+                    self._recording_io_error(exc)
 
             self._imu_write(scaled.T, times)
             if n:
                 self._imu_newest_us = float(times[-1])
                 self._imu_seen_t = time.perf_counter()
+            self._flush_recording()
 
     def _imu_write(self, block: np.ndarray, times: np.ndarray) -> None:
         """block is (6, samples); times are device microseconds."""
@@ -1727,24 +2452,34 @@ class App(tk.Tk):
         self.stats.config(text="\n".join([
             f"{self.samples} samples  {self.samples / el:6.1f} SPS",
             f"{self.frames} frames  {bad} bad  {self.gaps} gaps  "
-            f"{self.lost} lost{rec}",
+            f"{self.lost} samples lost{rec}",
             f"DC mV: {dc}",
             motion,
             site,
             display]))
 
+    def _finish_close(self) -> None:
+        if not self._closing_app or self._closing is not None:
+            return
+        self._closing_app = False
+        self.pacer.close()
+        self.destroy()
+
     def _close(self) -> None:
-        if self.recorder is not None:
-            self._rec_file.close()
-            self._imu_file.close()
-        if self.link:
+        if self._closing_app:
+            return
+        self._closing_app = True
+        self._finish_recording("app closed")
+        old = self.link
+        self.link = None
+        if old is not None:
             try:
-                self.link.send(link.CMD_STREAM_STOP)
+                old.send(link.CMD_STREAM_STOP)
             except Exception:  # noqa: BLE001
                 pass
-            self.link.close()
-        self.pacer.close()
-        self.after(200, self.destroy)
+            self._close_link(old)
+        if self._closing is None:
+            self._finish_close()
 
 
 if __name__ == "__main__":

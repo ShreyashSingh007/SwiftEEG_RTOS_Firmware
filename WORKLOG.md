@@ -16,7 +16,7 @@ was relaxed by the owner on 2026-09-16 for exactly this.)
 - **Review:** COMPLETE (2026-09-17). 58 findings, every critical and high one
   verified against the code. Verdict, fix plan and the owner's decisions are
   in *Verdict and path* below; evidence in `docs/review/2026-09-17/`.
-- **Next:** the owner picks from *Decisions for the owner*. Nothing is fixed
+- **Next:** the owner picks from *Open decisions (owner)*. Nothing is fixed
   until then.
 - **Parked:** `feature/bcg-vitals` - heart rate, breathing and HRV from head
   motion. Works, not on the plan.

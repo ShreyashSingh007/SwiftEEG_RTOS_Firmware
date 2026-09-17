@@ -13,7 +13,7 @@ was relaxed by the owner on 2026-09-16 for exactly this.)
 ## Resume here
 
 - **Work on:** `m1-bringup` - the milestone line.
-- **Review status:** wave 1 done and verified (44 findings, below). Wave 2 (architecture / multiplatform, protocol contract) running. Full reports with file:line evidence: `docs/review/2026-09-17/`.
+- **Review status:** wave 1 done and verified (44 findings, below). Wave 2: protocol contract done and verified (7 findings); architecture / multiplatform running. Full reports with file:line evidence: `docs/review/2026-09-17/`.
 - **In progress:** deep review of the firmware, the desktop app and the link
   between them, plus whether the foundation supports native apps on Windows,
   macOS, iOS and Android with shared native libraries. Verified findings land
@@ -119,6 +119,22 @@ row are in `docs/review/2026-09-17/<prefix>.md`. Nothing is fixed yet.
 | 05 | medium | | One exception in the pump throws away every drained batch, repeatedly; the error goes only to stderr. |
 | 06 | medium | | A dropped link shows green status, no reconnect, recording stays open. |
 | 07 | medium | V | App times and filters by a rate it never confirmed: one GET_CONFIG with no retry, rates above 1 kSPS ignored, the give-up path resumes anyway. |
+
+### Firmware <-> host contract (R5-CONTRACT, code-reviewer)
+
+Byte layouts otherwise match exactly: frame header, CRC, every opcode and
+status value, DATA and IMU headers, all four sample encodings, the full
+GET_CONFIG reply and the SET_FILTER upload.
+
+| ID | Sev | V | Finding |
+|---|---|---|---|
+| 01 | **critical** | V | No version or capability negotiation. GET_INFO carries channels, a hard-coded 0 and the rate - no firmware version, protocol version, device identity or feature list - and both sides silently drop any frame whose version byte differs. Nothing breaks today; the first protocol change makes old apps and new firmware mutually deaf. |
+| 02 | medium | V | A reply payload over 46 bytes is dropped entirely and still answered OK. GET_CONFIG is 9 bytes under that limit. |
+| 03 | medium | | GET_CONFIG readback drops each channel's power-down and SRB2 bits on the host side (only gain and input are decoded). |
+| 04 | medium | | The host library has no generic reply-status decoder: bad-argument, failed and unknown-command replies look like garbled ones. |
+| 05 | low | | The test-signal frequency enum has no host-side definition. |
+| 06 | low | | A command with an empty payload gets no reply at all instead of bad-argument. |
+| 07 | low | | Sample flags are defined twice (pipeline.h, proto.h) with equal values but no compile-time check tying them. |
 
 ### Corrections made during verification
 

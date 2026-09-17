@@ -26,7 +26,7 @@ was relaxed by the owner on 2026-09-16 for exactly this.)
 
 | Branch | Holds | State |
 |---|---|---|
-| `m1-bringup` | M1-M6 milestone line | 3 commits ahead of the `SwiftEEG_RTOS` remote; the push has to be run by the owner |
+| `m1-bringup` | M1-M6 milestone line | 11 commits ahead of the `SwiftEEG_RTOS` remote; phase-A edits are also uncommitted. The push has to be run by the owner |
 | `feature/bcg-vitals` | BCG vitals, `10ec2ab`, branched from `6a094b6` | parked |
 
 ## Open decisions (owner)
@@ -61,7 +61,7 @@ D. **One firmware release** for protocol v2 + pairing/bonding + MCUboot/SMP:
    never touched and recordings stay raw.
 4. **ERP stimulus markers:** a software marker from the PC, or a trigger wire
    into a spare pin. Undecided.
-5. **Push** the three commits on `m1-bringup` (blocked on this side).
+5. **Push** the 11 committed changes on `m1-bringup` after phase A is reviewed (owner action).
 6. Battery: nothing to be done unless asked. The 3.3 V rail reading could be
    exposed over the protocol if wanted.
 7. Electrode impedance meter: parked until the input network values can be
@@ -268,6 +268,21 @@ ceilings), R3-DSP-05 (float32 high-pass at high rates).
 ---
 
 ## Log
+
+### 2026-09-17 - phase A continuation
+
+- Firmware items 8-12 are implemented in the working tree. Main, protocol,
+  DSP, timebase, and pipeline builds passed. No firmware was flashed.
+- Added full CHnSET validation, per-channel re-priming, DC-aware settling,
+  invalid-channel isolation, DSP-invalid reporting, and CAR eligibility.
+- The Windows app now confirms full device configuration, measures timing,
+  records loss flags, isolates bad frames and recording I/O, writes segmented
+  CSV plus JSON metadata, and closes links with a bound.
+- `python tools/proto_ref.py` passed. Other NumPy reference/app checks remain
+  blocked because this shell has no NumPy installation.
+- Reviewer follow-up: `capture_last_us()` uses `timebase_stamp_past_us()`.
+- Owner action remains: review, commit, flash only after hardware readiness,
+  then push the 11 committed changes.
 
 ### 2026-09-17 - decisions, phase A starts
 

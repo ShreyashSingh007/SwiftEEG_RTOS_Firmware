@@ -106,7 +106,7 @@ Repo: `D:\Electronics Projects\EEG Project\SwiftEEG\RTOS Firmware\RTOS`
 
 | Branch | Head | What |
 |---|---|---|
-| `m1-bringup` | `830e21a` (+ this handoff commit) | The milestone line. **Work here.** Ahead of the remote by 10+ commits; the owner has not pushed yet. |
+| `m1-bringup` | `830e21a` (+ this handoff commit) | The milestone line. **Work here.** Ahead of the remote by 11 commits before the current phase-A edits; the owner has not pushed yet. |
 | `feature/bcg-vitals` | `10ec2ab` | Parked: heart rate, breathing, HRV from head motion (`tools/vitals.py`, app box, README section). Local only. |
 
 Remotes: `SwiftEEG_RTOS` = `https://github.com/ShreyashSingh007/SwiftEEG_RTOS_Firmware.git`
@@ -143,7 +143,7 @@ working in the **uncommitted working tree**. Run `git status` and
 | R3-DSP-10 settling flag uses the warped pole | **done** (not yet built into test suites) | `src/dsp/dsp.c/.h`, `tools/dsp_ref.py`, `tests/dsp/src/main.c` | `docs/handoff/phaseA/C-PRO.md`: never short over 25 921 (g,k) pairs; flagged 1.03-1.9x the simulated ring-down |
 | R3-DSP-06 section bounds (validation half) | **done** | same | all 13 080 designed sections accepted; 9 huge-but-finite cases refused |
 | R4-HOST-01 parser, -04 BLE close, link side of -05/-06 | **done** | `tools/swifteeg_link.py` | `python tools/swifteeg_link.py` self-test OK; parser losses 338->1 frames; STREAM_STOP written 100/100 (was 0/100); config reply swallowed 0/500 (was ~10 %) |
-| R4-HOST-02/03/05/06/07 app side (sync, measured period, loss columns, error isolation, segments + JSON sidecar, link-lost state) | **in progress** (six steps) | `tools/swifteeg_app.py` | `docs/handoff/phaseA/PYTHON-PRO.md` |
+| R4-HOST-02/03/05/06/07 app side (sync, measured period, loss columns, error isolation, segments + JSON sidecar, link-lost state) | **implemented**; runtime check blocked by missing NumPy | `tools/swifteeg_app.py` | `docs/handoff/phaseA/PYTHON-PRO.md` |
 | Firmware 1. R3-DSP-01 codec payload overwrite (+ test) | **done**, builds | `src/proto/proto.c/.h`, `tests/proto` | `docs/handoff/phaseA/FIRMWARE.md` |
 | Firmware 2. R3-DSP-12 table CRC | **done**, builds (+512 B) | `src/proto/proto.c` | check value 0x29B1 |
 | Firmware 3. R1-ACQ-01 timestamp wrap race (+ test) | **done**, builds | `src/timebase/*`, `src/afe/ads1299.c`, `tests/timebase` | **follow-up:** `src/pipeline/capture.c:224` still calls `timebase_stamp_us()` - same latent issue, not yet fixed |
@@ -151,11 +151,11 @@ working in the **uncommitted working tree**. Run `git status` and
 | Firmware 5. R1-ACQ-08 START before frame buffers | **done**, builds | `src/afe/ads1299.c` | |
 | Firmware 6. R1-ACQ-11 anomaly-198 workaround + readback | **done**, builds (+260 B) | `src/afe/ads1299.c` | |
 | Firmware 7. Commands: SET_RATE validated first + **cap at 1000 SPS**, `pipeline_rate()` 0 when stopped, gain/mux range checks, GET_CONFIG EFAILED on bad readback, no silent reply drop, empty-payload reply | **done**, builds | `src/transport/command.c/.h`, `src/pipeline/pipeline.c/.h` | FLASH 251 396 B, RAM 101 370 B |
-| Firmware 8. R3-DSP-03 DSP thread yields when behind | pending | `src/pipeline/pipeline.c` | |
-| Firmware 9. R1-ACQ-09 watchdog + reset on fatal + reset cause | pending | `prj.conf`, `src/main.c`, threads | must not fire during rate restarts, register access or BLE blocking |
-| Firmware 10. R3-DSP-04 re-prime DC + SETTLING on input/power change | pending | `pipeline.c`, `chain.c` | |
-| Firmware 11. R3-DSP-06 chain half (non-finite channel reset + flag) | pending | `chain.c` | |
-| Firmware 12. Mirror 10-11 in `tools/pipeline_ref.py`; host self-tests; regenerate goldens if outputs change | pending | `tools/pipeline_ref.py`, `tests/pipeline` | |
+| Firmware 8. R3-DSP-03 DSP thread yields when behind | **done**, builds | `src/pipeline/pipeline.c` | |
+| Firmware 9. R1-ACQ-09 watchdog + reset on fatal + reset cause | **done**, builds | `prj.conf`, `src/main.c`, threads | hardware timing still pending |
+| Firmware 10. R3-DSP-04 re-prime DC + SETTLING on input/power change | **done**, builds | `pipeline.c`, `chain.c` | reset and DSP recovery include DC settling |
+| Firmware 11. R3-DSP-06 chain half (non-finite channel reset + flag) | **done**, builds | `chain.c` | invalid channels are isolated from CAR |
+| Firmware 12. Mirror 10-11 in `tools/pipeline_ref.py`; host self-tests; regenerate goldens if outputs change | **done**, builds | `tools/pipeline_ref.py`, `tests/pipeline` | NumPy host self-test still pending |
 
 Nothing of phase A has been flashed or run on hardware yet.
 

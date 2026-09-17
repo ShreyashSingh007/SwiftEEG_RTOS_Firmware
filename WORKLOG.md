@@ -16,8 +16,7 @@ was relaxed by the owner on 2026-09-16 for exactly this.)
 - **Review:** COMPLETE (2026-09-17). 58 findings, every critical and high one
   verified against the code. Verdict, fix plan and the owner's decisions are
   in *Verdict and path* below; evidence in `docs/review/2026-09-17/`.
-- **Next:** the owner picks from *Open decisions (owner)*. Nothing is fixed
-  until then.
+- **Next:** phase A (data-integrity fixes) - decided 2026-09-17, in progress.
 - **Parked:** `feature/bcg-vitals` - heart rate, breathing and HRV from head
   motion. Works, not on the plan.
 
@@ -30,18 +29,22 @@ was relaxed by the owner on 2026-09-16 for exactly this.)
 
 ## Open decisions (owner)
 
-**From the review (see *Verdict and path*):**
+**Decided 2026-09-17 (from the review):**
 
-A. Fix the data-integrity bugs (phase A) before any more recordings?
-   Recommended: yes.
-B. Shared core language: the firmware's own C for the codec and DSP, plus a
-   Rust session layer with generated Swift/Kotlin/Python bindings
-   (recommended), or all C.
-C. Apple at 1 kSPS cannot carry raw + filtered side by side. Stream raw only
-   and have the apps replay the device's exact filters (recommended), or keep
-   the device-filtered stream and accept lower rates on Apple.
-D. Protocol v2, pairing/bonding and MCUboot in ONE firmware release, so each
-   board needs a single SWD reflash. Recommended: yes.
+A. **Phase A first** - fix the data-integrity bugs before any more
+   recordings.
+B. **Shared core: C + Rust** - the firmware's own C for codec and DSP (L0),
+   a Rust session layer with generated bindings (L1).
+C. **Filtering stays on the device; rates follow the link.** Owner, verbatim
+   in substance: a device or platform that cannot carry high rates works at
+   the lower rates that do fit; 1000 SPS is disabled on devices that throttle
+   the BLE data rate; consistency is the key; most DSP happens on the device.
+   So: no host replay as the display path. The firmware measures each link
+   (MTU, interval, PHY) and reports the rates and encodings it can carry
+   without loss; apps offer only those. Replay in the core stays a
+   verification tool only.
+D. **One firmware release** for protocol v2 + pairing/bonding + MCUboot/SMP:
+   one SWD reflash per board.
 
 **Carried over:**
 
@@ -177,8 +180,10 @@ gets rewritten.
 **Bluetooth budget** (details and assumptions: R6-ARCH.md section 2). Windows
 and Android carry every mode today except 1000 SPS raw+uV, which is marginal
 (measured OK on Windows). Apple today carries only raw 24-bit, up to 500 SPS
-with motion. Apple at 1000 SPS + motion needs MTU-sized frames, an interval
-request Apple accepts, raw-only streaming, and lossless packing for headroom.
+with motion. Decision C: links that cannot carry a rate do not get it - the firmware
+reports per-link capabilities and apps offer only rates that fit, with the
+device's own filtered output kept. MTU-sized frames, an interval request
+Apple accepts and lossless packing raise how high those links can go.
 The Apple figures rest on assumed packets per connection event: measure a real
 iPhone before freezing v2.
 
@@ -189,7 +194,7 @@ iPhone before freezing v2.
   encoder.
 - **L1 `swifteeg-core` - Rust**, no I/O of its own, C ABI: request matching,
   device mirror, connect / rate change / reconnect, loss accounting, clock
-  sync, replay chain, recorder, LSL. Bindings generated (UniFFI) for Swift,
+  sync, recorder, LSL (a replay chain only for verification - decision C). Bindings generated (UniFFI) for Swift,
   Kotlin and Python; a C header for Windows.
 - **Per platform:** BLE/USB I/O (CoreBluetooth, BluetoothGatt, WinRT),
   pairing UI, permissions, storage, UI.
@@ -236,8 +241,8 @@ float flags; write the v1 schema + generator; start the core behind
 `swifteeg_link.Link`, switched over only when its output matches today's on
 captured byte streams.
 
-**Phase C - one firmware release, one SWD pass per board:** protocol v2,
-MTU-adaptive batching, Apple-compliant link parameters and PPCP, USB/BLE
+**Phase C - one firmware release, one SWD pass per board:** protocol v2
+with per-link rate/encoding capabilities (decision C), MTU-adaptive batching, Apple-compliant link parameters and PPCP, USB/BLE
 transmit decoupling and USB flush, pairing/bonding, MCUboot + SMP. Measure an
 iPhone first.
 
@@ -261,6 +266,17 @@ ceilings), R3-DSP-05 (float32 high-pass at high rates).
 ---
 
 ## Log
+
+### 2026-09-17 - decisions, phase A starts
+
+- Owner decided A-D (see *Open decisions*). Decision C departs from the
+  review's recommendation: filtering stays on the device and rates are capped
+  per link instead of streaming raw-only for host replay.
+- Phase A pipeline: c-pro (DSP numerics: settling formula, section bounds),
+  python-pro (Windows app and link: R4-HOST-01..07) in parallel; then
+  Embedded Firmware Engineer (codec, timebase, AFE access, command checks,
+  rate cap, watchdog, input re-prime); then the lead builds, runs host tests,
+  commits in groups, and verifies on hardware with the owner.
 
 ### 2026-09-17 - review complete
 

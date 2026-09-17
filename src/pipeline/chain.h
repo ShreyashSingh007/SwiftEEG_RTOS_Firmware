@@ -34,6 +34,17 @@
 
 #define CHAIN_STAGE_PRE  0u /* before the common average */
 #define CHAIN_STAGE_POST 1u /* after it */
+#define CHAIN_MUX_NORMAL 0u
+
+/* At least one channel produced a non-finite filtered value. */
+#define CHAIN_FLAG_DSP_INVALID 0x04u
+
+struct chain_channel_config {
+	uint8_t gain;
+	uint8_t mux;
+	bool    power_down;
+	bool    srb2;
+};
 
 typedef struct {
 	dsp_dc_t      dc[FRAME_CHANNELS];
@@ -45,8 +56,10 @@ typedef struct {
 	float         mains_in;               /* see chain_process() */
 	uint8_t       mains_mask;             /* channels mains_in is taken over */
 	uint8_t       car_mask;               /* channels that make the average */
+	uint8_t       car_runtime_mask;       /* temporary DSP eligibility mask */
 	bool          car;
 	uint8_t       channels;
+	struct chain_channel_config channel[FRAME_CHANNELS];
 } chain_t;
 
 /*
@@ -73,6 +86,10 @@ int chain_init(chain_t *c, uint8_t dc_shift, float vref_volts, uint8_t gain);
  */
 bool chain_process(chain_t *c, const uint8_t *frame, int32_t *raw_out,
 		   float *uv_out);
+
+/* Same as chain_process(), with output flags for recoverable DSP faults. */
+bool chain_process_flags(chain_t *c, const uint8_t *frame, int32_t *raw_out,
+			 float *uv_out, uint8_t *flags);
 
 /*
  * Aim the mains notch at `hz`, `q` wide, with a second section at twice the
@@ -110,6 +127,10 @@ void chain_set_mains_mask(chain_t *c, uint8_t mask);
  * of the offset into the filters.
  */
 int chain_set_gain(chain_t *c, uint8_t ch, uint8_t gain);
+
+/* Load one complete CHnSET configuration and re-prime on any real change. */
+int chain_set_channel(chain_t *c, uint8_t ch, uint8_t gain, uint8_t mux,
+		      bool power_down, bool srb2, bool *changed);
 
 /*
  * Start again from the next frame: the DC estimate and every filter

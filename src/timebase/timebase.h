@@ -55,6 +55,15 @@ uint32_t timebase_imu_capture_get(void);
  */
 uint64_t timebase_stamp_past_us(uint32_t capture);
 
+/*
+ * Same as timebase_stamp_past_us(), without the spinlock and capture-task
+ * round trip timebase_now_us() pays. Only safe to call from a context TIMER1's
+ * wrap ISR cannot preempt - currently just the SPIM3 END ISR, which shares
+ * its NVIC priority. See the doc comment in timebase.c before adding another
+ * caller.
+ */
+uint64_t timebase_stamp_past_us_from_isr(uint32_t capture);
+
 /* True once HFXO has taken over, so the rate is crystal-accurate. */
 bool timebase_hfxo_running(void);
 

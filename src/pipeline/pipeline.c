@@ -7,6 +7,8 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/atomic.h>
+#include <zephyr/sys/reboot.h>
+#include <zephyr/task_wdt/task_wdt.h>
 
 #include "capture.h"
 #include "chain.h"
@@ -31,6 +33,15 @@ BUILD_ASSERT(PIPELINE_STAGE_PRE == CHAIN_STAGE_PRE &&
 #define RAW_RING_FRAMES 128
 
 /*
+ * Frames the DSP thread drains per wake-up before checking whether it should
+ * yield instead of continuing (R3-DSP-03). At priority 2 this thread outranks
+ * the command, TX and Bluetooth host threads; a rate/filter load it cannot
+ * sustain must not turn "drain until the ring is empty" into "never yield",
+ * or none of those threads runs again and the device needs a power cycle.
+ */
+#define DSP_BATCH_FRAMES 64u
+
+/*
  * The mains notch, Q 12 by default: about 4 Hz wide at 50 Hz. A Q 30 notch
  * aimed at 50.0 took only 7 dB off mains measured at 49.6 Hz; at Q 12, aimed
  * at a measurement tens of millihertz out, it takes over 30 dB off.
@@ -51,6 +62,17 @@ BUILD_ASSERT(PIPELINE_STAGE_PRE == CHAIN_STAGE_PRE &&
 
 #define DSP_STACK_SIZE 2048
 #define DSP_PRIORITY   2
+
+/*
+ * Task watchdog channel for the DSP thread's progress (R1-ACQ-09), fed only
+ * when a batch actually processed at least one frame - not on every
+ * wake-up - so a live thread with a dead AFE (DRDY stopped, R1-ACQ-07's
+ * failure mode) still shows up as a reset instead of a stream that just goes
+ * quiet. ~4 s is comfortably over the slowest normal gap: a rate-change
+ * restart (~1 s) tears down and rebuilds this thread, and DSP_BATCH_FRAMES
+ * bounds how long any single wake-up can run before feeding again.
+ */
+#define DSP_WDT_TIMEOUT_MS 4000u
 
 /*
  * How long a filter change waits for the DSP thread to take it. A sample
@@ -76,6 +98,13 @@ static float sample_rate_hz;
 static K_THREAD_STACK_DEFINE(dsp_stack, DSP_STACK_SIZE);
 static struct k_thread dsp_thread;
 static k_tid_t dsp_tid;
+
+/*
+ * Registered by pipeline_start(), deleted by pipeline_stop(): -1 whenever
+ * the DSP thread does not exist, which is also when nothing tries to feed
+ * it (R1-ACQ-09).
+ */
+static int dsp_wdt_channel = -1;
 
 static volatile bool running;
 static uint8_t current_rate_code;
@@ -175,7 +204,7 @@ struct chain_req {
 	uint8_t notch_q;
 	bool notch_harmonic;
 	bool notch_track;
-	uint8_t gains[FRAME_CHANNELS];
+	uint8_t chset[FRAME_CHANNELS];
 	uint8_t electrodes; /* channels on their electrodes */
 
 	/* Filled in by whichever thread applied it. */
@@ -192,10 +221,21 @@ static atomic_t req_state = ATOMIC_INIT(REQ_IDLE);
 static K_SEM_DEFINE(req_done, 0, 1);
 static K_MUTEX_DEFINE(req_lock);
 
-static void arm_settling(void)
+static void arm_settling(bool include_dc)
 {
 	const uint32_t cap = (uint32_t)sample_rate_hz * SETTLE_MAX_S;
-	const uint32_t n = chain_settle_samples(&chain);
+	uint32_t n = chain_settle_samples(&chain);
+
+	if (include_dc) {
+		/* Five DC time constants leave about 1% of a step. */
+		const uint32_t tau = 1u << chain.dc[0].shift;
+		const uint32_t dc = (tau > UINT32_MAX / 5u) ? UINT32_MAX
+							   : tau * 5u;
+
+		if (dc > n) {
+			n = dc;
+		}
+	}
 
 	settle_left = (n < cap) ? n : cap;
 }
@@ -264,6 +304,14 @@ static void follow_mains(float hz)
 	}
 }
 
+/* CHnSET bits 6:4 to the gain they select; 0 for the reserved code. */
+static uint8_t gain_from_chset(uint8_t chset)
+{
+	static const uint8_t gains[8] = { 1, 2, 4, 6, 8, 12, 24, 0 };
+
+	return gains[(chset >> 4) & 0x07u];
+}
+
 /* Channels on their electrodes and powered: bit 7 clear, input mux normal. */
 static uint8_t electrode_mask(const uint8_t *chset)
 {
@@ -282,6 +330,7 @@ static uint8_t electrode_mask(const uint8_t *chset)
 static void apply_request(struct chain_req *r)
 {
 	bool restarted = false;
+	bool include_dc = false;
 
 	switch (r->kind) {
 	case REQ_STAGE: {
@@ -326,23 +375,49 @@ static void apply_request(struct chain_req *r)
 		break;
 	}
 
-	case REQ_GAINS:
+	case REQ_GAINS: {
+		bool channel_changed = false;
+
 		r->result = 0;
+		/* Validate the complete snapshot before changing any channel. */
 		for (uint8_t ch = 0; ch < FRAME_CHANNELS; ch++) {
-			if (chain_set_gain(&chain, ch, r->gains[ch]) != 0) {
+			const uint8_t chset = r->chset[ch];
+			if (gain_from_chset(chset) == 0u) {
+				r->result = -EINVAL;
+				break;
+			}
+		}
+		if (r->result != 0) {
+			break;
+		}
+
+		for (uint8_t ch = 0; ch < FRAME_CHANNELS; ch++) {
+			bool changed = false;
+			const uint8_t chset = r->chset[ch];
+			const uint8_t gain = gain_from_chset(chset);
+
+			if (chain_set_channel(&chain, ch, gain, chset & 0x07u,
+					      (chset & 0x80u) != 0u,
+					      (chset & 0x08u) != 0u, &changed) != 0) {
 				r->result = -EINVAL;
 			}
+			channel_changed |= changed;
 		}
 		if (r->electrodes != chain.mains_mask) {
 			chain_set_mains_mask(&chain, r->electrodes);
 			start_tracker();
 		}
+		if (channel_changed) {
+			arm_settling(true);
+		}
 		break;
+	}
 
 	case REQ_RESET:
 		chain_reset(&chain);
 		r->result = 0;
 		restarted = true;
+		include_dc = true;
 		break;
 
 	default:
@@ -354,7 +429,7 @@ static void apply_request(struct chain_req *r)
 	r->seq = st_seq;
 
 	if (restarted) {
-		arm_settling();
+		arm_settling(include_dc);
 	}
 }
 
@@ -464,10 +539,26 @@ static void process(const struct raw_frame *rf)
 	 * is not a sample: letting it through would corrupt the DC estimate
 	 * and the filter state for everything after it.
 	 */
-	if (!chain_process(&chain, rf->data, out.ch_raw, out.ch_uv)) {
+	uint8_t chain_flags = 0u;
+	const uint8_t car_runtime_mask = chain.car_runtime_mask;
+	if (settle_left != 0u) {
+		/* Do not let re-priming channels move the reference of good ones. */
+		chain.car_runtime_mask = 0u;
+	}
+
+	if (!chain_process_flags(&chain, rf->data, out.ch_raw, out.ch_uv,
+				&chain_flags)) {
+		chain.car_runtime_mask = car_runtime_mask;
 		st_bad_status++;
 		st_seq--; /* it never became a sample */
 		return;
+	}
+	chain.car_runtime_mask = car_runtime_mask;
+	out.flags |= chain_flags;
+
+	if ((chain_flags & CHAIN_FLAG_DSP_INVALID) != 0u) {
+		/* Recovery re-primes the affected channel's DC and filter state. */
+		arm_settling(true);
 	}
 
 	/*
@@ -516,6 +607,15 @@ static void process(const struct raw_frame *rf)
 	st_processed++;
 }
 
+static void dsp_wdt_fired(int channel_id, void *user_data)
+{
+	ARG_UNUSED(channel_id);
+	ARG_UNUSED(user_data);
+
+	LOG_ERR("DSP thread watchdog timed out - resetting");
+	sys_reboot(SYS_REBOOT_COLD);
+}
+
 static void dsp_entry(void *a, void *b, void *c)
 {
 	ARG_UNUSED(a);
@@ -530,13 +630,33 @@ static void dsp_entry(void *a, void *b, void *c)
 		/*
 		 * Drain rather than handling one per wake-up: the semaphore
 		 * count and the ring can disagree after a drop, and draining
-		 * keeps latency down when a burst arrives.
+		 * keeps latency down when a burst arrives. Bounded, though
+		 * (R3-DSP-03): unbounded, a rate/filter load this thread
+		 * cannot sustain would keep the ring non-empty forever, so
+		 * the k_sem_take() above - the only place this thread yields
+		 * to anything lower priority - would never be reached again.
+		 * Falling behind still shows up: the ring keeps counting what
+		 * it drops (process() -> spsc_dropped()), it just no longer
+		 * wedges the device to report it.
 		 */
 		const struct raw_frame *rf;
+		uint32_t n = 0;
 
-		while ((rf = spsc_peek(&raw_ring)) != NULL) {
+		while (n < DSP_BATCH_FRAMES &&
+		       (rf = spsc_peek(&raw_ring)) != NULL) {
 			process(rf);
 			spsc_release(&raw_ring);
+			n++;
+		}
+
+		/* Progress, not just a wake-up (R1-ACQ-09): see DSP_WDT_TIMEOUT_MS. */
+		if (n > 0 && dsp_wdt_channel >= 0) {
+			(void)task_wdt_feed(dsp_wdt_channel);
+		}
+
+		if (n == DSP_BATCH_FRAMES) {
+			/* Still behind: give the command and TX threads a turn. */
+			k_sleep(K_TICKS(1));
 		}
 	}
 }
@@ -562,14 +682,6 @@ static uint8_t dc_shift_for(uint16_t sps)
 	return shift;
 }
 
-/* CHnSET bits 6:4 to the gain they select; 0 for the reserved code. */
-static uint8_t gain_from_chset(uint8_t chset)
-{
-	static const uint8_t gains[8] = { 1, 2, 4, 6, 8, 12, 24, 0 };
-
-	return gains[(chset >> 4) & 0x07u];
-}
-
 static int build_chain(void)
 {
 	chain_ready = false;
@@ -583,7 +695,14 @@ static int build_chain(void)
 
 	ads1299_get_channels_cached(chset, ADS1299_CHANNELS);
 	for (uint8_t ch = 0; ch < ADS1299_CHANNELS; ch++) {
-		(void)chain_set_gain(&chain, ch, gain_from_chset(chset[ch]));
+		const int ch_err = chain_set_channel(&chain, ch,
+					gain_from_chset(chset[ch]), chset[ch] & 0x07u,
+					(chset[ch] & 0x80u) != 0u,
+					(chset[ch] & 0x08u) != 0u, NULL);
+
+		if (ch_err != 0) {
+			return ch_err;
+		}
 	}
 	chain_set_mains_mask(&chain, electrode_mask(chset));
 
@@ -597,7 +716,7 @@ static int build_chain(void)
 
 	chain_set_car(&chain, car_on, car_mask);
 	start_tracker();
-	arm_settling();
+	arm_settling(true);
 	chain_ready = true;
 
 	return 0;
@@ -677,6 +796,12 @@ int pipeline_start(uint8_t rate)
 				  DSP_PRIORITY, 0, K_NO_WAIT);
 	k_thread_name_set(dsp_tid, "eeg_dsp");
 
+	dsp_wdt_channel = task_wdt_add(DSP_WDT_TIMEOUT_MS, dsp_wdt_fired, NULL);
+	if (dsp_wdt_channel < 0) {
+		LOG_WRN("DSP thread watchdog channel unavailable (%d)",
+			dsp_wdt_channel);
+	}
+
 	err = ads1299_stream_start(on_frame);
 	if (err) {
 		pipeline_stop();
@@ -709,6 +834,11 @@ void pipeline_stop(void)
 		(void)k_thread_join(&dsp_thread, K_MSEC(500));
 		dsp_tid = NULL;
 	}
+
+	if (dsp_wdt_channel >= 0) {
+		(void)task_wdt_delete(dsp_wdt_channel);
+		dsp_wdt_channel = -1;
+	}
 }
 
 void pipeline_set_sink(pipeline_sink_t s)
@@ -734,6 +864,11 @@ static uint8_t rate_code_for(uint16_t sps)
 	case 16000: return ADS1299_DR_16KSPS;
 	default:    return 0xFFu;
 	}
+}
+
+bool pipeline_rate_supported(uint16_t sps)
+{
+	return rate_code_for(sps) != 0xFFu;
 }
 
 int pipeline_set_notch(uint8_t hz, uint8_t q, bool harmonic, bool track,
@@ -828,7 +963,7 @@ int pipeline_sync_gains(void)
 	};
 
 	for (uint8_t ch = 0; ch < ADS1299_CHANNELS; ch++) {
-		r.gains[ch] = gain_from_chset(chset[ch]);
+		r.chset[ch] = chset[ch];
 	}
 
 	return submit(&r, NULL);
@@ -865,7 +1000,16 @@ void pipeline_get_filters(struct pipeline_filters *out)
 
 uint16_t pipeline_rate(void)
 {
-	return (uint16_t)sample_rate_hz;
+	/*
+	 * sample_rate_hz is written as soon as pipeline_start() validates the
+	 * rate, before the AFE has accepted anything - a restart that fails
+	 * partway through (or twice, pipeline_set_rate()'s retry) would
+	 * otherwise report a rate no stream is actually running at
+	 * (R3-DSP-02). `running` is only true once ads1299_stream_start() has
+	 * succeeded, so gating on it reports the rate that is actually
+	 * accepted and running, 0 otherwise.
+	 */
+	return running ? (uint16_t)sample_rate_hz : 0u;
 }
 
 int pipeline_set_rate(uint16_t sps)

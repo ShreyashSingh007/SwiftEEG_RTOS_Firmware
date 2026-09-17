@@ -221,7 +221,7 @@ void capture_measure(uint32_t ms, struct capture_stats *out)
 
 uint64_t capture_last_us(void)
 {
-	return timebase_stamp_us(timebase_capture_get());
+	return timebase_stamp_past_us(timebase_capture_get());
 }
 
 int capture_edge_init(uint32_t pin, bool rising, uint32_t task_addr)

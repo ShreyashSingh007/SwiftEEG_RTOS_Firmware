@@ -58,6 +58,8 @@ typedef enum {
 #define PROTO_FLAG_SETTLING  0x01u
 /* Set when samples were dropped before this frame; seq shows how many. */
 #define PROTO_FLAG_OVERRUN   0x02u
+/* A channel produced a non-finite filtered value and was isolated. */
+#define PROTO_FLAG_DSP_INVALID 0x04u
 
 typedef struct {
 	uint8_t  version;
@@ -102,6 +104,13 @@ typedef struct {
 	uint16_t have;      /* bytes currently in buf */
 	uint16_t need;      /* total frame length once the header is known */
 	bool     in_frame;  /* SOF seen, still collecting */
+	/*
+	 * Bytes to drop from the front of buf before doing anything else, applied
+	 * at the start of the next push/poll. Consuming the just-returned frame
+	 * is deferred this way so out->payload (which points into buf) stays
+	 * valid for the caller until then, matching the contract below.
+	 */
+	uint16_t pending_consume;
 	uint32_t resyncs;   /* diagnostics: times we discarded and rescanned */
 	uint32_t crc_errors;
 } proto_stream_t;

@@ -4,8 +4,10 @@
 #include <string.h>
 
 #include <zephyr/kernel.h>
+#include <zephyr/sys/reboot.h>
 #include <zephyr/sys/ring_buffer.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/task_wdt/task_wdt.h>
 
 #include "afe/ads1299.h"
 #include "dsp/dsp.h"
@@ -33,8 +35,29 @@ LOG_MODULE_REGISTER(command, CONFIG_LOG_DEFAULT_LEVEL);
  */
 #define CMD_IDLE_MS 200
 
+/*
+ * Task watchdog channel for this thread's own loop (R1-ACQ-09). ~4 s, fed
+ * once per iteration regardless of whether it did anything that trip - the
+ * idle wait is a normal, healthy state, not a wedge. Comfortably over the
+ * slowest normal path this thread runs synchronously: CMD_SET_RATE calls
+ * pipeline_set_rate() directly, right here, which restarts acquisition
+ * (~1 s) before the next iteration - and well over
+ * RSP_RETRIES * RSP_RETRY_MS (100 ms), the longest respond() blocks waiting
+ * for a BLE notification buffer.
+ */
+#define CMD_WDT_TIMEOUT_MS 4000u
+
 /* One section on the wire: g, k, m0, m1, m2, little-endian float32 each. */
 #define SECTION_BYTES 20u
+
+/*
+ * respond()'s payload buffer, and the room that leaves for a status reply
+ * beyond [opcode, status]. Named so a caller's payload size (GET_CONFIG's
+ * BUILD_ASSERT below) is checked against the same number respond() itself
+ * enforces, rather than the two silently drifting apart.
+ */
+#define RSP_PAYLOAD_BYTES 48u
+#define RSP_EXTRA_MAX (RSP_PAYLOAD_BYTES - 2u)
 
 /*
  * A reply refused for want of a notification buffer is tried again, for up
@@ -63,6 +86,9 @@ static uint8_t ble_rx_storage[BLE_RX_BYTES];
 static struct ring_buf ble_rx_rb;
 static uint8_t rsp_buf[64];
 static uint16_t rsp_seq;
+
+/* -1 until command_init() registers it; checked before every feed. */
+static int cmd_wdt_channel = -1;
 
 /*
  * Which link the command being handled arrived on. A reply has to go back
@@ -155,16 +181,30 @@ static uint16_t sections_crc(const dsp_section_t *sections, uint8_t count)
 static void respond(uint8_t opcode, uint8_t status, const uint8_t *extra,
 		    size_t extra_len)
 {
-	uint8_t payload[48];
+	uint8_t payload[RSP_PAYLOAD_BYTES];
 
 	payload[0] = opcode;
-	payload[1] = status;
 
 	size_t len = 2;
 
-	if (extra != NULL && extra_len <= sizeof(payload) - 2) {
-		memcpy(&payload[2], extra, extra_len);
-		len += extra_len;
+	if (extra_len > RSP_EXTRA_MAX) {
+		/*
+		 * A truncated reply must never carry the caller's status: that
+		 * would claim a complete, successful answer while silently
+		 * dropping the data it was supposed to carry (R5-CONTRACT-02).
+		 * This is a last-resort guard, not the normal case - the
+		 * largest caller today, CMD_GET_CONFIG, is kept inside
+		 * RSP_EXTRA_MAX by the BUILD_ASSERT where it builds its reply.
+		 */
+		LOG_ERR("RSP 0x%02x: %zu-byte payload does not fit in %u, "
+			"sending EFAILED", opcode, extra_len, RSP_EXTRA_MAX);
+		payload[1] = CMD_EFAILED;
+	} else {
+		payload[1] = status;
+		if (extra != NULL) {
+			memcpy(&payload[2], extra, extra_len);
+			len += extra_len;
+		}
 	}
 
 	const int n = proto_encode(PROTO_TYPE_RSP, PROTO_FLAG_NONE, rsp_seq++,
@@ -288,7 +328,21 @@ static void handle_set_filter(const proto_frame_t *f)
 
 static void handle(const proto_frame_t *f)
 {
-	if (f->type != PROTO_TYPE_CMD || f->len < 1) {
+	if (f->type != PROTO_TYPE_CMD) {
+		return;
+	}
+
+	if (f->len < 1) {
+		/*
+		 * Legal at the framing layer - proto_encode()/proto_decode()
+		 * both accept a zero-length payload - so this needs its own
+		 * reply rather than falling silently through: there is no
+		 * opcode byte to read, let alone echo back. Without this a
+		 * host cannot tell "malformed command" from "never arrived"
+		 * (R5-CONTRACT-06), unlike every other bad-argument case
+		 * below, which already answers CMD_EBADARG.
+		 */
+		respond(CMD_OP_NONE, CMD_EBADARG, NULL, 0);
 		return;
 	}
 
@@ -379,17 +433,38 @@ static void handle(const proto_frame_t *f)
 		const uint16_t sps = get_u16(&f->payload[1]);
 
 		/*
-		 * Answer before restarting. The restart tears down the DSP
-		 * thread and reconfigures the AFE, which takes long enough
-		 * that a host waiting on the reply would time out.
+		 * Phase A: rates follow what a link can carry, and neither USB
+		 * nor BLE has been proven above 1000 SPS yet - higher rates
+		 * return with later high-rate work. The cap lives here, on
+		 * every link, rather than in the AFE driver or rate_code_for():
+		 * the hardware itself takes up to 16 kSPS.
 		 */
-		respond(op, CMD_OK, NULL, 0);
-		(void)pipeline_set_rate(sps);
+		if (sps > 1000u || !pipeline_rate_supported(sps)) {
+			status = CMD_EBADARG;
+			break;
+		}
+
+		/*
+		 * The rate is validated before the synchronous restart. The reply
+		 * carries the real restart result, so a failed AFE change is visible.
+		 */
+		status = status_for(pipeline_set_rate(sps));
+		respond(op, status, NULL, 0);
 		return;
 	}
 
 	case CMD_SET_CHANNEL:
 		if (f->len < 4) {
+			status = CMD_EBADARG;
+		} else if (f->payload[2] > 6u || f->payload[3] > 7u) {
+			/*
+			 * Masking instead of checking (ads1299_set_channel())
+			 * let a reserved gain code or an out-of-range mux
+			 * through to the part: code 7 is "do not use" on the
+			 * ADS1299, and a mux byte of 8 or more silently aliases
+			 * to a different mux once masked to 3 bits
+			 * (R3-DSP-07). Caught here, before anything is written.
+			 */
 			status = CMD_EBADARG;
 		} else {
 			const bool pd = (f->len >= 5) && f->payload[4];
@@ -506,18 +581,31 @@ static void handle(const proto_frame_t *f)
 		 * Everything a host needs to draw its controls in the right
 		 * position, in one exchange. Reading it back from the AFE
 		 * rather than reporting what we believe we set means a
-		 * failed write shows up as a wrong control, not a lie.
+		 * failed write shows up as a wrong control, not a lie - and a
+		 * failed READ must too (R3-DSP-09): the comment above used to
+		 * stop short of that, and reported eight channels at gain code
+		 * 0 with CMD_OK on a readback error, indistinguishable from a
+		 * real, freshly-reset part.
 		 */
 		uint8_t chset[ADS1299_CHANNELS] = { 0 };
 		struct imu_config imu;
 		struct pipeline_filters filt;
 
-		(void)ads1299_get_channels(chset, ADS1299_CHANNELS);
+		if (ads1299_get_channels(chset, ADS1299_CHANNELS) != 0) {
+			respond(op, CMD_EFAILED, NULL, 0);
+			return;
+		}
+
 		imu_get_config(&imu);
 		pipeline_get_filters(&filt);
 
 		const uint16_t sps = pipeline_rate();
 		uint8_t cfg[37];
+
+		/* respond() answers EFAILED instead of truncating (R5-CONTRACT-02) -
+		 * this keeps that from ever being reached silently. */
+		BUILD_ASSERT(sizeof(cfg) <= RSP_EXTRA_MAX,
+			     "GET_CONFIG payload no longer fits in an RSP");
 
 		cfg[0] = ADS1299_CHANNELS;
 		cfg[1] = stream_encoding();
@@ -619,6 +707,17 @@ static void on_usb_rx(void)
 	k_sem_give(&cmd_ready);
 }
 
+static void cmd_wdt_fired(int channel_id, void *user_data)
+{
+	ARG_UNUSED(channel_id);
+	ARG_UNUSED(user_data);
+
+	/* No IMMEDIATE-mode log call is guaranteed to land before a reboot
+	 * this close behind it, but it costs nothing to try. */
+	LOG_ERR("command thread watchdog timed out - resetting");
+	sys_reboot(SYS_REBOOT_COLD);
+}
+
 static void cmd_entry(void *a, void *b, void *c)
 {
 	ARG_UNUSED(a);
@@ -678,6 +777,11 @@ static void cmd_entry(void *a, void *b, void *c)
 		if (!did_work) {
 			(void)k_sem_take(&cmd_ready, K_MSEC(CMD_IDLE_MS));
 		}
+
+		/* Every trip round the loop, idle or not: R1-ACQ-09. */
+		if (cmd_wdt_channel >= 0) {
+			(void)task_wdt_feed(cmd_wdt_channel);
+		}
 	}
 }
 
@@ -695,6 +799,12 @@ int command_init(void)
 	ring_buf_init(&ble_rx_rb, sizeof(ble_rx_storage), ble_rx_storage);
 	ble_transport_set_control_handler(on_ble_control);
 	usb_transport_set_rx_notify(on_usb_rx);
+
+	cmd_wdt_channel = task_wdt_add(CMD_WDT_TIMEOUT_MS, cmd_wdt_fired, NULL);
+	if (cmd_wdt_channel < 0) {
+		LOG_WRN("command thread watchdog channel unavailable (%d)",
+			cmd_wdt_channel);
+	}
 
 	LOG_INF("command handler up (USB and BLE)");
 	return 0;

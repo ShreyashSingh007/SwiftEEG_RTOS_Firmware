@@ -99,6 +99,22 @@ ZTEST(proto, test_encode_rejects_bad_args)
 		      PROTO_ERR_ARG, "null payload with nonzero length accepted");
 }
 
+ZTEST(proto, test_data_dsp_invalid_flag_roundtrips)
+{
+	uint8_t buf[PROTO_MAX_FRAME];
+	const uint8_t payload[] = { 0x04, 0x00 };
+
+	const int n = proto_encode(PROTO_TYPE_DATA, PROTO_FLAG_DSP_INVALID,
+				   17, payload, sizeof(payload), buf, sizeof(buf));
+	zassert_true(n > 0, "DATA frame with DSP flag did not encode");
+
+	proto_frame_t f;
+	zassert_equal(proto_decode(buf, (size_t)n, &f), PROTO_OK,
+		      "DATA frame with DSP flag did not decode");
+	zassert_equal(f.flags, PROTO_FLAG_DSP_INVALID,
+		      "DSP invalid flag was not preserved");
+}
+
 ZTEST(proto, test_stream_decodes_back_to_back)
 {
 	proto_stream_t st;
@@ -191,6 +207,91 @@ ZTEST(proto, test_stream_survives_truncated_frame)
 	zassert_equal(f.len, good->payload_len, "len after truncation");
 	zassert_true(st.crc_errors >= 1,
 		     "truncated frame should have produced a CRC error");
+}
+
+ZTEST(proto, test_stream_truncated_frame_preserves_distinct_payloads)
+{
+	proto_stream_t st;
+	proto_frame_t f;
+
+	/*
+	 * Regression for R3-DSP-01: try_extract() used to consume() the just
+	 * decoded frame - and clobber out->payload via the memmove - before
+	 * returning it. Reusing the SAME frame three times (as the truncation
+	 * test above does) cannot catch that, because the "clobbered" bytes
+	 * are identical to the real ones. This uses three DIFFERENT frames so
+	 * a leaked pointer shows up as the wrong payload, not just a wrong
+	 * seq/len.
+	 */
+	const struct golden_vector *cut = &golden_vectors[6]; /* data_27b_frame: declares 27 bytes */
+	const struct golden_vector *frames[3] = {
+		&golden_vectors[2], /* evt_short */
+		&golden_vectors[3], /* data_settling */
+		&golden_vectors[5], /* data_seq_wrap */
+	};
+	uint8_t got_payload[3][16];
+	uint16_t got_len[3] = { 0 };
+	uint16_t got_seq[3] = { 0 };
+	int got_count = 0;
+
+	proto_stream_reset(&st);
+
+	/*
+	 * Only the header of `cut` arrives before the link drops the rest, so
+	 * its declared 27-byte payload swallows the three good frames that
+	 * follow. Once enough bytes have accumulated to match that declared
+	 * length, the CRC fails and the decoder resyncs onto frames[0], which
+	 * by then already has frames[1] (and part of frames[2]) buffered
+	 * behind it - the exact pileup that let consume()'s memmove overwrite
+	 * a payload before the caller could read it.
+	 */
+	for (uint16_t b = 0; b < PROTO_HEADER_LEN; b++) {
+		zassert_false(proto_stream_push(&st, cut->frame[b], &f),
+			      "cut header alone must not complete a frame");
+	}
+
+	for (int i = 0; i < 3; i++) {
+		const struct golden_vector *v = frames[i];
+
+		for (uint16_t b = 0; b < v->frame_len; b++) {
+			if (proto_stream_push(&st, v->frame[b], &f)) {
+				zassert_true(got_count < 3, "more frames than expected");
+				/*
+				 * Copy the payload out now, exactly as a real
+				 * caller (command.c's handle()) must: before
+				 * pushing or polling again. If it were still
+				 * clobbered, this is where the wrong frame's
+				 * bytes would show up.
+				 */
+				memcpy(got_payload[got_count], f.payload, f.len);
+				got_len[got_count] = f.len;
+				got_seq[got_count] = f.seq;
+				got_count++;
+			}
+		}
+	}
+
+	/* Drain anything left buffered, same as the real transport does. */
+	while (got_count < 3 && proto_stream_poll(&st, &f)) {
+		memcpy(got_payload[got_count], f.payload, f.len);
+		got_len[got_count] = f.len;
+		got_seq[got_count] = f.seq;
+		got_count++;
+	}
+
+	zassert_equal(got_count, 3, "expected exactly 3 frames out of the pileup");
+	zassert_true(st.crc_errors >= 1,
+		     "the swallowed length should have produced a CRC error");
+
+	for (int i = 0; i < 3; i++) {
+		const struct golden_vector *v = frames[i];
+
+		zassert_equal(got_len[i], v->payload_len, "frame %d (%s): len", i, v->name);
+		zassert_equal(got_seq[i], v->seq, "frame %d (%s): seq", i, v->name);
+		zassert_mem_equal(got_payload[i], v->payload, v->payload_len,
+				  "frame %d (%s): payload leaked a different frame's bytes",
+				  i, v->name);
+	}
 }
 
 ZTEST(proto, test_stream_poll_drains_buffered_frames)

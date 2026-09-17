@@ -10,6 +10,13 @@
 #ifndef SWIFTEEG_TRANSPORT_COMMAND_H
 #define SWIFTEEG_TRANSPORT_COMMAND_H
 
+/*
+ * Not a real opcode a host ever sends: what a reply to a CMD frame with no
+ * payload at all carries in place of one, since there is no opcode byte to
+ * echo back (R5-CONTRACT-06).
+ */
+#define CMD_OP_NONE      0x00u
+
 /* Opcodes, first byte of a CMD payload. */
 #define CMD_PING         0x01u
 #define CMD_STREAM_START 0x02u
@@ -20,8 +27,8 @@
 #define CMD_READ_REG     0x07u /* payload[1] = address; RSP carries the value */
 #define CMD_SET_INPUT    0x08u /* payload[1] = ADS1299_MUX_*, [2] = cal freq */
 #define CMD_SET_RATE     0x09u /* payload[1..2] = SPS, little-endian */
-#define CMD_SET_CHANNEL  0x0Au /* [1]=ch or 0xFF, [2]=gain, [3]=mux,
-                                *   [4]=power down, [5]=srb2 */
+#define CMD_SET_CHANNEL  0x0Au /* [1]=ch or 0xFF, [2]=gain code 0-6, [3]=mux
+                                *   0-7, [4]=power down, [5]=srb2 */
 #define CMD_SET_BIAS     0x0Bu /* [1]=enable, [2]=sensp mask, [3]=sensn mask */
 #define CMD_SET_NOTCH    0x0Cu /* [1]=nominal Hz (0 removes it, 50 or 60),
                                 *   [2]=Q, [3]=flags (bit 0 harmonic, bit 1

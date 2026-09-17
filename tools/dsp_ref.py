@@ -117,10 +117,38 @@ def from_biquad(b0, b1, b2, a1, a2):
     return tuple(F32(v) for v in (g, k, m0, m1, m2))
 
 
+SECTION_MIX_MAX = F32(1e3)
+SECTION_G_MAX = F32(1e3)
+SECTION_TAU_MAX = F32(1e6)
+
+
+def slowest_tau(g, k):
+    """
+    Mirrors slowest_tau in src/dsp/dsp.c, float32 and in the same order: the
+    time constant, in samples, of the section's pole nearest the unit circle,
+    where the bilinear transform puts it. See dsp.c for the derivation.
+    """
+    g, k = F32(g), F32(k)
+    with np.errstate(over="ignore", divide="ignore"):
+        if k < F32(2.0):
+            return (F32(1.0) + g * g) / (g * k)
+        h = F32(1.0) / g if g > F32(1.0) else g
+        return (k + np.sqrt(k * k - F32(4.0))) / (F32(4.0) * h)
+
+
 def section_is_valid(s) -> bool:
-    """Mirrors dsp_section_is_valid: all finite, g and k positive."""
+    """
+    Mirrors dsp_section_is_valid: all finite, g and k positive, and nothing
+    past what float32 runs as designed - see dsp.c for the bounds.
+    """
     v = [F32(x) for x in s]
-    return all(np.isfinite(x) for x in v) and v[0] > 0 and v[1] > 0
+    if not all(np.isfinite(x) for x in v):
+        return False
+    g, k, m0, m1, m2 = v
+    return bool(F32(0.0) < g <= SECTION_G_MAX and k > F32(0.0)
+                and abs(m0) <= SECTION_MIX_MAX and abs(m1) <= SECTION_MIX_MAX
+                and abs(m2) <= SECTION_MIX_MAX
+                and slowest_tau(g, k) <= SECTION_TAU_MAX)
 
 
 # --- filtering, float32 throughout, as src/dsp/dsp.c does it ---------------
@@ -193,11 +221,9 @@ class Cascade:
         """Mirrors dsp_cascade_settle_samples."""
         total = F32(0.0)
         for g, k, *_ in self.sections:
-            if k > F32(2.0):
-                tau = (k + np.sqrt(k * k - F32(4.0))) / (F32(4.0) * g)
-            else:
-                tau = F32(1.0) / (g * k)
-            total = total + F32(4.6) * tau
+            d = F32(0.5) * k if k < F32(2.0) else F32(2.0) / k
+            total = total + ((F32(4.96) + F32(3.04) * d * d) * slowest_tau(g, k)
+                             + F32(2.0))
         if not total < F32(4294967040.0):
             return 0xFFFFFFFF
         return int(np.ceil(total))
@@ -491,19 +517,50 @@ def _self_test() -> None:
     assert not section_is_valid((0.1, 1.0, float("nan"), 0.0, 0.0))
     assert not section_is_valid((float("inf"), 1.0, 1.0, 0.0, 0.0))
 
+    # Finite is not enough: each of these would load and then overflow, or
+    # ring undamped in float32.
+    g, k = float(n[0]), float(n[1])
+    for huge in ((g, k, 1e30, -k, 0.0), (4096.0, k, 1.0, -k, 0.0),
+                 (2e19, k, 1.0, -k, 0.0), (g, 1e-9, 1.0, -1e-9, 0.0),
+                 (g, 1e30, 1.0, -1.0, 0.0), (1e-9, k, 1.0, -k, 0.0)):
+        assert not section_is_valid(huge), huge
+
+    # And the furthest out the host tools and the device design is inside:
+    # the slowest high-pass section, a low-pass just under 0.475 fs, and the
+    # narrowest notch the device takes.
+    for s in (design_highpass(16000.0, 0.05, butterworth_qs(8)[-1]),
+              design_lowpass(250.0, 118.0, butterworth_qs(8)[-1]),
+              design_notch_f32(16000.0, 50.0, 255.0)):
+        assert section_is_valid(s), s
+
     # A retune keeps state only with the same number of sections.
     c = Cascade(1)
     assert c.set([n, lp])
     assert not c.retune([n])
     assert c.retune([design_notch(fs, 50.2, 30.0), lp])
 
-    # Settling: nothing to settle is zero samples, and a Q 30 notch at 50 Hz
-    # rings for about 4.6 Q / (pi f0).
+    # Settling: nothing to settle is zero samples, and from whatever state a
+    # restart leaves, the loop's own output falls below 1 % of its peak
+    # inside the estimate - which is not much longer. At 250 SPS the harmonic
+    # notch sits where the bilinear transform squeezes its poles up to the
+    # unit circle, and an order-2 Butterworth high-pass peaks late: the
+    # estimate from the analogue prototype flagged 94 samples of the first,
+    # which rings for up to 194, and 518 of the second, which takes 641.
     assert Cascade(1).settle_samples() == 0, "an empty cascade has nothing to settle"
-    c = Cascade(1)
-    c.set([n])
-    expect = 4.6 * 30.0 / (math.pi * 50.0) * fs
-    assert abs(c.settle_samples() - expect) / expect < 0.05, c.settle_samples()
+    rng = np.random.default_rng(2)
+    for secs in ([design_notch_f32(250.0, 50.0, 12.0), design_notch_f32(250.0, 100.0, 12.0)],
+                 [design_highpass(250.0, 0.5, butterworth_qs(2)[0])]):
+        c = Cascade(1)
+        c.set(secs)
+        settle = c.settle_samples()
+        worst = 0
+        for _ in range(16):
+            c.pending[0] = False
+            for i in range(len(secs)):
+                c.ic1[0][i], c.ic2[0][i] = (F32(v) for v in rng.standard_normal(2))
+            y = np.abs([float(c.apply(0, 0.0)) for _ in range(2 * settle)])
+            worst = max(worst, int(np.nonzero(y > 0.01 * y.max())[0][-1]) + 1)
+        assert worst <= settle < 2 * worst, (secs, settle, worst)
 
     # A restart primes on its next input: a high-pass fed a constant gives
     # nothing from the very first sample, and a low-pass gives the constant.

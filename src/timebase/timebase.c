@@ -122,9 +122,17 @@ uint64_t timebase_now_us(void)
 	nrf_timer_task_trigger(TB_TIMER, nrf_timer_capture_task_get(CC_NOW));
 	uint32_t counter = nrf_timer_cc_get(TB_TIMER, CC_NOW);
 
+	/*
+	 * Extend before releasing the lock. Done after unlock, the wrap ISR can
+	 * run between the capture and the tb_wraps read, adding a spurious
+	 * 2^32 us to "now" - the same root cause as R1-ACQ-01, just a narrower
+	 * window (a few us here instead of a whole SPI transfer).
+	 */
+	const uint64_t now = tb_stamp(counter);
+
 	k_spin_unlock(&tb_lock, key);
 
-	return tb_stamp(counter);
+	return now;
 }
 
 uint64_t timebase_stamp_us(uint32_t capture)
@@ -134,15 +142,31 @@ uint64_t timebase_stamp_us(uint32_t capture)
 
 uint64_t timebase_stamp_past_us(uint32_t capture)
 {
-	const uint64_t now = timebase_now_us();
-	uint64_t t = (now & ~(uint64_t)UINT32_MAX) | capture;
+	return timebase_extend_past(timebase_now_us(), capture);
+}
 
-	/* Later than now means the capture came before the most recent wrap. */
-	if (t > now) {
-		t -= (uint64_t)1 << 32;
-	}
+/*
+ * Same rule as timebase_stamp_past_us(), for a caller that already runs
+ * where TIMER1's wrap ISR cannot preempt it, and so can read CC_NOW directly
+ * instead of paying timebase_now_us()'s spinlock and capture-task round
+ * trip.
+ *
+ * The intended (and, for this safety argument, only) caller is the SPIM3
+ * END ISR: it shares TIMER1's NVIC priority (both 1 - see the `interrupts`
+ * property on timer1 and spi3 in build/zephyr/zephyr.dts, both `< irq 0x1 >`
+ * today), and on Cortex-M same-priority interrupts never preempt one
+ * another. So while this runs, tb_isr() has either already completed or has
+ * not started yet - never partway through - which is exactly what tb_stamp()
+ * needs from its caller instead of the lock. Re-check that priority pairing
+ * if either IRQ's priority ever changes.
+ */
+uint64_t timebase_stamp_past_us_from_isr(uint32_t capture)
+{
+	nrf_timer_task_trigger(TB_TIMER, nrf_timer_capture_task_get(CC_NOW));
+	uint32_t counter = nrf_timer_cc_get(TB_TIMER, CC_NOW);
+	const uint64_t now = tb_stamp(counter);
 
-	return t;
+	return timebase_extend_past(now, capture);
 }
 
 uint32_t timebase_capture_get(void)

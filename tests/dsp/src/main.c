@@ -138,6 +138,99 @@ ZTEST(dsp, test_invalid_sections_are_refused)
 		      "an empty cascade must pass samples through");
 }
 
+ZTEST(dsp, test_section_bounds_reject_huge_but_finite)
+{
+	dsp_cascade_t c;
+	dsp_section_t bad;
+
+	dsp_cascade_init(&c, 1);
+	zassert_true(dsp_cascade_set(&c, &golden_notch50, 1), NULL);
+
+	/*
+	 * g and k positive with every value finite is not enough: each of
+	 * these loads and then either overflows a1..a3 in dsp_cascade_apply,
+	 * rounds a3 to exactly 1.0 for an undamped ring at Nyquist, or takes
+	 * longer than any real filter to settle. None of these is a filter a
+	 * host would design.
+	 */
+	bad = golden_notch50;
+	bad.m0 = 1e30f;
+	zassert_false(dsp_cascade_set(&c, &bad, 1), "mix of 1e30 accepted");
+
+	bad = golden_notch50;
+	bad.m1 = 2e3f;
+	zassert_false(dsp_cascade_set(&c, &bad, 1), "mix of 2e3 accepted");
+
+	bad = golden_notch50;
+	bad.g = 4096.0f;
+	zassert_false(dsp_cascade_set(&c, &bad, 1), "g past the bound accepted");
+
+	bad = golden_notch50;
+	bad.g = 2e19f;
+	zassert_false(dsp_cascade_set(&c, &bad, 1),
+		      "g large enough to overflow 1 + g(g+k) accepted");
+
+	bad = golden_notch50;
+	bad.g = 4096.0f;
+	bad.k = 1e-4f;
+	zassert_false(dsp_cascade_set(&c, &bad, 1),
+		      "g, k where a3 rounds to 1.0 accepted");
+
+	bad = golden_notch50;
+	bad.k = 1e-9f;
+	zassert_false(dsp_cascade_set(&c, &bad, 1),
+		      "k tiny enough for a million-sample decay accepted");
+
+	bad = golden_notch50;
+	bad.k = 1e30f;
+	zassert_false(dsp_cascade_set(&c, &bad, 1), "k = 1e30 accepted");
+
+	bad = golden_notch50;
+	bad.g = 1e-9f;
+	zassert_false(dsp_cascade_set(&c, &bad, 1),
+		      "g tiny enough for a million-sample decay accepted");
+
+	/*
+	 * g and k each pass their own bound here, but together push the
+	 * slowest decay past it - exactly the combination separate bounds on
+	 * g and k alone could not catch without also refusing sections that
+	 * work (see the comment on dsp_section_is_valid in dsp.h).
+	 */
+	bad = golden_notch50;
+	bad.g = 1000.0f;
+	bad.k = 1e-3f;
+	zassert_false(dsp_cascade_set(&c, &bad, 1),
+		      "g and k both within bound but tau past it accepted");
+
+	zassert_equal(c.count, 1, "a refused load changed the cascade");
+}
+
+ZTEST(dsp, test_section_bounds_accept_designed_sections)
+{
+	dsp_section_t s;
+
+	/*
+	 * The furthest the host tools go, and the device's own design
+	 * functions land well inside dsp_section_is_valid's bounds: an
+	 * eighth-order 0.05 Hz high-pass at 16 kSPS (the slowest legitimate
+	 * decay, ~2.6e5 samples), a low-pass corner just under 0.475 fs (the
+	 * largest legitimate g), and the narrowest notch the device takes.
+	 */
+	zassert_true(dsp_design_highpass(&s, 16000.0f, 0.05f, 2.5629154f),
+		     "slowest legitimate high-pass section failed to design");
+	zassert_true(dsp_section_is_valid(&s),
+		     "slowest legitimate high-pass section refused");
+
+	zassert_true(dsp_design_lowpass(&s, 250.0f, 118.0f, 2.5629154f),
+		     "low-pass corner near Nyquist failed to design");
+	zassert_true(dsp_section_is_valid(&s),
+		     "low-pass corner near Nyquist refused");
+
+	zassert_true(dsp_design_notch(&s, 16000.0f, 50.0f, 255.0f),
+		     "narrowest notch failed to design");
+	zassert_true(dsp_section_is_valid(&s), "narrowest notch refused");
+}
+
 ZTEST(dsp, test_integer_dc_removal_is_exact)
 {
 	dsp_dc_t dc;
@@ -355,14 +448,20 @@ ZTEST(dsp, test_settle_samples_are_sane)
 		      "an empty cascade has nothing to settle");
 
 	/*
-	 * A Q 30 notch at 50 Hz and 1 kSPS rings down to 1 % in about
-	 * 4.6 Q / (pi f0) seconds: some 880 samples.
+	 * A Q 30 notch at 50 Hz and 1 kSPS: the bilinear-warped pole radius
+	 * puts its slowest decay at (1 + g^2) / (g k) samples, about 194 -
+	 * against roughly 189 from the unwarped analogue g k this replaces.
+	 * Ring-down to 1 % of peak adds the low-damping correction, close to
+	 * its 4.96 floor at this Q, and 2 samples of initial state:
+	 * (4.96 + 3.04 d^2) * 194 + 2, about 966 samples. tools/dsp_ref.py's
+	 * self-test checks this same cascade's estimate against its own
+	 * simulated worst-case ring-down rather than this formula restated.
 	 */
 	zassert_true(dsp_cascade_set(&c, &golden_notch50, 1), NULL);
 
 	const uint32_t n = dsp_cascade_settle_samples(&c);
 
-	zassert_true(n > 800u && n < 960u, "notch settles in %u samples", n);
+	zassert_true(n > 940u && n < 995u, "notch settles in %u samples", n);
 }
 
 ZTEST(dsp, test_group_delay_is_sane)

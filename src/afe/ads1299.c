@@ -185,6 +185,50 @@ static void afe_recover(void)
 	nrf_spim_event_clear(AFE_SPIM, NRF_SPIM_EVENT_END);
 }
 
+/*
+ * nRF52840 anomaly 198: "SPIM3 transmit data might be corrupted." nrfx
+ * applies this around every SPIM3 transfer (nrfx_spim.c), writing the 8 KB
+ * RAM block mask of the TX buffer to an undocumented register so EasyDMA
+ * cannot read a torn byte out of a block another master (USB, the radio) is
+ * writing at the same time. This driver talks to SPIM3 straight through the
+ * HAL rather than nrfx, so nothing was applying it (R1-ACQ-11): a WREG could
+ * put a corrupted command or data byte on MOSI. Streaming reads do not need
+ * this - the part ignores DIN in RDATAC - so it is only wired into afe_xfer,
+ * the register-access path.
+ *
+ * Address math and the register itself copied from nrfx_spim.c's
+ * anomaly_198_enable()/anomaly_198_disable(); afe_tx is always the buffer in
+ * play here, so unlike nrfx this does not need to take it as a parameter.
+ */
+static uint32_t afe_anomaly_198_saved;
+
+static void afe_anomaly_198_enable(void)
+{
+	afe_anomaly_198_saved = *(volatile uint32_t *)0x40000E00ul;
+
+	uint32_t buffer_end_addr = (uint32_t)afe_tx + sizeof(afe_tx);
+	uint32_t block_addr = (uint32_t)afe_tx & ~0x1FFFul;
+	uint32_t block_flag = 1UL << ((block_addr >> 13) & 0xFFFFu);
+	uint32_t occupied_blocks = 0;
+
+	if (block_addr >= 0x20010000ul) {
+		occupied_blocks = 1UL << 8;
+	} else {
+		do {
+			occupied_blocks |= block_flag;
+			block_flag <<= 1;
+			block_addr += 0x2000ul;
+		} while (block_addr < buffer_end_addr && block_addr < 0x20012000ul);
+	}
+
+	*(volatile uint32_t *)0x40000E00ul = occupied_blocks;
+}
+
+static void afe_anomaly_198_disable(void)
+{
+	*(volatile uint32_t *)0x40000E00ul = afe_anomaly_198_saved;
+}
+
 /* Blocking transfer. Used for register access only; streaming is DMA. */
 static int afe_xfer(size_t len)
 {
@@ -211,6 +255,13 @@ static int afe_xfer(size_t len)
 	}
 
 	nrf_spim_event_clear(AFE_SPIM, NRF_SPIM_EVENT_END);
+
+	const bool anomaly_198 = NRF_ERRATA_STATIC_CHECK(52, 198) &&
+				 NRF_ERRATA_DYNAMIC_CHECK(52, 198);
+	if (anomaly_198) {
+		afe_anomaly_198_enable();
+	}
+
 	nrf_spim_task_trigger(AFE_SPIM, NRF_SPIM_TASK_START);
 
 	/*
@@ -220,12 +271,18 @@ static int afe_xfer(size_t len)
 	for (int i = 0; i < 10000; i++) {
 		if (nrf_spim_event_check(AFE_SPIM, NRF_SPIM_EVENT_END)) {
 			nrf_spim_event_clear(AFE_SPIM, NRF_SPIM_EVENT_END);
+			if (anomaly_198) {
+				afe_anomaly_198_disable();
+			}
 			afe_xfer_done();
 			return 0;
 		}
 		k_busy_wait(1);
 	}
 
+	if (anomaly_198) {
+		afe_anomaly_198_disable();
+	}
 	afe_recover();
 	afe_xfer_done();
 	LOG_ERR("AFE SPI transfer timed out");
@@ -263,6 +320,34 @@ static int afe_write_reg(uint8_t addr, uint8_t val)
 	afe_tx[2] = val;
 
 	return afe_xfer(3);
+}
+
+/*
+ * Writes one register and reads it back, the way ads1299_configure() and
+ * ads1299_set_data_rate() already do for CONFIG1/CONFIG3: a failed write
+ * then shows up as a wrong control instead of a silent lie, and a corrupted
+ * byte on MOSI (R1-ACQ-11, anomaly 198) cannot pass as an accepted write.
+ */
+static int afe_write_reg_verified(uint8_t addr, uint8_t val)
+{
+	int err = afe_write_reg(addr, val);
+
+	if (err) {
+		return err;
+	}
+
+	uint8_t back = 0;
+
+	err = afe_read_reg(addr, &back);
+	if (err) {
+		return err;
+	}
+	if (back != val) {
+		LOG_ERR("reg %02x readback %02x, wanted %02x", addr, back, val);
+		return -EIO;
+	}
+
+	return 0;
 }
 
 int ads1299_read_reg(uint8_t addr, uint8_t *val)
@@ -423,7 +508,63 @@ int ads1299_set_data_rate(uint8_t rate)
  * Conversions are stopped as well, not just RDATAC exited: DRDY still drives
  * the PPI channel, and an edge arriving mid-transfer would restart the SPI
  * transfer underneath a register access.
+ *
+ * Defined ahead of afe_enter_command_mode(), which calls it to put streaming
+ * back if entering command mode itself fails partway through.
  */
+static int afe_resume_streaming(bool was_streaming)
+{
+	if (!was_streaming) {
+		return 0;
+	}
+
+	/*
+	 * RDATAC and START are both attempted, and everything below is always
+	 * restored, whichever of them fails: leaving CS high, DMA on the
+	 * command buffers or the gate off because one command errored is what
+	 * left acquisition gated off until some unrelated access happened to
+	 * succeed later (R1-ACQ-07). The caller still learns about a failure -
+	 * the first one - it just does not get left half fixed.
+	 */
+
+	/* Still framed by CS while we are issuing commands. */
+	int err = afe_cmd(ADS1299_CMD_RDATAC);
+
+	/*
+	 * Back to holding CS low for the PPI-driven transfers - nothing runs
+	 * between the DRDY edge and the transfer it starts, so there is no
+	 * opportunity to assert it per frame.
+	 */
+	nrf_gpio_pin_clear(afe_cs_pin());
+	afe_cs_held = true;
+
+	const int start_err = afe_cmd(ADS1299_CMD_START);
+
+	if (err == 0) {
+		err = start_err;
+	}
+
+	/*
+	 * Point the DMA back at the frame buffers. Register access leaves it on
+	 * the one-byte command buffers, so without this the first frame after
+	 * every register access was read one byte long, and the interrupt
+	 * passed on an old frame as if it were new.
+	 */
+	nrf_spim_tx_buffer_set(AFE_SPIM, afe_dummy, ADS1299_FRAME_BYTES);
+	nrf_spim_rx_buffer_set(AFE_SPIM, afe_frame[afe_active],
+			       ADS1299_FRAME_BYTES);
+
+	/* Payload rate again now the commands are done. */
+	nrf_spim_frequency_set(AFE_SPIM, AFE_FREQ_STREAM);
+
+	/* Only now let DRDY drive transfers again. */
+	if (afe_gate != NULL) {
+		afe_gate(true);
+	}
+
+	return err;
+}
+
 static int afe_enter_command_mode(bool *was_streaming)
 {
 	*was_streaming = afe_streaming;
@@ -480,55 +621,24 @@ static int afe_enter_command_mode(bool *was_streaming)
 
 	k_busy_wait(20);
 
-	if (err) {
-		return err;
+	if (err == 0) {
+		err = afe_cmd(ADS1299_CMD_STOP);
+		k_busy_wait(20);
 	}
-
-	err = afe_cmd(ADS1299_CMD_STOP);
-	k_busy_wait(20);
-
-	return err;
-}
-
-static int afe_resume_streaming(bool was_streaming)
-{
-	if (!was_streaming) {
-		return 0;
-	}
-
-	/* Still framed by CS while we are issuing commands. */
-	int err = afe_cmd(ADS1299_CMD_RDATAC);
 
 	if (err) {
-		return err;
-	}
-
-	/*
-	 * Back to holding CS low for the PPI-driven transfers - nothing runs
-	 * between the DRDY edge and the transfer it starts, so there is no
-	 * opportunity to assert it per frame.
-	 */
-	nrf_gpio_pin_clear(afe_cs_pin());
-	afe_cs_held = true;
-
-	err = afe_cmd(ADS1299_CMD_START);
-
-	/*
-	 * Point the DMA back at the frame buffers. Register access leaves it on
-	 * the one-byte command buffers, so without this the first frame after
-	 * every register access was read one byte long, and the interrupt
-	 * passed on an old frame as if it were new.
-	 */
-	nrf_spim_tx_buffer_set(AFE_SPIM, afe_dummy, ADS1299_FRAME_BYTES);
-	nrf_spim_rx_buffer_set(AFE_SPIM, afe_frame[afe_active],
-			       ADS1299_FRAME_BYTES);
-
-	/* Payload rate again now the commands are done. */
-	nrf_spim_frequency_set(AFE_SPIM, AFE_FREQ_STREAM);
-
-	/* Only now let DRDY drive transfers again. */
-	if (afe_gate != NULL) {
-		afe_gate(true);
+		/*
+		 * The gate is off, CS is high and the clock is down for
+		 * register access - state every caller here (the ads1299_*()
+		 * setters) relies on afe_resume_streaming() to undo on its way
+		 * out. None of them call it when THIS function fails, so
+		 * without putting it back here the DRDY trigger stays gated
+		 * off until some unrelated access happens to succeed later
+		 * (R1-ACQ-07). Report the error that got us here, not
+		 * whatever resuming does - the caller only ever sees the
+		 * first failure either way.
+		 */
+		(void)afe_resume_streaming(true);
 	}
 
 	return err;
@@ -672,20 +782,20 @@ int ads1299_set_leadoff(bool enable, uint8_t sensp, uint8_t sensn)
 	}
 
 	/* Lowest current and the default threshold; DC detection. */
-	err = afe_write_reg(ADS1299_REG_LOFF, ADS1299_LOFF_DC_6NA);
+	err = afe_write_reg_verified(ADS1299_REG_LOFF, ADS1299_LOFF_DC_6NA);
 
 	if (err == 0) {
-		err = afe_write_reg(ADS1299_REG_LOFF_SENSP,
-				    enable ? sensp : 0x00u);
+		err = afe_write_reg_verified(ADS1299_REG_LOFF_SENSP,
+					     enable ? sensp : 0x00u);
 	}
 	if (err == 0) {
-		err = afe_write_reg(ADS1299_REG_LOFF_SENSN,
-				    enable ? sensn : 0x00u);
+		err = afe_write_reg_verified(ADS1299_REG_LOFF_SENSN,
+					     enable ? sensn : 0x00u);
 	}
 	if (err == 0) {
 		/* The comparator itself, which is powered down by default. */
-		err = afe_write_reg(ADS1299_REG_CONFIG4,
-				    enable ? ADS1299_CONFIG4_PD_LOFF_COMP : 0x00u);
+		err = afe_write_reg_verified(ADS1299_REG_CONFIG4,
+					     enable ? ADS1299_CONFIG4_PD_LOFF_COMP : 0x00u);
 	}
 
 	const int resume_err = afe_resume_streaming(was_streaming);
@@ -725,6 +835,23 @@ int ads1299_get_channels(uint8_t *out, uint8_t count)
 	return err ? err : resume_err;
 }
 
+/*
+ * Writes one CHnSET, reads it back and updates the driver's cache from what
+ * the part actually holds rather than from what was sent (R1-ACQ-11) - a
+ * corrupted write then leaves afe_chset agreeing with a wrong gain/mux
+ * instead of the real one, which is what every later uV conversion trusts.
+ */
+static int afe_write_chset_verified(uint8_t ch, uint8_t val)
+{
+	int err = afe_write_reg_verified(ADS1299_REG_CH1SET + ch, val);
+
+	if (err == 0) {
+		afe_chset[ch] = val;
+	}
+
+	return err;
+}
+
 int ads1299_set_channel(uint8_t ch, uint8_t gain, uint8_t mux, bool power_down,
 			bool srb2)
 {
@@ -747,16 +874,10 @@ int ads1299_set_channel(uint8_t ch, uint8_t gain, uint8_t mux, bool power_down,
 
 	if (ch == 0xFFu) {
 		for (uint8_t i = 0; i < ADS1299_CHANNELS && err == 0; i++) {
-			err = afe_write_reg(ADS1299_REG_CH1SET + i, val);
-			if (err == 0) {
-				afe_chset[i] = val;
-			}
+			err = afe_write_chset_verified(i, val);
 		}
 	} else {
-		err = afe_write_reg(ADS1299_REG_CH1SET + ch, val);
-		if (err == 0) {
-			afe_chset[ch] = val;
-		}
+		err = afe_write_chset_verified(ch, val);
 	}
 
 	const int resume_err = afe_resume_streaming(was_streaming);
@@ -926,9 +1047,14 @@ static void afe_spim_isr(const void *arg)
 
 	/*
 	 * The timestamp was latched when DRDY fell, before this interrupt was
-	 * ever raised, so none of its latency is in the number.
+	 * ever raised, so none of its latency is in the number. That same
+	 * latency - the SPI transfer plus this ISR's own delay - is the window
+	 * in which TIMER1 can wrap, so the capture is stamped with the "past"
+	 * rule against a fresh read of the counter (R1-ACQ-01): combining it
+	 * with the live wrap count directly, the way timebase_stamp_us() does,
+	 * adds a spurious 2^32 us whenever a wrap lands in that window.
 	 */
-	const uint64_t ts = timebase_stamp_us(timebase_capture_get());
+	const uint64_t ts = timebase_stamp_past_us_from_isr(timebase_capture_get());
 
 	const uint8_t done = afe_active;
 
@@ -997,6 +1123,29 @@ int ads1299_stream_start(ads1299_frame_cb_t cb)
 	afe_cs_held = true;
 
 	/*
+	 * Streaming from here, so a failed START below unwinds through the
+	 * normal stream_stop() teardown instead of leaving RDATAC/CS/clock
+	 * half set up. Nothing can act on this early, since the DRDY trigger
+	 * gate - opened only at the very end below - is still closed.
+	 */
+	afe_streaming = true;
+
+	/*
+	 * START before the frame buffers, not after (R1-ACQ-08): START goes
+	 * through afe_cmd() -> afe_xfer(), which points TX/RX at the 1-byte
+	 * command buffers for its own transfer. Setting the frame buffers
+	 * first only left them clobbered by the command that followed, so the
+	 * first "sample" of every start was whatever afe_frame[0] already
+	 * held - zero at boot, or a leftover frame from the previous session
+	 * after a rate change - instead of a real conversion.
+	 */
+	err = ads1299_start_conversions();
+	if (err) {
+		ads1299_stream_stop();
+		return err;
+	}
+
+	/*
 	 * TX is a buffer of zeros: the part ignores DIN during RDATAC, but
 	 * SPIM needs something to clock out to generate SCK.
 	 */
@@ -1013,18 +1162,14 @@ int ads1299_stream_start(ads1299_frame_cb_t cb)
 	nrf_spim_int_enable(AFE_SPIM, NRF_SPIM_INT_END_MASK);
 	afe_irq_on = true;
 
-	afe_streaming = true;
-
-	/* DRDY may start transfers again: ads1299_stream_stop() took that away. */
+	/*
+	 * Gate last: DRDY may start transfers again only once the frame
+	 * buffers and the interrupt are both ready for it - ads1299_stream_stop()
+	 * took the gate away, but everything else here needs to be back in
+	 * place before it is safe to give it back.
+	 */
 	if (afe_gate != NULL) {
 		afe_gate(true);
-	}
-
-	/* Conversions last: everything must be ready before the first DRDY. */
-	err = ads1299_start_conversions();
-	if (err) {
-		ads1299_stream_stop();
-		return err;
 	}
 
 	return 0;

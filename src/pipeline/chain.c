@@ -1,6 +1,7 @@
 #include "chain.h"
 
 #include <errno.h>
+#include <math.h>
 
 int chain_init(chain_t *c, uint8_t dc_shift, float vref_volts, uint8_t gain)
 {
@@ -12,12 +13,17 @@ int chain_init(chain_t *c, uint8_t dc_shift, float vref_volts, uint8_t gain)
 	c->vref_volts = vref_volts;
 	c->car = false;
 	c->car_mask = 0xFFu;
+	c->car_runtime_mask = 0xFFu;
 	c->mains_mask = 0xFFu;
 	c->mains_in = 0.0f;
 
 	for (uint8_t ch = 0; ch < FRAME_CHANNELS; ch++) {
 		dsp_dc_init(&c->dc[ch], dc_shift);
 		c->lsb_uv[ch] = dsp_lsb_uv(vref_volts, gain);
+		c->channel[ch] = (struct chain_channel_config){
+			.gain = gain,
+			.mux = 0u,
+		};
 	}
 
 	dsp_cascade_init(&c->pre, FRAME_CHANNELS);
@@ -30,13 +36,25 @@ int chain_init(chain_t *c, uint8_t dc_shift, float vref_volts, uint8_t gain)
 bool chain_process(chain_t *c, const uint8_t *frame, int32_t *raw_out,
 		   float *uv_out)
 {
-	if (!frame_is_valid(frame)) {
+	return chain_process_flags(c, frame, raw_out, uv_out, NULL);
+}
+
+bool chain_process_flags(chain_t *c, const uint8_t *frame, int32_t *raw_out,
+			 float *uv_out, uint8_t *flags)
+{
+	if (flags != NULL) {
+		*flags = 0u;
+	}
+
+	if (c == NULL || frame == NULL || !frame_is_valid(frame)) {
 		return false;
 	}
 
 	float v[FRAME_CHANNELS];
 	float in_sum = 0.0f;
 	uint8_t in_n = 0;
+	uint8_t valid_mask = 0u;
+	uint8_t invalid_mask = 0u;
 
 	for (uint8_t ch = 0; ch < c->channels; ch++) {
 		const int32_t raw = frame_channel(frame, ch);
@@ -51,6 +69,16 @@ bool chain_process(chain_t *c, const uint8_t *frame, int32_t *raw_out,
 		/* Stage 1: microvolts, at this channel's own gain. */
 		const float uv = (float)ac * c->lsb_uv[ch];
 
+		if (!isfinite(uv)) {
+			invalid_mask |= (uint8_t)(1u << ch);
+			dsp_dc_init(&c->dc[ch], c->dc[ch].shift);
+			dsp_cascade_reset_channel(&c->pre, ch);
+			dsp_cascade_reset_channel(&c->notch, ch);
+			dsp_cascade_reset_channel(&c->post, ch);
+			v[ch] = 0.0f;
+			continue;
+		}
+
 		if ((c->mains_mask & (1u << ch)) != 0u) {
 			in_sum += uv;
 			in_n++;
@@ -59,7 +87,28 @@ bool chain_process(chain_t *c, const uint8_t *frame, int32_t *raw_out,
 		/* Stages 2 and 3: the pre sections - high-pass - then the notch. */
 		const float hp = dsp_cascade_apply(&c->pre, ch, uv);
 
+		if (!isfinite(hp)) {
+			invalid_mask |= (uint8_t)(1u << ch);
+			dsp_dc_init(&c->dc[ch], c->dc[ch].shift);
+			dsp_cascade_reset_channel(&c->pre, ch);
+			dsp_cascade_reset_channel(&c->notch, ch);
+			dsp_cascade_reset_channel(&c->post, ch);
+			v[ch] = 0.0f;
+			continue;
+		}
+
 		v[ch] = dsp_cascade_apply(&c->notch, ch, hp);
+		if (!isfinite(v[ch])) {
+			invalid_mask |= (uint8_t)(1u << ch);
+			dsp_dc_init(&c->dc[ch], c->dc[ch].shift);
+			dsp_cascade_reset_channel(&c->pre, ch);
+			dsp_cascade_reset_channel(&c->notch, ch);
+			dsp_cascade_reset_channel(&c->post, ch);
+			v[ch] = 0.0f;
+			continue;
+		}
+
+		valid_mask |= (uint8_t)(1u << ch);
 	}
 
 	c->mains_in = (in_n != 0u) ? in_sum / (float)in_n : 0.0f;
@@ -76,7 +125,11 @@ bool chain_process(chain_t *c, const uint8_t *frame, int32_t *raw_out,
 		uint8_t n = 0;
 
 		for (uint8_t ch = 0; ch < c->channels; ch++) {
-			if ((c->car_mask & (1u << ch)) != 0u) {
+			const struct chain_channel_config *cfg = &c->channel[ch];
+
+			if ((c->car_mask & c->car_runtime_mask & valid_mask &
+			     (1u << ch)) != 0u &&
+			    !cfg->power_down && cfg->mux == CHAIN_MUX_NORMAL) {
 				sum += v[ch];
 				n++;
 			}
@@ -86,18 +139,39 @@ bool chain_process(chain_t *c, const uint8_t *frame, int32_t *raw_out,
 			const float mean = sum / (float)n;
 
 			for (uint8_t ch = 0; ch < c->channels; ch++) {
-				v[ch] -= mean;
+				if ((valid_mask & (1u << ch)) != 0u) {
+					v[ch] -= mean;
+				}
 			}
 		}
 	}
 
 	/* Stage 5: the post sections - low-pass. */
 	for (uint8_t ch = 0; ch < c->channels; ch++) {
+		if ((invalid_mask & (1u << ch)) != 0u) {
+			if (uv_out != NULL) {
+				uv_out[ch] = NAN;
+			}
+			continue;
+		}
+
 		const float y = dsp_cascade_apply(&c->post, ch, v[ch]);
 
-		if (uv_out != NULL) {
-			uv_out[ch] = y;
+		if (!isfinite(y)) {
+			invalid_mask |= (uint8_t)(1u << ch);
+			dsp_dc_init(&c->dc[ch], c->dc[ch].shift);
+			dsp_cascade_reset_channel(&c->pre, ch);
+			dsp_cascade_reset_channel(&c->notch, ch);
+			dsp_cascade_reset_channel(&c->post, ch);
 		}
+
+		if (uv_out != NULL) {
+			uv_out[ch] = isfinite(y) ? y : NAN;
+		}
+	}
+
+	if (invalid_mask != 0u && flags != NULL) {
+		*flags |= CHAIN_FLAG_DSP_INVALID;
 	}
 
 	return true;
@@ -189,15 +263,49 @@ void chain_set_mains_mask(chain_t *c, uint8_t mask)
 
 int chain_set_gain(chain_t *c, uint8_t ch, uint8_t gain)
 {
-	if (c == NULL || ch >= FRAME_CHANNELS || gain == 0) {
+	if (c == NULL || ch >= FRAME_CHANNELS) {
 		return -EINVAL;
 	}
 
-	const float lsb = dsp_lsb_uv(c->vref_volts, gain);
+	return chain_set_channel(c, ch, gain, c->channel[ch].mux,
+				 c->channel[ch].power_down, c->channel[ch].srb2,
+				 NULL);
+}
 
-	if (lsb != c->lsb_uv[ch]) {
-		c->lsb_uv[ch] = lsb;
-		dsp_dc_init(&c->dc[ch], c->dc[ch].shift);
+int chain_set_channel(chain_t *c, uint8_t ch, uint8_t gain, uint8_t mux,
+		      bool power_down, bool srb2, bool *changed)
+{
+	if (changed != NULL) {
+		*changed = false;
+	}
+
+	if (c == NULL || ch >= FRAME_CHANNELS || gain == 0u || mux > 7u) {
+		return -EINVAL;
+	}
+
+	const struct chain_channel_config next = {
+		.gain = gain,
+		.mux = mux,
+		.power_down = power_down,
+		.srb2 = srb2,
+	};
+
+	if (c->channel[ch].gain == next.gain &&
+	    c->channel[ch].mux == next.mux &&
+	    c->channel[ch].power_down == next.power_down &&
+	    c->channel[ch].srb2 == next.srb2) {
+		return 0;
+	}
+
+	c->channel[ch] = next;
+	c->lsb_uv[ch] = dsp_lsb_uv(c->vref_volts, gain);
+	dsp_dc_init(&c->dc[ch], c->dc[ch].shift);
+	dsp_cascade_reset_channel(&c->pre, ch);
+	dsp_cascade_reset_channel(&c->notch, ch);
+	dsp_cascade_reset_channel(&c->post, ch);
+
+	if (changed != NULL) {
+		*changed = true;
 	}
 
 	return 0;

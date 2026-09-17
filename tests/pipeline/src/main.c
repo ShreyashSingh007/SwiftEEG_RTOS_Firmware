@@ -16,6 +16,8 @@
 
 #include <zephyr/ztest.h>
 
+#include <math.h>
+
 #include "golden_pipeline.h"
 #include "pipeline/chain.h"
 
@@ -365,6 +367,62 @@ ZTEST(pipeline, test_gain_rescales_one_channel)
 		       "gain 12 should double the LSB");
 	zassert_equal(chain.lsb_uv[0], lsb24, "another channel's scale moved");
 	zassert_equal(chain_set_gain(&chain, 1, 0), -EINVAL, "gain 0 accepted");
+}
+
+ZTEST(pipeline, test_channel_change_restarts_only_that_channel)
+{
+	build_full(&chain);
+
+	for (int i = 0; i < 16; i++) {
+		(void)chain_process(&chain, FRAME_AT(i), NULL, NULL);
+	}
+
+	bool changed = false;
+	zassert_ok(chain_set_channel(&chain, 1, 24, 1u, false, false,
+				     &changed));
+	zassert_true(changed, "a mux change must be reported");
+	zassert_false(chain.dc[1].primed, "changed channel DC was not re-primed");
+	zassert_true((chain.pre.prime_mask & (1u << 1)) != 0u,
+		     "changed channel pre-filter was not reset");
+	zassert_true(chain.dc[0].primed,
+		     "an unchanged channel was reset too");
+
+	(void)chain_process(&chain, FRAME_AT(16), NULL, NULL);
+	changed = true;
+	zassert_ok(chain_set_channel(&chain, 1, 24, 1u, false, false,
+				     &changed));
+	zassert_false(changed, "an unchanged channel config was reported changed");
+	zassert_true(chain.dc[1].primed,
+		     "an unchanged channel config reset its DC state");
+
+	zassert_ok(chain_set_channel(&chain, 1, 24, 1u, true, false, &changed));
+	zassert_true(changed, "power-down change was ignored");
+	zassert_false(chain.dc[1].primed, "power-down change did not re-prime");
+	zassert_ok(chain_set_channel(&chain, 1, 24, 1u, true, true, &changed));
+	zassert_true(changed, "SRB2 change was ignored");
+	zassert_false(chain.dc[1].primed, "SRB2 change did not re-prime");
+}
+
+ZTEST(pipeline, test_nonfinite_channel_isolated_and_flagged)
+{
+	build_full(&chain);
+	(void)chain_process(&chain, FRAME_AT(0), NULL, NULL);
+
+	/* Simulate a corrupted state arriving from a bad finite section. */
+	chain.post.state[0][0].ic2 = INFINITY;
+
+	float uv[FRAME_CHANNELS];
+	uint8_t flags = 0u;
+	zassert_true(chain_process_flags(&chain, FRAME_AT(1), NULL, uv, &flags));
+	zassert_true((flags & CHAIN_FLAG_DSP_INVALID) != 0u,
+		     "invalid filtered output was not flagged");
+	zassert_true(isnan(uv[0]), "invalid channel was presented as valid data");
+	zassert_true(isfinite(uv[1]), "one bad channel spread to another channel");
+
+	flags = 0u;
+	zassert_true(chain_process_flags(&chain, FRAME_AT(2), NULL, uv, &flags));
+	zassert_equal(flags, 0u, "reset channel stayed invalid");
+	zassert_true(isfinite(uv[0]), "reset channel did not recover");
 }
 
 ZTEST(pipeline, test_reset_is_a_fresh_start)

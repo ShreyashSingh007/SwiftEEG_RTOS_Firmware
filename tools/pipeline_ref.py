@@ -55,6 +55,7 @@ VREF_V = 4.5
 GAIN = 24
 
 STAGE_PRE, STAGE_POST = 0, 1
+CHAIN_FLAG_DSP_INVALID = 0x04
 
 # The ADS1299's own generator: (VREFP-VREFN)/2400, at fCLK/2^21.
 CAL_AMPLITUDE_V = VREF_V / 2400.0
@@ -140,8 +141,10 @@ class Chain:
         self.post = dsp_ref.Cascade(CHANNELS)
         self.car = False
         self.mask = 0xFF
+        self.car_runtime_mask = 0xFF
         self.mains_mask = 0xFF
         self.mains_in = F32(0.0)
+        self.channel = [(gain, 0, False, False) for _ in range(CHANNELS)]
         self.set_notch(notch_hz, notch_q, harmonic)
 
     def set_notch(self, hz: float, q: float = NOTCH_Q, harmonic: bool = True,
@@ -171,10 +174,30 @@ class Chain:
         self.mains_mask = int(mask) & 0xFF
 
     def set_gain(self, ch: int, gain: int) -> None:
-        lsb = dsp_ref.lsb_uv_f32(self.vref, gain)
-        if lsb != self.lsb[ch]:
-            self.lsb[ch] = lsb
-            self.dc_primed[ch] = False
+        _, mux, power_down, srb2 = self.channel[ch]
+        self.set_channel(ch, gain, mux, power_down, srb2)
+
+    def _reset_channel(self, ch: int) -> None:
+        self.dc_acc[ch] = 0
+        self.dc_primed[ch] = False
+        for cas in (self.pre, self.notch, self.post):
+            cas.ic1[ch] = [F32(0.0)] * dsp_ref.MAX_SECTIONS
+            cas.ic2[ch] = [F32(0.0)] * dsp_ref.MAX_SECTIONS
+            cas.pending[ch] = True
+
+    def set_channel(self, ch: int, gain: int, mux: int = 0,
+                    power_down: bool = False, srb2: bool = False) -> bool:
+        if not 0 <= ch < CHANNELS or gain <= 0 or not 0 <= mux <= 7:
+            raise ValueError("invalid channel configuration")
+
+        next_config = (int(gain), int(mux), bool(power_down), bool(srb2))
+        if self.channel[ch] == next_config:
+            return False
+
+        self.channel[ch] = next_config
+        self.lsb[ch] = dsp_ref.lsb_uv_f32(self.vref, gain)
+        self._reset_channel(ch)
+        return True
 
     def reset(self) -> None:
         self.dc_primed = [False] * CHANNELS
@@ -182,17 +205,21 @@ class Chain:
         self.notch.reset()
         self.post.reset()
 
-    def settle_samples(self) -> int:
+    def settle_samples(self, include_dc: bool = False) -> int:
         total = 0
         for cas in (self.pre, self.notch, self.post):
             total = min(0xFFFFFFFF, total + cas.settle_samples())
+        if include_dc:
+            total = max(total, min(0xFFFFFFFF, 5 * (1 << self.shift)))
         return total
 
-    def process_counts(self, counts):
+    def process_counts(self, counts, with_flags: bool = False):
         """One sample's eight raw counts in, eight float32 microvolts out."""
         v = []
         in_sum = F32(0.0)
         in_n = 0
+        valid_mask = 0
+        invalid_mask = 0
         for ch in range(CHANNELS):
             s = int(counts[ch])
 
@@ -206,12 +233,30 @@ class Chain:
 
             # Stage 1: microvolts, at this channel's own gain.
             uv = F32(ac) * self.lsb[ch]
+            if not np.isfinite(uv):
+                invalid_mask |= 1 << ch
+                self._reset_channel(ch)
+                v.append(F32(0.0))
+                continue
             if self.mains_mask & (1 << ch):
                 in_sum = in_sum + uv
                 in_n += 1
 
             # Stages 2 and 3: the pre sections, then the notch.
-            v.append(self.notch.apply(ch, self.pre.apply(ch, uv)))
+            hp = self.pre.apply(ch, uv)
+            if not np.isfinite(hp):
+                invalid_mask |= 1 << ch
+                self._reset_channel(ch)
+                v.append(F32(0.0))
+                continue
+            value = self.notch.apply(ch, hp)
+            if not np.isfinite(value):
+                invalid_mask |= 1 << ch
+                self._reset_channel(ch)
+                v.append(F32(0.0))
+                continue
+            valid_mask |= 1 << ch
+            v.append(value)
 
         self.mains_in = in_sum / F32(in_n) if in_n else F32(0.0)
 
@@ -220,22 +265,39 @@ class Chain:
             total = F32(0.0)
             n = 0
             for ch in range(CHANNELS):
-                if self.mask & (1 << ch):
+                _, mux, power_down, _ = self.channel[ch]
+                if (self.mask & self.car_runtime_mask & valid_mask & (1 << ch)
+                        and not power_down and mux == 0):
                     total = total + v[ch]
                     n += 1
             if n >= 2:
                 mean = total / F32(n)
-                v = [x - mean for x in v]
+                v = [x - mean if valid_mask & (1 << ch) else x
+                     for ch, x in enumerate(v)]
 
         # Stage 5: the post sections.
-        return np.array([self.post.apply(ch, v[ch]) for ch in range(CHANNELS)],
-                        dtype=F32)
+        out = []
+        for ch in range(CHANNELS):
+            if invalid_mask & (1 << ch):
+                out.append(F32(np.nan))
+                continue
+            value = self.post.apply(ch, v[ch])
+            if not np.isfinite(value):
+                invalid_mask |= 1 << ch
+                self._reset_channel(ch)
+                out.append(F32(np.nan))
+            else:
+                out.append(value)
 
-    def process_frame(self, frame: bytes):
+        result = np.array(out, dtype=F32)
+        return (result, CHAIN_FLAG_DSP_INVALID if invalid_mask else 0) \
+            if with_flags else result
+
+    def process_frame(self, frame: bytes, with_flags: bool = False):
         """A frame in; None for one the firmware would reject."""
         if not frame_is_valid(frame):
             return None
-        return self.process_counts(decode_frame(frame))
+        return self.process_counts(decode_frame(frame), with_flags=with_flags)
 
 
 def run_chain(frames, chain: Chain | None = None):
@@ -446,6 +508,24 @@ def _self_test() -> None:
     one.set_car(True, 0x01)
     assert np.array_equal(run_chain(common, one), run_chain(common, Chain(notch_hz=0.0))), \
         "a single-channel average changed the signal"
+
+    # A non-electrode input must not move the common reference of electrodes.
+    t = np.arange(400) / FS_HZ
+    small = (10.0 / (lsb_uv() * 1e-6) * 1e-6) * np.sin(2 * np.pi * 10.0 * t)
+    large = (100.0 / (lsb_uv() * 1e-6) * 1e-6) * np.sin(2 * np.pi * 10.0 * t)
+    mixed = [encode_frame([int(large[i])] + [int(small[i])] * 7)
+             for i in range(len(t))]
+    normal = Chain(notch_hz=0.0)
+    normal.set_car(True, 0xFF)
+    shorted = Chain(notch_hz=0.0)
+    shorted.set_car(True, 0xFF)
+    shorted.set_channel(0, 24, mux=1)
+    normal_out = run_chain(mixed, normal)
+    shorted_out = run_chain(mixed, shorted)
+    assert np.abs(shorted_out[100:, 1]).max() < 1.0, \
+        "a shorted channel moved the electrode average"
+    assert np.abs(normal_out[100:, 1]).max() > 5.0, \
+        "the normal channel average test was ineffective"
 
     # mains_in is the unfiltered mean of the masked channels: with every
     # channel carrying the same tone it is that tone, and with none, zero.

@@ -11,8 +11,10 @@
  */
 
 #include <zephyr/device.h>
+#include <zephyr/drivers/hwinfo.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/task_wdt/task_wdt.h>
 
 #include "afe/ads1299.h"
 #include "board/leds.h"
@@ -52,6 +54,84 @@ static void report_supply(void)
 	 */
 	if (mv < 3000) {
 		LOG_WRN("VDD is low - expected ~3300 mV from the LP5907");
+	}
+}
+
+/*
+ * Reported once at boot so a run that ended in a watchdog reset (R1-ACQ-09)
+ * leaves a trace instead of just restarting silently - a failure must never
+ * look like a clean start. Cleared afterwards so the NEXT reset's cause is
+ * read fresh rather than on top of this one's.
+ */
+static void report_reset_cause(void)
+{
+	static const struct {
+		uint32_t flag;
+		const char *name;
+	} known[] = {
+		{ RESET_PIN,            "pin" },
+		{ RESET_SOFTWARE,       "software" },
+		{ RESET_WATCHDOG,       "watchdog" },
+		{ RESET_POR,            "power-on" },
+		{ RESET_DEBUG,          "debug" },
+		{ RESET_CPU_LOCKUP,     "CPU lockup" },
+		{ RESET_LOW_POWER_WAKE, "low-power wake" },
+	};
+	uint32_t cause = 0;
+
+	if (hwinfo_get_reset_cause(&cause) != 0) {
+		LOG_WRN("reset cause unavailable");
+		return;
+	}
+
+	if (cause == 0) {
+		LOG_INF("reset cause: none reported");
+	}
+	for (size_t i = 0; i < ARRAY_SIZE(known); i++) {
+		if ((cause & known[i].flag) != 0) {
+			LOG_INF("reset cause: %s", known[i].name);
+		}
+	}
+
+	(void)hwinfo_clear_reset_cause();
+}
+
+/*
+ * Bring up the task watchdog (R1-ACQ-09).
+ *
+ * Channels are added by whoever owns the thread being watched - the command
+ * thread's own loop, and the DSP thread's progress while acquisition runs
+ * (command.c, pipeline.c) - and fed only while that thread is actually
+ * making progress, not merely running, so a wedge becomes a reset instead of
+ * a headset that looks connected while dead.
+ *
+ * task_wdt_init(NULL) - software channels only, no hardware fallback -
+ * always succeeds, so this retries with NULL if the hardware watchdog is
+ * missing or its install fails, rather than ever leaving task_wdt
+ * uninitialized: command.c and pipeline.c assume task_wdt_add()/
+ * task_wdt_feed() are always safe to call once they run.
+ */
+static void start_watchdog(void)
+{
+	const struct device *const wdt_dev = DEVICE_DT_GET(DT_ALIAS(watchdog0));
+	const struct device *hw_wdt = device_is_ready(wdt_dev) ? wdt_dev : NULL;
+
+	if (hw_wdt == NULL) {
+		LOG_WRN("hardware watchdog not ready - task watchdog will be "
+			"software-only");
+	}
+
+	int err = task_wdt_init(hw_wdt);
+
+	if (err != 0 && hw_wdt != NULL) {
+		LOG_WRN("hardware watchdog install failed (%d) - falling back "
+			"to software-only", err);
+		err = task_wdt_init(NULL);
+	}
+
+	if (err != 0) {
+		LOG_ERR("task watchdog unavailable (%d) - running without one",
+			err);
 	}
 }
 
@@ -315,6 +395,9 @@ static void report_health(void)
 int main(void)
 {
 	LOG_INF("SwiftEEG firmware starting (M1 bring-up)");
+
+	report_reset_cause();
+	start_watchdog();
 
 	int err = leds_init();
 	if (err) {

@@ -18,10 +18,12 @@
 
 #include "afe/ads1299.h"
 #include "dsp/dsp.h"
+#include "proto/proto.h"
 
 /* Sample flags, mirroring the protocol's DATA header. */
-#define EEG_FLAG_SETTLING 0x01 /* filters have not settled yet */
-#define EEG_FLAG_OVERRUN  0x02 /* frames were dropped before this one */
+#define EEG_FLAG_SETTLING    PROTO_FLAG_SETTLING /* filters have not settled yet */
+#define EEG_FLAG_OVERRUN     PROTO_FLAG_OVERRUN /* frames were dropped before this one */
+#define EEG_FLAG_DSP_INVALID PROTO_FLAG_DSP_INVALID /* a filtered channel was invalid */
 
 /* One processed sample set, in microvolts. */
 struct eeg_sample {
@@ -78,7 +80,18 @@ void pipeline_stop(void);
  */
 int pipeline_set_rate(uint16_t sps);
 
-/* The rate currently running, in samples per second. */
+/*
+ * True if `sps` is a rate the AFE has a register code for. Touches no
+ * hardware - for validating a request before committing to the restart.
+ */
+bool pipeline_rate_supported(uint16_t sps);
+
+/*
+ * The rate currently running, in samples per second, or 0 when acquisition
+ * is not running - including while a restart is in progress or after one
+ * failed, so a stale rate from before the failure is never reported as
+ * current.
+ */
 uint16_t pipeline_rate(void);
 
 /*

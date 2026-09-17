@@ -138,20 +138,27 @@ bool dsp_cascade_retune(dsp_cascade_t *c, const dsp_section_t *sections,
  * transient the size of the signal.
  */
 void dsp_cascade_reset_state(dsp_cascade_t *c);
+/* Reset one channel and prime it on its next sample. */
+void dsp_cascade_reset_channel(dsp_cascade_t *c, uint8_t channel);
 float dsp_cascade_apply(dsp_cascade_t *c, uint8_t channel, float x);
 
 /*
- * Whether a section can be run. With g and k both positive a section of this
- * form is stable whatever its mix, so that - with every value finite - is the
- * whole check. Sections arrive from a host, and an unstable one would not
- * fail: it would grow until the output was all infinities.
+ * Whether a section can be run: every value finite, g and k positive, and
+ * nothing past what float32 runs as designed - a mix of at most 1000, g of at
+ * most 1000 (a corner within 0.03 % of Nyquist) and a slowest decay of at
+ * most a million samples. In exact arithmetic positive g and k make a section
+ * stable whatever its mix, but the loop's a1..a3 are rounded, and a pole that
+ * close to the unit circle can land on it or outside. Sections arrive from a
+ * host, and an unstable one would not fail: it would grow until the output
+ * was all infinities.
  */
 bool dsp_section_is_valid(const dsp_section_t *s);
 
 /*
  * Roughly how many samples a cascade takes to settle after a restart: each
- * section's slowest decay to 1 %, added up. Samples inside that window are
- * flagged, so a transient is never mistaken for signal.
+ * section's ring-down to 1 % of its peak, from its poles where the bilinear
+ * transform puts them, added up. Samples inside that window are flagged, so a
+ * transient is never mistaken for signal.
  */
 uint32_t dsp_cascade_settle_samples(const dsp_cascade_t *c);
 

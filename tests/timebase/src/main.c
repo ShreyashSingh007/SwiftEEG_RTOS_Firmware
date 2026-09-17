@@ -66,6 +66,47 @@ ZTEST(timebase, test_both_orderings_agree)
 		      "orderings disagree: %llu vs %llu", isr_late, isr_early);
 }
 
+ZTEST(timebase, test_extend_past_resolves_what_extend_alone_cannot)
+{
+	/*
+	 * R1-ACQ-01: unlike test_both_orderings_agree above, a HIGH counter
+	 * (pre-wrap) does NOT agree once the ISR has already run - pending is
+	 * false either way, so timebase_extend() cannot tell "genuinely in the
+	 * new period" from "stale, from just before the wrap" apart:
+	 */
+	const uint32_t counter = 0xFFFFFF00;
+
+	const uint64_t isr_not_run_yet = timebase_extend(4, counter, true);
+	const uint64_t isr_already_ran = timebase_extend(5, counter, false);
+
+	zassert_not_equal(isr_not_run_yet, isr_already_ran,
+			  "if this starts passing, timebase_extend() alone has "
+			  "become sufficient and the _from_isr past-rule path "
+			  "may no longer be needed");
+
+	/*
+	 * timebase_extend_past() is what the SPIM3 END ISR now uses
+	 * (timebase_stamp_past_us_from_isr()) to resolve exactly this case: a
+	 * capture latched ~32 us before a wrap (a live DRDY timestamp), read out
+	 * after the wrap ISR has already bumped the high word and moved on.
+	 */
+	const uint64_t now = timebase_extend(5, 0x00000060, false);
+
+	zassert_equal(timebase_extend_past(now, counter), HI(4) + counter,
+		      "a capture from just before the wrap must stay in the "
+		      "old epoch, not jump 2^32 us into the future");
+}
+
+ZTEST(timebase, test_extend_past_leaves_the_same_epoch_alone)
+{
+	/* No wrap in the window: an ordinary capture is unaffected. */
+	const uint64_t now = timebase_extend(4, 500000, false);
+
+	zassert_equal(timebase_extend_past(now, 100), HI(4) + 100);
+	zassert_equal(timebase_extend_past(now, 500000), now,
+		      "a capture equal to now must not be pushed into the past");
+}
+
 ZTEST(timebase, test_never_goes_backwards_across_a_wrap)
 {
 	/*

@@ -65,12 +65,70 @@ void dsp_cascade_init(dsp_cascade_t *c, uint8_t channels)
 	c->channels = (channels > DSP_MAX_CHANNELS) ? DSP_MAX_CHANNELS : channels;
 }
 
+/*
+ * A section's slowest decay once nothing drives it, as a time constant in
+ * samples.
+ *
+ * The poles are the analogue prototype's, s^2 + k s + 1 = 0, taken through
+ * the bilinear transform z = (1 + g s) / (1 - g s), and a pole's radius is
+ * what sets its decay. The transform squeezes the top of the band up against
+ * Nyquist, and a pole there sits far nearer the unit circle than its analogue
+ * decay says. An underdamped pair has |z|^2 = (1 - u) / (1 + u) with
+ * u = g k / (1 + g^2), a decay of atanh(u) a sample: slower than the
+ * analogue g k by 1 + g^2, which is 10.5 for the 100 Hz harmonic notch at
+ * 250 SPS. An overdamped pair's slower real pole, (k - sqrt(k^2 - 4)) / 2,
+ * is the one nearest the unit circle while g < 1; above that its faster
+ * partner is, near z = -1, and decays as the slower one would at 1 / g.
+ *
+ * atanh(u) >= u, so 1 / u stands in for 1 / atanh(u): never short, within
+ * 0.1 % of it for any decay of 20 samples or more, and built only from
+ * operations IEEE 754 rounds exactly, so a host mirroring this counts the
+ * same samples.
+ */
+static float slowest_tau(float g, float k)
+{
+	if (k < 2.0f) {
+		return (1.0f + g * g) / (g * k);
+	}
+
+	const float h = (g > 1.0f) ? 1.0f / g : g;
+
+	return (k + sqrtf(k * k - 4.0f)) / (4.0f * h);
+}
+
+/*
+ * How far a section may go before it is refused. With g and k positive a
+ * section is stable in exact arithmetic whatever its values, but not in
+ * float32, and nothing past these is a filter anyone designs. The furthest
+ * the host tools go - a 0.05 Hz eighth-order high-pass at 16 kSPS, whose
+ * slowest decay is 2.6e5 samples, and corners up to 0.475 fs, g = 12.7 - is
+ * well inside them.
+ *
+ * A mix of a thousand is hundreds of times any filter's, which are at most
+ * 2. A g of a thousand puts the corner within 0.03 % of Nyquist; past about
+ * 4096, 1 + g(g + k) cannot hold its 1, and in a narrow section a3 rounds to
+ * exactly 1 - an undamped ring at Nyquist. A decay of a million samples,
+ * over a minute even at 16 kSPS, leaves the slowest pole 1e-6 inside the
+ * unit circle, and float32's rounding of a1..a3 already moves it by up to a
+ * quarter of that; by 1e8 samples the rounding puts poles on the circle or
+ * outside it. That one bound refuses g or k too small and k too large
+ * together, which separate bounds on g and k could not do without refusing
+ * sections that work.
+ */
+#define SECTION_MIX_MAX 1e3f
+#define SECTION_G_MAX   1e3f
+#define SECTION_TAU_MAX 1e6f
+
 bool dsp_section_is_valid(const dsp_section_t *s)
 {
 	return s != NULL &&
 	       isfinite(s->g) && isfinite(s->k) &&
 	       isfinite(s->m0) && isfinite(s->m1) && isfinite(s->m2) &&
-	       s->g > 0.0f && s->k > 0.0f;
+	       s->g > 0.0f && s->g <= SECTION_G_MAX && s->k > 0.0f &&
+	       fabsf(s->m0) <= SECTION_MIX_MAX &&
+	       fabsf(s->m1) <= SECTION_MIX_MAX &&
+	       fabsf(s->m2) <= SECTION_MIX_MAX &&
+	       slowest_tau(s->g, s->k) <= SECTION_TAU_MAX;
 }
 
 static bool sections_valid(const dsp_section_t *sections, uint8_t count)
@@ -143,6 +201,16 @@ void dsp_cascade_reset_state(dsp_cascade_t *c)
 	}
 }
 
+void dsp_cascade_reset_channel(dsp_cascade_t *c, uint8_t channel)
+{
+	if (c == NULL || channel >= c->channels) {
+		return;
+	}
+
+	memset(c->state[channel], 0, sizeof(c->state[channel]));
+	c->prime_mask |= (uint8_t)(1u << channel);
+}
+
 float dsp_cascade_apply(dsp_cascade_t *c, uint8_t channel, float x)
 {
 	if (c == NULL || channel >= c->channels) {
@@ -193,22 +261,33 @@ uint32_t dsp_cascade_settle_samples(const dsp_cascade_t *c)
 	}
 
 	/*
-	 * Each section's slowest pole, taken from the analogue prototype it was
-	 * prewarped from (w0 = 2 fs g). An underdamped pair decays at w0 / 2Q,
-	 * a time constant of 1 / (g k) samples; an overdamped one at its slower
-	 * real pole, (k + sqrt(k^2 - 4)) / 4g. Decaying to 1 % takes ln(100),
-	 * about 4.6 time constants.
+	 * Each section's ring-down to 1 % of its peak, added up. Falling to 1 %
+	 * takes ln(100), 4.6 time constants, but two things put the last sample
+	 * above 1 % of the peak later than that - found by running this loop
+	 * from every state a restart can leave it in. A ring sampled near four
+	 * samples a cycle can peak at only 1/sqrt(2) of its envelope, which
+	 * makes it ln(100 sqrt(2)), 4.96 time constants. And a well-damped
+	 * section rises before it falls: at critical damping it peaks a time
+	 * constant in, at 1/e of where it started, and takes 7.64 in all. The
+	 * extra 3.04, scaled by the square of the damping ratio folded about
+	 * critical - k/2 below it, 2/k above - covers everything between: an
+	 * order-2 Butterworth section needs up to 5.9 and is given 6.5. The 2
+	 * samples are for poles at z = 0, which decay at once but still hold two
+	 * samples of state.
+	 *
+	 * The sum over-counts a cascade whose sections ring at different
+	 * frequencies - 1.7 times for the 50 Hz notch and its harmonic at
+	 * 250 SPS - but it has to cover sections that share a pole, whose rings
+	 * build on each other.
 	 */
 	float total = 0.0f;
 
 	for (uint8_t i = 0; i < c->count; i++) {
 		const float g = c->sections[i].g;
 		const float k = c->sections[i].k;
-		const float tau = (k > 2.0f)
-				  ? (k + sqrtf(k * k - 4.0f)) / (4.0f * g)
-				  : 1.0f / (g * k);
+		const float d = (k < 2.0f) ? 0.5f * k : 2.0f / k;
 
-		total += 4.6f * tau;
+		total += (4.96f + 3.04f * d * d) * slowest_tau(g, k) + 2.0f;
 	}
 
 	/* The largest float32 below 2^32; also catches a NaN. */

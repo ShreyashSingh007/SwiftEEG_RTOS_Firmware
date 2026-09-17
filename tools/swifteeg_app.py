@@ -1759,11 +1759,13 @@ class App(tk.Tk):
                 self._open_segment("configuration confirmed")
             state = "streaming" if change["resume"] else "ready"
             self.status.config(text=f"{state} at {sps} SPS", fg="#5ed18b")
+            self._update_buttons()
             return
 
         self._open_segment("configuration confirmed")
         self.status.config(text=f"connected - {sps} SPS, gain {self.gain}",
                            fg="#5ed18b")
+        self._update_buttons()
 
     def _on_filter_response(self, p: bytes) -> None:
         if not self.filters_on_device:

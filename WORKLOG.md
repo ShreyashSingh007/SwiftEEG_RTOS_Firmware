@@ -13,6 +13,8 @@ was relaxed by the owner on 2026-09-16 for exactly this.)
 ## Resume here
 
 - **Work on:** `m1-bringup` - the milestone line.
+- **Handoff:** `HANDOFF.md` - everything a new engineer or assistant needs to
+  resume, including phase A's in-progress state and the session tools.
 - **Review:** COMPLETE (2026-09-17). 58 findings, every critical and high one
   verified against the code. Verdict, fix plan and the owner's decisions are
   in *Verdict and path* below; evidence in `docs/review/2026-09-17/`.

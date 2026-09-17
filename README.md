@@ -33,7 +33,8 @@ DSP, precise timestamps, and a transport-agnostic binary API.
 ## 0. Where we are  (read this first)
 
 The running work log - what was done last, which branch, what is waiting
-on whom - is `WORKLOG.md`. This file is the reference.
+on whom - is `WORKLOG.md`. A full handoff for a new engineer or assistant
+is `HANDOFF.md`. This file is the reference.
 
 **M1-M4 are done and M5 works.** Samples come off the ADS1299 by DMA, run
 through the DSP chain, and stream to a PC over Bluetooth or USB alongside the
